@@ -1,4 +1,5 @@
 # 🔧 Yandex Station Max Flasher - Графический инсталлятор прошивки
+<img width="1094" height="824" alt="image" src="https://github.com/user-attachments/assets/8a696e8a-ca5e-465c-8192-7ec7eac2cdcc" />
 
 Графическое приложение для прошивки Yandex Station Max (Amlogic S905X2) на Windows.
 
