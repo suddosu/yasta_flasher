@@ -47,7 +47,7 @@ COM ТЕРМИНАЛ:
   ├── odm.img
   ├── product.img
   ├── recovery.img
-  ├── system.img
+  ├── system-bkp.img
   ├── vendor.img
   └── sysrecovery.img
 
@@ -79,29 +79,50 @@ try:
 except ImportError:
     SERIAL_AVAILABLE = False
 
-# Импорт pyamlboot для загрузки U-Boot
-try:
-    from pyamlboot_local.boot import main as send_aml_bundle
-except ImportError:
-    send_aml_bundle = None
+# Импорт pyamlboot для загрузки U-Boot.
+# ВАЖНО: папка pyamlboot_local/ может появиться уже ПОСЛЕ старта программы
+# (после нажатия «Загрузить утилиты»). Поэтому импорт делаем ленивым —
+# функция get_aml_bundle_sender() пытается импортировать модуль в момент вызова.
+send_aml_bundle = None   # кэш; заполняется при первом успешном импорте
+
+def get_aml_bundle_sender():
+    """Вернуть функцию загрузки U-Boot или None.
+    Пытается (пере)импортировать pyamlboot_local при каждом вызове,
+    пока не получится — чтобы работать после докачивания файлов."""
+    global send_aml_bundle
+    if send_aml_bundle is not None:
+        return send_aml_bundle
+    try:
+        import importlib
+        if ROOT_DIR not in sys.path:
+            sys.path.insert(0, ROOT_DIR)
+        for mod_name in list(sys.modules):
+            if mod_name.startswith("pyamlboot_local"):
+                del sys.modules[mod_name]
+        mod = importlib.import_module("pyamlboot_local.boot")
+        send_aml_bundle = getattr(mod, "main", None)
+        return send_aml_bundle
+    except Exception:
+        return None
 
 ROOT_DIR = os.getcwd()
 FILE_DIR = os.path.join(ROOT_DIR, "files")
 IMG_DIR = os.path.join(ROOT_DIR, "images-bkp")
 
-# URL для загрузки утилит из GitHub (ИСПРАВЛЕННЫЙ)
-GITHUB_TOOLS_BASE = "https://raw.githubusercontent.com/althafvly/Amlogic_Kitchen/master/bin/windows"
+# Репозиторий с утилитами и зависимостями
+GITHUB_REPO       = "https://github.com/suddosu/yasta_flasher"
+GITHUB_RAW_BASE   = "https://raw.githubusercontent.com/suddosu/yasta_flasher/main"
+GITHUB_TOOLS_BASE = f"{GITHUB_RAW_BASE}/files"   # совместимость со старым кодом
 
-# Основные утилиты из репозитория
+# Основные утилиты — проверяются как обязательные при запуске.
+# MIK живёт в files/MIK/ (отдельная проверка), update.exe — в files/.
 REQUIRED_TOOLS = [
-    "update.exe",           # Основная утилита прошивки
+    "update.exe",   # Утилита прошивки Amlogic
 ]
 
-# Дополнительные DLL (из внешних источников)
+# Дополнительные DLL
 OPTIONAL_DLLS = {
-    "libusb-1.0.dll": "https://github.com/libusb/libusb/releases/download/v1.0.26/libusb-1.0.26-binaries.7z",
-    "msvcp100.dll": "https://www.microsoft.com/en-us/download/details.aspx?id=26999",  # Visual C++ 2010 Redistributable
-    "msvcr100.dll": "https://www.microsoft.com/en-us/download/details.aspx?id=26999",  # Visual C++ 2010 Redistributable
+    "libusb-1.0.dll": f"{GITHUB_TOOLS_BASE}/libusb-1.0.dll",
 }
 
 PART_IMAGES = [
@@ -112,7 +133,7 @@ PART_IMAGES = [
     {"name": "odm", "file": "odm.img", "display": "ODM", "time": "несколько секунд"},
     {"name": "product", "file": "product.img", "display": "Product", "time": "несколько секунд"},
     {"name": "recovery", "file": "recovery.img", "display": "Recovery", "time": "несколько секунд"},
-    {"name": "system", "file": "system.img", "display": "System", "time": "около 10 минут"},
+    {"name": "system", "file": "system-bkp.img", "display": "System", "time": "около 10 минут"},
     {"name": "vendor", "file": "vendor.img", "display": "Vendor", "time": "несколько секунд"},
     {"name": "sysrecovery", "file": "sysrecovery.img", "display": "System Recovery", "time": "около 10 минут"},
 ]
@@ -141,6 +162,9 @@ class FlasherGUI:
         
         # Кастомные разделы
         self.custom_partitions = []
+
+        # Буфер захвата вывода терминала (для дампа разделов)
+        self._terminal_capture_buf = None
         
         # Создаем папку files если не существует
         os.makedirs(FILE_DIR, exist_ok=True)
@@ -172,16 +196,17 @@ class FlasherGUI:
         # Основной контейнер с разделением на левую и правую части
         main_container = tk.Frame(self.root)
         main_container.pack(fill=tk.BOTH, expand=True)
-        
-        # Левая панель (основной функционал)
+
+        # ВАЖНО: правую панель (COM-терминал, фиксированная ширина) пакуем
+        # ПЕРВОЙ с side=RIGHT — иначе при узком окне её выталкивает за край.
+        right_panel = tk.Frame(main_container, padx=10, pady=10, width=350)
+        right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False)
+        right_panel.pack_propagate(False)
+
+        # Левая панель (основной функционал) — занимает остаток ширины
         left_panel = tk.Frame(main_container, padx=10, pady=10)
         left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        # Правая панель (COM терминал)
-        right_panel = tk.Frame(main_container, padx=10, pady=10, width=350)
-        right_panel.pack(side=tk.RIGHT, fill=tk.BOTH)
-        right_panel.pack_propagate(False)
-        
+
         self.create_left_panel(left_panel)
         self.create_com_terminal(right_panel)
     
@@ -278,6 +303,10 @@ class FlasherGUI:
             else:
                 path_label.config(text="✗ Не найден", fg="red")
         
+        # Сохраняем ссылку на scrollable_frame для динамического добавления разделов
+        self.images_scrollable_frame = scrollable_frame
+        self.images_canvas = canvas
+
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
@@ -295,6 +324,14 @@ class FlasherGUI:
             bg="#3498DB",
             fg="white"
         ).pack(side=tk.LEFT, padx=5)
+        tk.Button(
+            select_frame,
+            text="💾 Дамп разделов",
+            command=self.dump_partitions,
+            width=16,
+            bg="#C0392B",
+            fg="white"
+        ).pack(side=tk.LEFT, padx=5)
         
         # Правая сторона
         tk.Button(
@@ -303,6 +340,15 @@ class FlasherGUI:
             command=self.open_env_editor,
             width=15,
             bg="#E67E22",
+            fg="white"
+        ).pack(side=tk.RIGHT, padx=5)
+        
+        tk.Button(
+            select_frame,
+            text="📝 Редактор образов",
+            command=self.open_image_editor,
+            width=17,
+            bg="#8E44AD",
             fg="white"
         ).pack(side=tk.RIGHT, padx=5)
         
@@ -664,11 +710,12 @@ class FlasherGUI:
     
     def terminal_update_line(self, message):
         """Обновление текущей строки (для динамического прогресса)"""
+        # Также пишем в буфер захвата (CR-строки без LF)
+        if self._terminal_capture_buf is not None:
+            self._terminal_capture_buf.append(message)
         try:
             self.terminal_text.config(state='normal')
-            # Удаляем текущую строку
             self.terminal_text.delete("end-1c linestart", "end-1c")
-            # Добавляем обновлённую
             self.terminal_text.insert("end-1c", message)
             self.terminal_text.see(tk.END)
             self.terminal_text.config(state='disabled')
@@ -678,10 +725,12 @@ class FlasherGUI:
     
     def terminal_add_line(self, message):
         """Добавление новой строки в терминал"""
+        # Если активен захват — пишем в буфер (для парсинга списка разделов)
+        if self._terminal_capture_buf is not None:
+            self._terminal_capture_buf.append(message)
         try:
             from datetime import datetime
             time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            
             self.terminal_text.config(state='normal')
             self.terminal_text.insert(tk.END, f"[{time_str}] {message}\n")
             self.terminal_text.see(tk.END)
@@ -692,6 +741,8 @@ class FlasherGUI:
     
     def terminal_log(self, message, timestamp=False, update_line=False):
         """Добавление сообщения в терминал (совместимость со старым API)"""
+        if self._terminal_capture_buf is not None:
+            self._terminal_capture_buf.append(message)
         if update_line:
             self.terminal_update_line(message)
         else:
@@ -735,93 +786,127 @@ class FlasherGUI:
     
     def add_custom_partition(self):
         """Добавление кастомного раздела"""
-        # Создаём диалоговое окно
         dialog = tk.Toplevel(self.root)
         dialog.title("Добавить кастомный раздел")
-        dialog.geometry("400x200")
+        dialog.geometry("420x220")
+        dialog.resizable(True, True)
+        dialog.minsize(420, 220)
         dialog.transient(self.root)
         dialog.grab_set()
         
         tk.Label(dialog, text="Добавление кастомного раздела", font=("Arial", 12, "bold")).pack(pady=10)
         
-        # Поле для имени раздела
-        tk.Label(dialog, text="Имя раздела:", font=("Arial", 10)).pack(pady=(10, 0))
+        tk.Label(dialog, text="Имя раздела (например: tee, logo):", font=("Arial", 10)).pack(pady=(5, 0))
         name_entry = tk.Entry(dialog, width=30, font=("Arial", 10))
         name_entry.pack(pady=5)
         name_entry.focus()
         
-        # Поле для файла образа
-        tk.Label(dialog, text="Файл образа:", font=("Arial", 10)).pack(pady=(10, 0))
-        
+        tk.Label(dialog, text="Файл образа:", font=("Arial", 10)).pack(pady=(5, 0))
         file_frame = tk.Frame(dialog)
         file_frame.pack(pady=5)
-        
         file_var = tk.StringVar()
-        file_entry = tk.Entry(file_frame, textvariable=file_var, width=25, font=("Arial", 9))
-        file_entry.pack(side=tk.LEFT, padx=(0, 5))
-        
+        tk.Entry(file_frame, textvariable=file_var, width=28, font=("Arial", 9)).pack(side=tk.LEFT, padx=(0, 5))
+
         def browse_file():
-            filename = filedialog.askopenfilename(
+            fn = filedialog.askopenfilename(
                 title="Выберите образ раздела",
                 filetypes=[("Image files", "*.img"), ("All files", "*.*")]
             )
-            if filename:
-                file_var.set(filename)
-        
+            if fn:
+                file_var.set(fn)
+
         tk.Button(file_frame, text="Обзор...", command=browse_file, width=10).pack(side=tk.LEFT)
-        
-        # Кнопки
+
         btn_frame = tk.Frame(dialog)
-        btn_frame.pack(pady=20)
-        
+        btn_frame.pack(pady=15)
+
         def add_partition():
             name = name_entry.get().strip()
             file_path = file_var.get().strip()
-            
             if not name:
                 messagebox.showwarning("Предупреждение", "Введите имя раздела", parent=dialog)
                 return
-            
-            if not file_path:
-                messagebox.showwarning("Предупреждение", "Выберите файл образа", parent=dialog)
+            if not file_path or not os.path.exists(file_path):
+                messagebox.showerror("Ошибка", "Укажите существующий файл образа", parent=dialog)
                 return
-            
-            if not os.path.exists(file_path):
-                messagebox.showerror("Ошибка", "Файл не существует", parent=dialog)
+            if name in self.image_vars:
+                messagebox.showwarning("Предупреждение", f"Раздел '{name}' уже существует", parent=dialog)
                 return
-            
-            # Добавляем в список
+
             custom_part = {
                 "name": name,
                 "file": os.path.basename(file_path),
                 "display": f"{name} (custom)",
-                "time": "зависит от размера"
+                "time": "зависит от размера",
             }
-            
             PART_IMAGES.append(custom_part)
             self.selected_images[name] = file_path
-            
-            # Добавляем чекбокс в интерфейс
-            self.add_partition_checkbox(custom_part)
-            
-            self.log(f"✓ Добавлен кастомный раздел: {name}")
+
+            # Регистрируем BooleanVar — без этого start_flashing падал с KeyError
+            var = tk.BooleanVar(value=True)
+            self.image_vars[name] = var
+
+            # Добавляем строку в UI
+            self.add_partition_checkbox(custom_part, file_path)
+
+            self.log(f"✓ Добавлен кастомный раздел: {name} ({os.path.basename(file_path)})")
             messagebox.showinfo("Успех", f"Раздел '{name}' добавлен", parent=dialog)
             dialog.destroy()
-        
-        tk.Button(btn_frame, text="Добавить", command=add_partition, bg="#27AE60", fg="white", width=12).pack(side=tk.LEFT, padx=5)
+
+        tk.Button(btn_frame, text="Добавить", command=add_partition,
+                  bg="#27AE60", fg="white", width=12).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="Отмена", command=dialog.destroy, width=12).pack(side=tk.LEFT)
+
+    def add_partition_checkbox(self, img, file_path=None):
+        """Добавить строку раздела в прокручиваемый список"""
+        if not hasattr(self, 'images_scrollable_frame'):
+            return
+        parent = self.images_scrollable_frame
+
+        frame = tk.Frame(parent)
+        frame.pack(fill=tk.X, padx=5, pady=2)
+
+        cb = tk.Checkbutton(
+            frame,
+            text=f"{img['display']} ({img['file']})",
+            variable=self.image_vars[img["name"]],
+            font=("Arial", 9)
+        )
+        cb.pack(side=tk.LEFT)
+
+        btn = tk.Button(
+            frame, text="Обзор...",
+            command=lambda i=img: self.browse_image(i),
+            width=10
+        )
+        btn.pack(side=tk.RIGHT, padx=5)
+
+        path_label = tk.Label(frame, font=("Arial", 8))
+        path_label.pack(side=tk.RIGHT, padx=5)
+        self.image_path_labels[img["name"]] = path_label
+
+        if file_path and os.path.exists(file_path):
+            path_label.config(text=f"✓ {os.path.basename(file_path)}", fg="green")
+        else:
+            path_label.config(text="✗ Не найден", fg="red")
+
+        # Обновляем область прокрутки
+        if hasattr(self, 'images_canvas'):
+            self.images_canvas.configure(scrollregion=self.images_canvas.bbox("all"))
     
-    def add_partition_checkbox(self, img):
-        """Добавить чекбокс для нового раздела (должен быть вызван из основного потока)"""
-        # Этот метод нужно вызвать для добавления UI элемента
-        # Пока просто логируем - полная реализация требует рефакторинга
-        pass
-    
-    def open_env_editor(self):
-        """Открыть редактор ENV"""
+    def open_env_editor(self, return_window=False):
+        """Открыть редактор ENV.
+
+        return_window=True → вернуть окно Toplevel (для wait_window при
+        вызове из процесса прошивки, чтобы блокировать до закрытия).
+        Значения полей берутся из self.env_data (заполняется при чтении
+        env с устройства перед прошивкой).
+        """
         editor = tk.Toplevel(self.root)
         editor.title("⚙️ Редактор переменных окружения (ENV)")
         editor.geometry("800x700")
+        editor.resizable(True, True)
+        editor.minsize(450, 300)
         editor.transient(self.root)
         
         tk.Label(
@@ -846,9 +931,13 @@ class FlasherGUI:
         
         tk.Label(info_frame, text=info_text, justify=tk.LEFT, font=("Arial", 9), pady=5).pack(padx=10)
         
+        # Контейнер кнопок ВНИЗУ — пакуем до notebook чтобы не исчезал
+        env_bottom = tk.Frame(editor, bg="#ECF0F1", relief=tk.RIDGE, bd=2)
+        env_bottom.pack(side=tk.BOTTOM, fill=tk.X)
+
         # Notebook с вкладками
         notebook = ttk.Notebook(editor)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         
         # Вкладка 1: Идентификация
         id_frame = tk.Frame(notebook)
@@ -868,38 +957,43 @@ class FlasherGUI:
         id_scroll = scrolledtext.ScrolledText(id_frame, height=20, font=("Consolas", 9))
         id_scroll.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
+        # Значения по умолчанию — пустые; заполняются из устройства или из файла
         id_vars = {
             "serial": {
-                "value": "X10AAA5555RM1K",
+                "value": "",
                 "desc": "Серийный номер устройства (основной)",
                 "critical": True
             },
             "deviceid": {
-                "value": "X10AAA5555RM1K", 
+                "value": "",
                 "desc": "ID устройства (используется в bootargs)",
                 "critical": True
             },
             "custom_deviceid": {
-                "value": "X10AAA5555RM1K",
+                "value": "",
                 "desc": "Кастомный ID устройства",
                 "critical": True
             },
             "aml_serial": {
-                "value": "280c400001221a000000000000250",
+                "value": "",
                 "desc": "Аппаратный серийный номер Amlogic",
                 "critical": False
             },
             "mac": {
-                "value": "3c:0b:4f:ff:ff:ff",
+                "value": "",
                 "desc": "MAC адрес сетевого интерфейса",
                 "critical": True
             },
             "ethaddr": {
-                "value": "3c:0b:4f:ff:ff:ff",
+                "value": "",
                 "desc": "Ethernet MAC адрес",
                 "critical": True
             },
         }
+        # Если у нас уже есть сохранённые данные — подставляем их
+        for k in id_vars:
+            if k in self.env_data:
+                id_vars[k]["value"] = self.env_data[k]
         
         for var_name, var_info in id_vars.items():
             frame = tk.Frame(id_scroll)
@@ -927,34 +1021,34 @@ class FlasherGUI:
         
         sec_vars = {
             "lock": {
-                "value": "10000000",
-                "desc": "🔓 Разблокировка bootloader (10000000 = разблокирован)",
+                "value": self.env_data.get("lock", ""),
+                "desc": "🔓 Разблокировка bootloader (10000000 = разблокирован, 0 = заблокирован)",
                 "critical": True
             },
             "avb2": {
-                "value": "0",
+                "value": self.env_data.get("avb2", ""),
                 "desc": "🔓 Android Verified Boot 2.0 (0 = выключен, 1 = включен)",
                 "critical": True
             },
             "EnableSelinux": {
-                "value": "enforcing",
+                "value": self.env_data.get("EnableSelinux", ""),
                 "desc": "🔓 SELinux режим (permissive = отключен, enforcing = включен)",
                 "critical": True,
                 "options": ["permissive", "enforcing", "disabled"]
             },
             "jtag": {
-                "value": "disable",
+                "value": self.env_data.get("jtag", ""),
                 "desc": "🔧 JTAG отладка (enable/disable)",
                 "critical": False,
                 "options": ["disable", "enable"]
             },
             "silent": {
-                "value": "0",
+                "value": self.env_data.get("silent", ""),
                 "desc": "📢 Вывод сообщений загрузки (0 = включен, 1 = выключен)",
                 "critical": False
             },
             "rabbit_hole_debug": {
-                "value": "0",
+                "value": self.env_data.get("rabbit_hole_debug", ""),
                 "desc": "🐰 Режим отладки (0 = выключен, 1 = включен)",
                 "critical": False
             },
@@ -990,32 +1084,32 @@ class FlasherGUI:
         
         sys_vars = {
             "bootdelay": {
-                "value": "1",
+                "value": self.env_data.get("bootdelay", ""),
                 "desc": "⏱️ Задержка перед загрузкой (секунды)",
                 "critical": False
             },
             "led_screen_brightness": {
-                "value": "100",
+                "value": self.env_data.get("led_screen_brightness", ""),
                 "desc": "💡 Яркость экрана (0-255)",
                 "critical": False
             },
             "led_ring_brightness": {
-                "value": "10",
+                "value": self.env_data.get("led_ring_brightness", ""),
                 "desc": "💡 Яркость кольца подсветки (0-255)",
                 "critical": False
             },
             "localization": {
-                "value": "RU.RU",
+                "value": self.env_data.get("localization", ""),
                 "desc": "🌍 Локализация устройства",
                 "critical": False
             },
             "hdmimode": {
-                "value": "1080p60hz",
+                "value": self.env_data.get("hdmimode", ""),
                 "desc": "📺 Режим HDMI (1080p60hz, 720p60hz и т.д.)",
                 "critical": False
             },
             "outputmode": {
-                "value": "576cvbs",
+                "value": self.env_data.get("outputmode", ""),
                 "desc": "📺 Режим вывода видео",
                 "critical": False
             },
@@ -1038,8 +1132,8 @@ class FlasherGUI:
         
         sys_scroll.config(state='disabled')
         
-        # Кнопки
-        btn_frame = tk.Frame(editor)
+        # Кнопки (внутри зафиксированного снизу env_bottom)
+        btn_frame = tk.Frame(env_bottom, bg="#ECF0F1")
         btn_frame.pack(fill=tk.X, padx=10, pady=10)
         
         def save_env():
@@ -1163,7 +1257,745 @@ class FlasherGUI:
             font=("Arial", 10),
             width=10
         ).pack(side=tk.RIGHT, padx=5)
-    
+
+        if return_window:
+            return editor
+        return None
+
+    def _find_mik_tools(self):
+        """Найти MIK и его консольные утилиты в files/MIK/.
+        Возвращает dict: {mik_gui, bin_dir, simg2img, img2simg, make_ext4fs,
+                          imgextractor, mkfs_erofs}. Значения = путь или None.
+        """
+        mik_dir = os.path.join(FILE_DIR, "MIK")
+        result = {"mik_gui": None, "bin_dir": None, "simg2img": None,
+                  "img2simg": None, "make_ext4fs": None, "imgextractor": None,
+                  "mkfs_erofs": None, "dir": mik_dir}
+        if not os.path.isdir(mik_dir):
+            return result
+
+        # GUI (MIK64.exe / mik64.exe / MIK.exe)
+        for name in ("MIK64.exe", "mik64.exe", "MIK.exe", "mik.exe"):
+            p = os.path.join(mik_dir, name)
+            if os.path.exists(p):
+                result["mik_gui"] = p
+                break
+
+        # bin/ — консольные утилиты
+        bin_dir = os.path.join(mik_dir, "bin")
+        if not os.path.isdir(bin_dir):
+            # рекурсивно ищем bin
+            for root_d, dirs, _files in os.walk(mik_dir):
+                if "bin" in dirs:
+                    bin_dir = os.path.join(root_d, "bin")
+                    break
+        if os.path.isdir(bin_dir):
+            result["bin_dir"] = bin_dir
+            def find_tool(*names):
+                for n in names:
+                    p = os.path.join(bin_dir, n)
+                    if os.path.exists(p):
+                        return p
+                # рекурсивно
+                for root_d, _dirs, files in os.walk(bin_dir):
+                    for n in names:
+                        if n in files:
+                            return os.path.join(root_d, n)
+                return None
+            result["simg2img"]     = find_tool("simg2img.exe", "simg2img")
+            result["img2simg"]     = find_tool("img2simg.exe", "ext2simg.exe",
+                                               "img2simg", "ext2simg")
+            result["make_ext4fs"]  = find_tool("make_ext4fs.exe", "make_ext4fs")
+            result["imgextractor"] = find_tool("imgextractor.exe", "imgextractor",
+                                               "extract.exe", "ext4_unpacker.exe")
+            result["mkfs_erofs"]   = find_tool("mkfs.erofs.exe", "mkfs.erofs",
+                                               "mke2fs.exe")
+        return result
+
+    def open_image_editor(self):
+        """Редактор образов Android.
+
+        Два режима:
+          A) Прямой вызов консольных утилит MIK из bin/ (распаковка + сборка
+             без запуска GUI MIK) — для ext4/sparse образов.
+          B) Запуск полного MIK GUI (мышкой) — fallback для erofs и сложных
+             случаев, где консольная сборка ненадёжна.
+
+        ВАЖНО (из Readme MIK): путь к образу не должен содержать кириллицу,
+        пробелы — иначе make_ext4fs не соберёт образ.
+        """
+        import threading as _th
+
+        tools = self._find_mik_tools()
+
+        win = tk.Toplevel(self.root)
+        win.title("Редактор образов Android")
+        win.resizable(True, True)
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.geometry(f"{min(900, sw-60)}x{min(720, sh-60)}")
+        win.minsize(720, 600)
+        win.transient(self.root)
+
+        have_tools = tools["mik_gui"] or tools["bin_dir"]
+        hdr_color = "#27AE60" if have_tools else "#E74C3C"
+        hdr_text  = ("✓ MIK найден" if have_tools
+                     else "✗ MIK не найден — нажмите «Загрузить утилиты»")
+        hdr = tk.Frame(win, bg=hdr_color, height=32)
+        hdr.pack(side=tk.TOP, fill=tk.X)
+        hdr.pack_propagate(False)
+        tk.Label(hdr, text=hdr_text, font=("Arial", 9, "bold"),
+                 bg=hdr_color, fg="white").pack(side=tk.LEFT, padx=10, pady=6)
+
+        # ══ Низ: кнопки ══
+        bottom = tk.Frame(win, bg="#ECF0F1", relief=tk.RIDGE, bd=2)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
+        btn_row = tk.Frame(bottom, bg="#ECF0F1")
+        btn_row.pack(fill=tk.X, padx=10, pady=8)
+
+        # ══ Лог (тоже снизу) ══
+        logf = tk.LabelFrame(win, text="Журнал", font=("Arial", 9, "bold"))
+        logf.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 4))
+        log_box = scrolledtext.ScrolledText(logf, height=8, font=("Consolas", 8),
+                                            bg="#1E1E1E", fg="#00FF00", state='disabled')
+        log_box.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        def log(m):
+            log_box.config(state='normal')
+            log_box.insert(tk.END, m + "\n"); log_box.see(tk.END)
+            log_box.config(state='disabled'); log_box.update_idletasks()
+
+        # ══ Верх: выбор образа и папки ══
+        top = tk.Frame(win)
+        top.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=8)
+
+        # — образ —
+        f1 = tk.LabelFrame(top, text="1. Образ раздела (.img)", font=("Arial", 9, "bold"))
+        f1.pack(fill=tk.X, pady=(0, 6))
+        img_var = tk.StringVar()
+        r1 = tk.Frame(f1); r1.pack(fill=tk.X, padx=6, pady=4)
+        tk.Entry(r1, textvariable=img_var, font=("Arial", 9)
+                 ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+
+        info_var = tk.StringVar(value="Выберите образ для анализа")
+        is_sparse = tk.BooleanVar(value=False)
+        is_erofs  = tk.BooleanVar(value=False)
+
+        def analyze(path):
+            try:
+                sz = os.path.getsize(path)
+                with open(path, "rb") as fh:
+                    head4 = fh.read(4)
+                    fh.seek(1024)
+                    erofs_magic = fh.read(4)
+                    fh.seek(0x438)
+                    ext4_magic = fh.read(2)
+                sparse = head4 == b"\x3a\xff\x26\xed"
+                erofs  = erofs_magic == b"\xe2\xe1\xf5\xe0"   # 0xE0F5E1E2 @ 1024
+                ext4   = ext4_magic == b"\x53\xef"            # 0xEF53 @ 0x438
+                is_sparse.set(sparse); is_erofs.set(erofs)
+                fmt = ("Sparse (android)" if sparse else
+                       "EROFS (read-only)" if erofs else
+                       "ext4" if ext4 else "неизвестно")
+                info_var.set(f"{fmt}  |  {sz/(1024*1024):.1f} MB")
+                log(f"Образ: {os.path.basename(path)} — {fmt}, {sz/(1024*1024):.1f} MB")
+                if erofs:
+                    log("ℹ EROFS — для редактирования соберётся как ext4 (размер вырастет)")
+                if _re_has_bad(path):
+                    log("⚠ В пути пробелы/кириллица — make_ext4fs может не собрать образ!")
+            except Exception as ex:
+                log(f"❌ Анализ: {ex}")
+
+        def _re_has_bad(p):
+            import re
+            return bool(re.search(r'[ \u0400-\u04FF]', p))
+
+        def pick_img():
+            fn = filedialog.askopenfilename(
+                title="Выберите образ", parent=win,
+                filetypes=[("Image", "*.img *.PARTITION *.fex"), ("All", "*.*")])
+            if fn:
+                img_var.set(fn)
+                work_var.set(os.path.splitext(fn)[0] + "_unpacked")
+                out_var.set(os.path.splitext(fn)[0] + "-modified.img")
+                analyze(fn)
+        tk.Button(r1, text="Обзор…", command=pick_img, width=9).pack(side=tk.LEFT)
+        tk.Label(f1, textvariable=info_var, font=("Arial", 8), fg="#8E44AD"
+                 ).pack(anchor=tk.W, padx=6, pady=(0, 4))
+
+        for cn in ("system", "vendor", "product", "odm"):
+            if cn in self.selected_images:
+                img_var.set(self.selected_images[cn]); analyze(self.selected_images[cn]); break
+
+        # — папка распаковки —
+        f2 = tk.LabelFrame(top, text="2. Папка распаковки", font=("Arial", 9, "bold"))
+        f2.pack(fill=tk.X, pady=(0, 6))
+        work_var = tk.StringVar()
+        r2 = tk.Frame(f2); r2.pack(fill=tk.X, padx=6, pady=4)
+        tk.Entry(r2, textvariable=work_var, font=("Arial", 9)
+                 ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        tk.Button(r2, text="Обзор…",
+                  command=lambda: work_var.set(
+                      filedialog.askdirectory(parent=win) or work_var.get()),
+                  width=9).pack(side=tk.LEFT)
+
+        # — выходной образ —
+        f3 = tk.LabelFrame(top, text="3. Новый образ (.img)", font=("Arial", 9, "bold"))
+        f3.pack(fill=tk.X, pady=(0, 6))
+        out_var = tk.StringVar()
+        r3 = tk.Frame(f3); r3.pack(fill=tk.X, padx=6, pady=4)
+        tk.Entry(r3, textvariable=out_var, font=("Arial", 9)
+                 ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        tk.Button(r3, text="Обзор…",
+                  command=lambda: out_var.set(
+                      filedialog.asksaveasfilename(parent=win, defaultextension=".img")
+                      or out_var.get()),
+                  width=9).pack(side=tk.LEFT)
+
+        # — описание режимов —
+        desc = tk.Label(top, justify=tk.LEFT, font=("Arial", 8), fg="gray", text=(
+            "Распаковка/сборка через консольные утилиты MIK (bin/).\n"
+            "• ext4/sparse — поддерживаются полностью.\n"
+            "• EROFS — образ только для чтения; для редактирования его\n"
+            "  конвертируют в ext4 (увеличится размер). Сложные случаи —\n"
+            "  через кнопку «Открыть GUI MIK».\n"
+            "• Путь не должен содержать пробелов и кириллицы!"
+        ))
+        desc.pack(anchor=tk.W, pady=(4, 0))
+
+        prog = ttk.Progressbar(top, mode="indeterminate")
+        prog.pack(fill=tk.X, pady=(6, 0))
+
+        cflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+        def run_tool(cmd, timeout=900):
+            """Запустить консольную утилиту, лог в окно. Возврат (rc, out)."""
+            log(f"$ {os.path.basename(cmd[0])} {' '.join(cmd[1:])}")
+            try:
+                r = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                                   creationflags=cflags)
+                out = ((r.stdout or b"") + (r.stderr or b"")
+                       ).decode("utf-8", errors="ignore")
+                for ln in out.splitlines():
+                    if ln.strip():
+                        log("  " + ln.strip())
+                return r.returncode, out
+            except subprocess.TimeoutExpired:
+                log("  ❌ таймаут"); return -1, "timeout"
+            except Exception as ex:
+                log(f"  ❌ {ex}"); return -1, str(ex)
+
+        # ══ Распаковка ══
+        def do_unpack():
+            src = img_var.get()
+            if not src or not os.path.exists(src):
+                messagebox.showwarning("!", "Выберите образ", parent=win); return
+            if not tools["bin_dir"]:
+                messagebox.showwarning("!",
+                    "Консольные утилиты MIK (bin/) не найдены.\n"
+                    "Используйте «Открыть GUI MIK» или скачайте MIK заново.",
+                    parent=win); return
+            work = work_var.get() or os.path.splitext(src)[0] + "_unpacked"
+            work_var.set(work)
+
+            def _t():
+                prog.start(10)
+                try:
+                    os.makedirs(work, exist_ok=True)
+                    raw = src
+                    # sparse → raw
+                    if is_sparse.get() and tools["simg2img"]:
+                        raw = os.path.join(work, "_raw.img")
+                        log("🔄 simg2img (sparse → raw)...")
+                        rc, _ = run_tool([tools["simg2img"], src, raw])
+                        if rc != 0:
+                            log("❌ simg2img не сработал"); return
+                    # извлечение содержимого
+                    if tools["imgextractor"]:
+                        log("📂 imgextractor...")
+                        rc, _ = run_tool([tools["imgextractor"], raw, work])
+                        if rc == 0:
+                            log(f"✓ Распаковано в {work}")
+                            self.root.after(0, lambda: _open_folder(work))
+                        else:
+                            log("⚠ imgextractor вернул ошибку — для erofs это ожидаемо.")
+                            log("  Попробуйте «Открыть GUI MIK».")
+                    else:
+                        log("⚠ imgextractor не найден в bin/. Используйте GUI MIK.")
+                finally:
+                    self.root.after(0, prog.stop)
+            _th.Thread(target=_t, daemon=True).start()
+
+        def _open_folder(path):
+            try: os.startfile(path)
+            except Exception: pass
+            messagebox.showinfo("Распаковано",
+                f"Образ распакован в:\n{path}\n\n"
+                "Отредактируйте файлы, затем «Собрать образ».", parent=win)
+
+        # ══ Сборка ══
+        def do_pack():
+            work = work_var.get()
+            out  = out_var.get()
+            if not work or not os.path.isdir(work):
+                messagebox.showwarning("!", "Нет папки распаковки", parent=win); return
+            if not out:
+                messagebox.showwarning("!", "Укажите выходной файл", parent=win); return
+            if not tools["make_ext4fs"]:
+                messagebox.showwarning("!",
+                    "make_ext4fs не найден. Используйте «Открыть GUI MIK».",
+                    parent=win); return
+            if __import__("re").search(r'[ \u0400-\u04FF]', work + out):
+                if not messagebox.askyesno("Внимание",
+                    "В пути есть пробелы/кириллица.\nmake_ext4fs может не собрать образ.\n"
+                    "Продолжить?", parent=win):
+                    return
+
+            def _t():
+                prog.start(10)
+                try:
+                    # размер: берём исходный образ или папку × 1.1
+                    orig = img_var.get()
+                    if orig and os.path.exists(orig):
+                        size = os.path.getsize(orig)
+                    else:
+                        size = sum(os.path.getsize(os.path.join(dp, f))
+                                   for dp, _d, fs in os.walk(work) for f in fs)
+                        size = int(size * 1.15)
+                    raw_out = out
+                    make_sparse = is_sparse.get()
+                    if make_sparse:
+                        raw_out = out + ".raw"
+                    log(f"📦 make_ext4fs (размер {size//(1024*1024)} MB)...")
+                    # make_ext4fs -s -l <size> -a <mountpoint> <out> <dir>
+                    mp = os.path.basename(work).replace("_unpacked", "")
+                    rc, _ = run_tool([tools["make_ext4fs"],
+                                      "-l", str(size), "-a", mp or "system",
+                                      raw_out, work])
+                    if rc != 0:
+                        log("❌ make_ext4fs не сработал"); return
+                    if make_sparse and tools["img2simg"]:
+                        log("🔄 img2simg (raw → sparse)...")
+                        rc, _ = run_tool([tools["img2simg"], raw_out, out])
+                        try: os.remove(raw_out)
+                        except Exception: pass
+                    log(f"✓ Готово: {out}")
+                    self.root.after(0, lambda: messagebox.showinfo(
+                        "Готово", f"Новый образ:\n{out}", parent=win))
+                finally:
+                    self.root.after(0, prog.stop)
+            _th.Thread(target=_t, daemon=True).start()
+
+        # ══ GUI MIK ══
+        def open_gui():
+            if not tools["mik_gui"]:
+                messagebox.showwarning("!", "MIK GUI (MIK64.exe) не найден", parent=win); return
+            try:
+                img = img_var.get()
+                if img and os.path.exists(img):
+                    subprocess.Popen([tools["mik_gui"], img])
+                else:
+                    subprocess.Popen([tools["mik_gui"]])
+                log(f"✓ Запущен MIK GUI")
+            except Exception as ex:
+                messagebox.showerror("Ошибка", str(ex), parent=win)
+
+        # ── Кнопки ──
+        if tools["bin_dir"]:
+            tk.Button(btn_row, text="📂 Распаковать",
+                      command=do_unpack, bg="#2980B9", fg="white",
+                      font=("Arial", 10, "bold"), height=2
+                      ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+            tk.Button(btn_row, text="📦 Собрать образ",
+                      command=do_pack, bg="#27AE60", fg="white",
+                      font=("Arial", 10, "bold"), height=2
+                      ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        if tools["mik_gui"]:
+            tk.Button(btn_row, text="🖥 Открыть GUI MIK",
+                      command=open_gui, bg="#8E44AD", fg="white",
+                      font=("Arial", 9), height=2
+                      ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        if not have_tools:
+            tk.Button(btn_row, text="📥 Загрузить утилиты",
+                      command=self.download_tools_from_github,
+                      bg="#9B59B6", fg="white", font=("Arial", 10), height=2
+                      ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        tk.Button(btn_row, text="Закрыть", command=win.destroy,
+                  font=("Arial", 9), height=2, width=10).pack(side=tk.RIGHT)
+
+        log("Редактор образов готов.")
+        if tools["bin_dir"]:
+            log(f"Утилиты bin/: {tools['bin_dir']}")
+            for k in ("simg2img", "img2simg", "make_ext4fs", "imgextractor"):
+                log(f"  {k}: {'✓' if tools[k] else '✗ не найден'}")
+        else:
+            log("⚠ Папка bin/ не найдена — доступен только GUI MIK.")
+
+    def dump_partitions(self):
+        """Дамп разделов устройства через update.exe mread.
+
+        Документация Amlogic update tool:
+          update mread store <part> normal <nBytes> <file>
+        ВАЖНО: nBytes — реальный размер раздела в байтах (НЕ 0!),
+        иначе ошибка "Err args in mread: check filetype and readSize".
+
+        Размеры берём из таблицы разделов (sectors × 512).
+        Список разделов:
+          • заранее известная таблица Yandex Station Max (по умолчанию)
+          • либо парсинг UART-лога amlmmc part 1 (автоматом или вставкой вручную)
+        """
+        import re as _re, time as _t, threading as _th
+
+        # (name, sectors)  — из реального лога устройства (× 512 = байты)
+        KNOWN_PARTS_SECT = [
+            ("bootloader",  8192), ("reserved",  131072), ("cache",  2293760),
+            ("env",        16384), ("logo",       16384), ("recovery",  49152),
+            ("misc",       16384), ("dtbo",       16384), ("cri_data",  16384),
+            ("param",      32768), ("boot",       32768), ("rsv",       32768),
+            ("metadata",   32768), ("vbmeta",      4096), ("tee",       65536),
+            ("vendor",   1048576), ("odm",       262144), ("system",  3031040),
+            ("product",   262144), ("sysrecovery",3145728),("data",  19644416),
+        ]
+        SECTOR = 512
+
+        def parse_table(text):
+            """Парсит вывод amlmmc part 1:
+               ' 00 0 8192    512 U-Boot bootloader'
+               idx start sectors sectorsize type name
+            """
+            parts, seen = [], set()
+            for line in text.splitlines():
+                line = _re.sub(r'\[\d{2}:\d{2}:\d{2}[.,]\d{3}\]', '', line)
+                m = _re.search(
+                    r'\b(\d{1,3})\s+(\d+)\s+(\d+)\s+(512)\s+\S+\s+(\w+)', line)
+                if m:
+                    name = m.group(5)
+                    if name in seen or name in ('name','Type','Size','Sect','Start'):
+                        continue
+                    seen.add(name)
+                    parts.append((name, int(m.group(3))))   # sectors
+            return parts
+
+        # ── Окно ──────────────────────────────────────────────────────────────
+        win = tk.Toplevel(self.root)
+        win.title("Дамп разделов")
+        win.resizable(True, True)
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        w = min(840, sw - 60)
+        h = min(760, sh - 60)
+        win.geometry(f"{w}x{h}")
+        win.minsize(680, 560)
+        win.transient(self.root)
+
+        # ══ КНОПКИ ВНИЗУ — пакуем ПЕРВЫМИ с side=BOTTOM, чтобы не исчезали ══
+        bottom = tk.Frame(win, bg="#ECF0F1", relief=tk.RIDGE, bd=2)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
+        btn_inner = tk.Frame(bottom, bg="#ECF0F1")
+        btn_inner.pack(fill=tk.X, padx=10, pady=8)
+
+        session_btn = tk.Button(
+            btn_inner,
+            text="⚡ Запустить сессию (U-Boot → amlmmc part 1)",
+            bg="#2980B9", fg="white", font=("Arial", 10, "bold"), height=2)
+        session_btn.pack(fill=tk.X, pady=(0, 4))
+
+        mid_row = tk.Frame(btn_inner, bg="#ECF0F1")
+        mid_row.pack(fill=tk.X, pady=(0, 4))
+        paste_btn = tk.Button(
+            mid_row, text="📋 Вставить UART лог",
+            bg="#7F8C8D", fg="white", font=("Arial", 9))
+        paste_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
+        reset_btn = tk.Button(
+            mid_row, text="↺ Стандартная таблица",
+            bg="#95A5A6", fg="white", font=("Arial", 9))
+        reset_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0))
+
+        dump_btn = tk.Button(
+            btn_inner, text="💾 Дамп выбранных разделов",
+            bg="#C0392B", fg="white", font=("Arial", 11, "bold"), height=2)
+        dump_btn.pack(fill=tk.X, pady=(0, 4))
+
+        tk.Button(btn_inner, text="Закрыть", command=win.destroy,
+                  font=("Arial", 9)).pack(fill=tk.X)
+
+        # ── Заголовок ─────────────────────────────────────────────────────────
+        tk.Label(win, text="Дамп разделов устройства",
+                 font=("Arial", 13, "bold"), pady=4).pack(side=tk.TOP)
+
+        # ── Инструкция ────────────────────────────────────────────────────────
+        inst = tk.LabelFrame(win, text="Подготовка", font=("Arial", 9, "bold"))
+        inst.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(0, 4))
+        tk.Label(inst, justify=tk.LEFT, font=("Arial", 8), text=(
+            "1. USB к сервисной колодке, пин 6 на GND, USB к ПК (без питания).\n"
+            "2. «Запустить сессию» → сразу подайте питание.\n"
+            "3. Размеры берутся из таблицы; для дампа размер ОБЯЗАТЕЛЕН (не 0).\n"
+            "4. Без UART используется стандартная таблица YSM (21 раздел)."
+        )).pack(anchor=tk.W, padx=6, pady=2)
+
+        # ── Папка ─────────────────────────────────────────────────────────────
+        of = tk.LabelFrame(win, text="Папка для дампов", font=("Arial", 9, "bold"))
+        of.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(0, 4))
+        out_var = tk.StringVar(value=os.path.join(ROOT_DIR, "dump"))
+        orow = tk.Frame(of); orow.pack(fill=tk.X, padx=6, pady=4)
+        tk.Entry(orow, textvariable=out_var, font=("Arial", 9)
+                 ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        tk.Button(orow, text="Обзор…",
+                  command=lambda: out_var.set(
+                      filedialog.askdirectory(title="Папка дампов", parent=win)
+                      or out_var.get()), width=8).pack(side=tk.LEFT)
+
+        # ── Лог (внизу, фиксированной высоты, перед таблицей) ─────────────────
+        logf = tk.LabelFrame(win, text="Журнал", font=("Arial", 9, "bold"))
+        logf.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 4))
+        log_box = scrolledtext.ScrolledText(logf, height=6, font=("Consolas", 8),
+                                            bg="#1E1E1E", fg="#00FF00", state='disabled')
+        log_box.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        def log(msg):
+            log_box.config(state='normal')
+            log_box.insert(tk.END, msg + "\n")
+            log_box.see(tk.END)
+            log_box.config(state='disabled')
+            log_box.update_idletasks()
+
+        # ── Таблица (растягивается между шапкой и логом) ──────────────────────
+        lf = tk.LabelFrame(win, text="Разделы (клик — вкл/выкл; ✓ = дампить)",
+                           font=("Arial", 9, "bold"))
+        lf.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=(0, 4))
+
+        # Панель «выбрать все / снять все»
+        sel_bar = tk.Frame(lf)
+        sel_bar.pack(side=tk.TOP, fill=tk.X, padx=2, pady=(2, 0))
+
+        cols = ("sel", "name", "size")
+        tree = ttk.Treeview(lf, columns=cols, show="headings")
+        tree.heading("sel",  text="✓",      anchor="center")
+        tree.heading("name", text="Раздел")
+        tree.heading("size", text="Размер")
+        tree.column("sel",  width=40,  anchor="center", stretch=False)
+        tree.column("name", width=200, anchor="w")
+        tree.column("size", width=140, anchor="e")
+        vsb = ttk.Scrollbar(lf, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        part_sect = {}   # name → sectors
+        part_sel  = {}   # name → bool
+
+        def set_all(state):
+            for row in tree.get_children():
+                n = tree.set(row, "name")
+                part_sel[n] = state
+                tree.set(row, "sel", "✓" if state else "")
+
+        tk.Button(sel_bar, text="✓ Выбрать все", font=("Arial", 8),
+                  command=lambda: set_all(True), width=14).pack(side=tk.LEFT, padx=2)
+        tk.Button(sel_bar, text="✗ Снять все", font=("Arial", 8),
+                  command=lambda: set_all(False), width=14).pack(side=tk.LEFT, padx=2)
+        tk.Button(sel_bar, text="⤺ Инвертировать", font=("Arial", 8),
+                  command=lambda: [
+                      (part_sel.__setitem__(tree.set(r, "name"),
+                          not part_sel.get(tree.set(r, "name"), True)),
+                       tree.set(r, "sel",
+                          "✓" if part_sel[tree.set(r, "name")] else ""))
+                      for r in tree.get_children()],
+                  width=14).pack(side=tk.LEFT, padx=2)
+
+        def toggle(event):
+            row = tree.identify_row(event.y)
+            if not row: return
+            n = tree.set(row, "name")
+            part_sel[n] = not part_sel.get(n, True)
+            tree.set(row, "sel", "✓" if part_sel[n] else "")
+        tree.bind("<ButtonRelease-1>", toggle)
+
+        def populate(parts_sect, source=""):
+            for row in tree.get_children(): tree.delete(row)
+            part_sect.clear(); part_sel.clear()
+            for name, sect in parts_sect:
+                part_sect[name] = sect
+                part_sel[name]  = True
+                sz_b = sect * SECTOR
+                sz_s = (f"{sz_b/(1024*1024):.0f} MB" if sz_b >= 1024*1024
+                        else f"{sz_b//1024} KB")
+                tree.insert("", tk.END, values=("✓", name, sz_s))
+            if source:
+                log(f"✓ Загружено {len(parts_sect)} разделов ({source})")
+
+        populate(KNOWN_PARTS_SECT, "стандартная таблица YSM")
+
+        # ── Снапшот терминала ─────────────────────────────────────────────────
+        def snapshot_terminal():
+            result = [""]; ev = _th.Event()
+            def _do():
+                try: result[0] = self.terminal_text.get("1.0", tk.END)
+                except Exception: pass
+                ev.set()
+            self.root.after(0, _do)
+            ev.wait(timeout=5)
+            return result[0]
+
+        # ── Сессия ────────────────────────────────────────────────────────────
+        def run_session():
+            session_btn.config(state=tk.DISABLED)
+            def _thread():
+                try:
+                    self.get_update_path()
+                except FileNotFoundError as ex:
+                    log(f"❌ {ex}")
+                    self.root.after(0, lambda: session_btn.config(state=tk.NORMAL))
+                    return
+
+                _sender = get_aml_bundle_sender()
+                if _sender:
+                    bundle = os.path.join(FILE_DIR, "aml_bundle.img")
+                    if not os.path.exists(bundle):
+                        log(f"❌ aml_bundle.img не найден в {FILE_DIR}")
+                        self.root.after(0, lambda: session_btn.config(state=tk.NORMAL))
+                        return
+                    log("🔌 Ожидание устройства (USB Boot)...")
+                    try:
+                        _sender(bundle); log("✓ U-Boot загружен")
+                    except Exception as ex:
+                        log(f"❌ pyamlboot: {ex}")
+                        self.root.after(0, lambda: session_btn.config(state=tk.NORMAL))
+                        return
+                    _t.sleep(3)
+                else:
+                    log("⚠ pyamlboot_local не найден/не импортируется.")
+                    log("  Нажмите «Загрузить утилиты» и ПЕРЕЗАПУСТИТЕ программу,")
+                    log("  либо ожидается, что U-Boot уже загружен в память.")
+
+                log("🔧 mmc dev 1...")
+                try: self.aml_bulkcmd("mmc dev 1"); log("  ✓")
+                except Exception as ex: log(f"  ⚠ {ex}")
+
+                log("🔓 store disprotect key...")
+                try: self.aml_bulkcmd("store disprotect key"); log("  ✓")
+                except Exception as ex: log(f"  ⚠ {ex}")
+
+                snap_before = snapshot_terminal(); len_before = len(snap_before)
+                self._terminal_capture_buf = []
+
+                log("📋 amlmmc part 1...")
+                usb_out = ""
+                try: usb_out = self.aml_bulkcmd("amlmmc part 1")
+                except Exception as ex: log(f"  ⚠ {ex}")
+
+                wait = 4 if self.serial_running else 1
+                log(f"  ⏳ {wait}с (UART {'подключён' if self.serial_running else 'НЕТ'})")
+                _t.sleep(wait)
+
+                snap_after = snapshot_terminal()
+                new_text = snap_after[len_before:]
+                captured = "\n".join(self._terminal_capture_buf or [])
+                self._terminal_capture_buf = None
+
+                parts = parse_table(new_text + "\n" + captured + "\n" + usb_out)
+
+                def _ui():
+                    if parts:
+                        populate(parts, "UART автоопределение")
+                        log("✓ Таблица разделов получена с устройства — точное совпадение.")
+                    else:
+                        log("ℹ Авто-таблица с устройства не считана (ответ amlmmc part 1")
+                        log("  приходит по UART). Используется встроенная таблица YSM —")
+                        log("  она совпадает с реальной для Yandex Station Max (S905X2).")
+                        if not self.serial_running:
+                            log("  Для 100% сверки: подключите UART (115200) в приложении")
+                            log("  или вставьте лог из PuTTY кнопкой «Вставить UART лог».")
+                        else:
+                            log("  UART подключён, но ответ не распознан — проверьте,")
+                            log("  виден ли в терминале блок «Part Start Sect x Size».")
+                        prev = new_text[:200].strip()
+                        if prev: log(f"  (терминал: {prev[:120]})")
+                    session_btn.config(state=tk.NORMAL)
+                self.root.after(0, _ui)
+
+            _th.Thread(target=_thread, daemon=True).start()
+
+        # ── Вставить лог ──────────────────────────────────────────────────────
+        def paste_log():
+            pw = tk.Toplevel(win)
+            pw.title("Вставить UART лог")
+            pw.geometry("700x420"); pw.resizable(True, True); pw.minsize(500, 320)
+            pw.transient(win)
+            tk.Label(pw, text="Вставьте вывод amlmmc part 1 (из PuTTY):",
+                     font=("Arial", 10)).pack(pady=6)
+            txt = scrolledtext.ScrolledText(pw, font=("Consolas", 9))
+            txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+            def do_parse():
+                parts = parse_table(txt.get("1.0", tk.END))
+                if parts:
+                    populate(parts, "ручная вставка"); pw.destroy()
+                else:
+                    messagebox.showwarning("Не найдено",
+                        "Разделы не распознаны.", parent=pw)
+            tk.Button(pw, text="Разобрать", command=do_parse,
+                      bg="#27AE60", fg="white", font=("Arial", 10)
+                      ).pack(pady=6, fill=tk.X, padx=10)
+
+        # ── Дамп ──────────────────────────────────────────────────────────────
+        def run_dump():
+            to_dump = [n for n, s in part_sel.items() if s]
+            if not to_dump:
+                messagebox.showwarning("Нет выбора",
+                                       "Выберите хотя бы один раздел", parent=win)
+                return
+            out_dir = out_var.get(); os.makedirs(out_dir, exist_ok=True)
+            try:
+                update_path = self.get_update_path()
+            except FileNotFoundError as ex:
+                log(f"❌ {ex}"); return
+
+            def _thread():
+                dump_btn.config(state=tk.DISABLED)
+                log(f"\n💾 Дамп {len(to_dump)} разделов → {out_dir}")
+                cflags = subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0
+                for pname in to_dump:
+                    sect = part_sect.get(pname, 0)
+                    nbytes = sect * SECTOR
+                    if nbytes <= 0:
+                        log(f"  ⚠ {pname}: неизвестен размер, пропуск")
+                        continue
+                    out_file = os.path.join(out_dir, f"{pname}.img")
+                    size_hex = hex(nbytes)
+                    log(f"  ⬇ {pname}  ({nbytes//1024} KB, {size_hex})...")
+                    try:
+                        # update mread store <part> normal <nBytes> <file>
+                        r = subprocess.run(
+                            [update_path, "mread", "store",
+                             pname, "normal", size_hex, out_file],
+                            capture_output=True, timeout=1800,
+                            creationflags=cflags)
+                        out_t = ((r.stdout or b"")+(r.stderr or b"")
+                                 ).decode('utf-8', errors='ignore')
+                        for ln in out_t.splitlines():
+                            if ln.strip():
+                                self.root.after(0,
+                                    lambda l=ln.strip(): self.terminal_log(f"[USB] {l}"))
+                        if r.returncode == 0 and os.path.exists(out_file):
+                            log(f"     ✓ {os.path.getsize(out_file)//1024} KB сохранено")
+                        else:
+                            log(f"     ❌ код {r.returncode}: {out_t.strip()[:140]}")
+                    except subprocess.TimeoutExpired:
+                        log(f"     ❌ таймаут (раздел слишком большой?)")
+                    except Exception as ex:
+                        log(f"     ❌ {ex}")
+                self.root.after(0, lambda: (
+                    dump_btn.config(state=tk.NORMAL),
+                    messagebox.showinfo("Готово",
+                                        f"Дампы в:\n{out_dir}", parent=win)))
+            _th.Thread(target=_thread, daemon=True).start()
+
+        # ── Привязка кнопок ───────────────────────────────────────────────────
+        session_btn.config(command=run_session)
+        paste_btn.config(command=paste_log)
+        reset_btn.config(command=lambda: populate(KNOWN_PARTS_SECT, "стандартная таблица YSM"))
+        dump_btn.config(command=run_dump)
+
+        log("Стандартная таблица Yandex Station Max загружена (21 раздел).")
+        log("Размеры известны — дамп доступен сразу, даже без UART.")
+
     def browse_image(self, img):
         filename = filedialog.askopenfilename(
             title=f"Выберите образ {img['display']}",
@@ -1265,192 +2097,231 @@ class FlasherGUI:
         self.log(f"Проверка файлов: найдено {len(found_files)}, отсутствует {len(missing_files)}")
     
     def check_and_download_tools(self):
-        """Проверка и загрузка утилит при запуске"""
-        missing_tools = []
-        for tool in REQUIRED_TOOLS:
-            if not os.path.exists(os.path.join(FILE_DIR, tool)):
-                missing_tools.append(tool)
-        
-        if missing_tools:
-            msg = f"Отсутствуют необходимые утилиты:\n\n"
-            msg += "\n".join(f"• {tool}" for tool in missing_tools)
-            msg += "\n\nЗагрузить их автоматически из GitHub?"
-            
-            response = messagebox.askyesno(
-                "Необходимые файлы",
-                msg,
-                icon='question'
-            )
-            
-            if response:
+        """Проверка наличия всех критичных компонентов при запуске.
+
+        Проверяются:
+          • update.exe         (files/)               — прошивка, дамп
+          • MIK (MIK64.exe)    (files/MIK/)           — редактор образов
+          • pyamlboot_local/   (корень проекта)       — загрузка U-Boot
+          • aml_bundle.img     (files/) — опционально, специфичен для устройства
+        """
+        missing = []      # критичные — предлагаем скачать
+        warnings = []     # некритичные — просто предупреждаем
+
+        # 1. update.exe
+        if not (os.path.exists(os.path.join(FILE_DIR, "update.exe"))
+                or os.path.exists(os.path.join(FILE_DIR, "update"))):
+            missing.append("update.exe — утилита прошивки/дампа")
+
+        # 2. MIK (любой из вариантов имени, в т.ч. в подпапке)
+        mik_dir = os.path.join(FILE_DIR, "MIK")
+        mik_found = False
+        if os.path.isdir(mik_dir):
+            for root_d, _d, files in os.walk(mik_dir):
+                if any(n in files for n in ("MIK64.exe", "mik64.exe", "MIK.exe")):
+                    mik_found = True
+                    break
+        if not mik_found:
+            missing.append("MIK — редактор образов (files/MIK/)")
+
+        # 3. pyamlboot_local
+        pyaml = os.path.join(ROOT_DIR, "pyamlboot_local")
+        if not (os.path.isdir(pyaml)
+                and os.path.exists(os.path.join(pyaml, "boot.py"))):
+            missing.append("pyamlboot_local — загрузка U-Boot")
+
+        # 4. aml_bundle.img — некритично (специфичен для устройства)
+        if not os.path.exists(os.path.join(FILE_DIR, "aml_bundle.img")):
+            warnings.append("aml_bundle.img (U-Boot образ устройства) — "
+                            "добавьте вручную в files/")
+
+        if missing:
+            msg = "Отсутствуют компоненты:\n\n"
+            msg += "\n".join(f"• {m}" for m in missing)
+            if warnings:
+                msg += "\n\nТакже потребуется (вручную):\n"
+                msg += "\n".join(f"• {w}" for w in warnings)
+            msg += "\n\nЗагрузить недостающее из GitHub (suddosu/yasta_flasher + MIK)?"
+            if messagebox.askyesno("Необходимые файлы", msg, icon='question'):
                 self.download_tools_from_github()
+        elif warnings:
+            messagebox.showinfo(
+                "Проверка компонентов",
+                "Основные утилиты на месте.\n\nОбратите внимание:\n"
+                + "\n".join(f"• {w}" for w in warnings))
     
     def download_tools_from_github(self):
-        """Загрузка утилит из GitHub репозитория Khadas"""
-        self.log("="*50)
-        self.log("Загрузка утилит из GitHub...")
-        self.log("Источник: khadas/utils")
-        self.log("="*50)
-        
-        # Создаем окно прогресса
-        progress_window = tk.Toplevel(self.root)
-        progress_window.title("Загрузка файлов")
-        progress_window.geometry("550x350")
-        progress_window.transient(self.root)
-        progress_window.grab_set()
-        
-        tk.Label(
-            progress_window,
-            text="Загрузка утилит из GitHub",
-            font=("Arial", 12, "bold")
-        ).pack(pady=10)
-        
-        progress_text = scrolledtext.ScrolledText(
-            progress_window,
-            height=12,
-            font=("Consolas", 9)
-        )
-        progress_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        progress_bar = ttk.Progressbar(
-            progress_window,
-            mode='determinate',
-            maximum=len(REQUIRED_TOOLS)
-        )
-        progress_bar.pack(fill=tk.X, padx=10, pady=5)
-        
-        status_label = tk.Label(progress_window, text="", font=("Arial", 9))
-        status_label.pack(pady=5)
-        
-        def log_progress(msg):
-            progress_text.insert(tk.END, f"{msg}\n")
-            progress_text.see(tk.END)
-            progress_text.update()
-        
-        def download_thread():
-            success_count = 0
-            failed_count = 0
-            failed_files = []
-            
-            log_progress("📥 Загрузка из репозитория Khadas...")
-            log_progress(f"URL: {GITHUB_TOOLS_BASE}")
-            log_progress("-" * 60)
-            
-            for idx, tool in enumerate(REQUIRED_TOOLS):
-                try:
-                    status_label.config(text=f"Загрузка {tool}...")
-                    log_progress(f"\n[{idx+1}/{len(REQUIRED_TOOLS)}] {tool}")
-                    
-                    url = f"{GITHUB_TOOLS_BASE}/{tool}"
-                    dest_path = os.path.join(FILE_DIR, tool)
-                    
-                    # Проверяем, не существует ли файл уже
-                    if os.path.exists(dest_path):
-                        log_progress(f"  ⚠ Файл уже существует, пропускаем...")
-                        success_count += 1
-                        progress_bar['value'] = idx + 1
-                        progress_window.update()
+        """Скачать ВСЕ необходимые файлы из репозитория suddosu/yasta_flasher.
+
+        Главный механизм — скачивание всего репозитория одним zip-архивом
+        (archive/refs/heads/main.zip). Это гарантирует, что попадут ВСЕ файлы
+        из files/ и pyamlboot_local/ (включая .dll, .bin и прочее), без
+        перечисления имён и без зависимости от GitHub API (rate-limit / 404).
+
+        Раскладка из архива:
+          <zip>/files/*            → files/
+          <zip>/pyamlboot_local/*  → pyamlboot_local/   (в корне проекта)
+          прочее в корне репо      → игнорируется
+
+        MIK скачивается отдельно из CryptoNickSoft/MIK (другой репозиторий).
+        """
+        import zipfile, io
+
+        OWNER, REPO_NAME, BRANCH = "suddosu", "yasta_flasher", "main"
+        REPO_ZIP = f"https://github.com/{OWNER}/{REPO_NAME}/archive/refs/heads/{BRANCH}.zip"
+
+        def ua_req(url):
+            return urllib.request.Request(url, headers={"User-Agent": "yasta_flasher/1.0"})
+
+        # ── Окно прогресса ────────────────────────────────────────────────────
+        pw = tk.Toplevel(self.root)
+        pw.title("Загрузка файлов")
+        pw.resizable(True, True)
+        pw.geometry("680x500")
+        pw.minsize(520, 400)
+        pw.transient(self.root)
+        pw.grab_set()
+
+        tk.Label(pw, text=f"Загрузка из {OWNER}/{REPO_NAME}",
+                 font=("Arial", 12, "bold")).pack(pady=8)
+        log_box = scrolledtext.ScrolledText(pw, font=("Consolas", 9))
+        log_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        prog = ttk.Progressbar(pw, mode="indeterminate")
+        prog.pack(fill=tk.X, padx=10, pady=4)
+        prog.start(10)
+        status = tk.Label(pw, text="", font=("Arial", 9))
+        status.pack(pady=2)
+
+        def log_p(msg):
+            log_box.insert(tk.END, msg + "\n")
+            log_box.see(tk.END)
+            log_box.update_idletasks()
+
+        def extract_repo_zip(data, log_fn):
+            """Распаковать архив репозитория, разложив files/ и pyamlboot_local/.
+            Возвращает (files_count, pyaml_count).
+            """
+            fcount = pcount = 0
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                members = z.namelist()
+                # Верхняя папка вида yasta_flasher-main/
+                top = members[0].split("/")[0] + "/" if members and "/" in members[0] else ""
+                for m in members:
+                    if m.endswith("/"):
                         continue
-                    
-                    log_progress(f"  → Загрузка с {url}")
-                    
-                    # Загружаем файл с таймаутом
-                    req = urllib.request.Request(url)
-                    req.add_header('User-Agent', 'Mozilla/5.0')
-                    
-                    with urllib.request.urlopen(req, timeout=30) as response:
-                        data = response.read()
-                        with open(dest_path, 'wb') as f:
-                            f.write(data)
-                    
-                    file_size = os.path.getsize(dest_path)
-                    size_kb = file_size / 1024
-                    log_progress(f"  ✓ Загружено: {size_kb:.1f} KB")
-                    self.log(f"✓ Загружен: {tool} ({size_kb:.1f} KB)")
-                    success_count += 1
-                    
-                except urllib.error.HTTPError as e:
-                    log_progress(f"  ✗ HTTP ошибка: {e.code} {e.reason}")
-                    self.log(f"✗ HTTP ошибка: {tool} - {e.code}")
-                    failed_count += 1
-                    failed_files.append(tool)
-                    
-                except urllib.error.URLError as e:
-                    log_progress(f"  ✗ Сетевая ошибка: {str(e.reason)}")
-                    self.log(f"✗ Сетевая ошибка: {tool}")
-                    failed_count += 1
-                    failed_files.append(tool)
-                    
-                except Exception as e:
-                    log_progress(f"  ✗ Ошибка: {str(e)}")
-                    self.log(f"✗ Ошибка: {tool} - {str(e)}")
-                    failed_count += 1
-                    failed_files.append(tool)
-                
-                progress_bar['value'] = idx + 1
-                progress_window.update()
-            
-            log_progress("\n" + "="*60)
-            log_progress("ℹ️  ДОПОЛНИТЕЛЬНЫЕ БИБЛИОТЕКИ")
-            log_progress("="*60)
-            log_progress("\nИсточник утилит:")
-            log_progress("https://github.com/althafvly/Amlogic_Kitchen")
-            log_progress("\nНекоторые DLL-библиотеки могут потребоваться:")
-            log_progress("")
-            for dll, url in OPTIONAL_DLLS.items():
-                log_progress(f"• {dll}")
-                if isinstance(url, str) and url.startswith("http"):
-                    log_progress(f"  Скачать: {url}")
-            log_progress("\nЕсли update.exe не запустится, установите:")
-            log_progress("Microsoft Visual C++ 2010 Redistributable Package")
-            log_progress("(обычно уже установлен в Windows)")
-            
-            log_progress("\n" + "="*60)
-            log_progress(f"✓ ЗАВЕРШЕНО")
-            log_progress(f"  Успешно: {success_count} файлов")
-            log_progress(f"  Ошибок: {failed_count}")
-            if failed_files:
-                log_progress(f"  Не загружены: {', '.join(failed_files)}")
-            log_progress("="*60)
-            
-            status_label.config(text=f"Завершено: {success_count} успешно, {failed_count} ошибок")
-            self.log(f"Загрузка завершена: {success_count} файлов, {failed_count} ошибок")
-            
-            time.sleep(3)
-            progress_window.destroy()
-            
-            if success_count > 0:
-                msg = f"✓ Загружено файлов: {success_count}\n"
-                if failed_count > 0:
-                    msg += f"⚠ Ошибок: {failed_count}\n\n"
-                    msg += "Не удалось загрузить:\n"
-                    msg += "\n".join(f"• {f}" for f in failed_files)
-                    msg += "\n\nВозможно, файлы удалены из репозитория."
-                    msg += "\nПопробуйте загрузить их вручную."
-                    messagebox.showwarning("Частичная загрузка", msg)
-                else:
-                    msg += "\nУтилиты готовы к использованию!"
-                    msg += "\n\nℹ️ Если update.exe не запустится, установите:"
-                    msg += "\nMicrosoft Visual C++ 2010 Redistributable"
-                    messagebox.showinfo("Успех", msg)
-                self.check_all_files()
+                    rel = m[len(top):] if top and m.startswith(top) else m
+                    if not rel:
+                        continue
+                    # files/...  → FILE_DIR
+                    if rel.startswith("files/"):
+                        sub = rel[len("files/"):]
+                        dest = os.path.join(FILE_DIR, sub.replace("/", os.sep))
+                        target = "files"
+                    # pyamlboot_local/...  → ROOT_DIR/pyamlboot_local
+                    elif rel.startswith("pyamlboot_local/"):
+                        dest = os.path.join(ROOT_DIR, rel.replace("/", os.sep))
+                        target = "pyamlboot"
+                    else:
+                        continue  # README и прочее из корня — не нужно
+                    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+                    # Не перезаписываем уже существующие образы прошивки
+                    if os.path.exists(dest) and dest.lower().endswith(
+                            (".img", ".bin")) and os.path.getsize(dest) > 0:
+                        log_fn(f"  ⏭ есть: {os.path.basename(dest)}")
+                    else:
+                        with z.open(m) as src, open(dest, "wb") as out:
+                            out.write(src.read())
+                        log_fn(f"  ↓ {rel}")
+                    if target == "files":
+                        fcount += 1
+                    else:
+                        pcount += 1
+            return fcount, pcount
+
+        def dl_mik(log_fn):
+            """MIK (CryptoNickSoft/MIK) → files/MIK/  (отдельный репозиторий)."""
+            mik_dir = os.path.join(FILE_DIR, "MIK")
+            if os.path.isdir(mik_dir):
+                has_exe = False
+                for _r, _d, fs in os.walk(mik_dir):
+                    if any(n.lower() in ("mik64.exe", "mik.exe") for n in fs):
+                        has_exe = True
+                        break
+                if has_exe:
+                    log_fn("  ⏭ MIK уже установлен")
+                    return
+            zip_url = "https://github.com/CryptoNickSoft/MIK/archive/refs/heads/main.zip"
+            log_fn("  ↓ MIK main.zip ...")
+            try:
+                with urllib.request.urlopen(ua_req(zip_url), timeout=300) as r:
+                    data = r.read()
+            except Exception as ex:
+                log_fn(f"  ❌ MIK: {ex}")
+                log_fn(f"  → Вручную: {zip_url}  →  files/MIK/")
+                return
+            try:
+                os.makedirs(mik_dir, exist_ok=True)
+                with zipfile.ZipFile(io.BytesIO(data)) as z:
+                    members = z.namelist()
+                    top = members[0].split("/")[0] + "/" if members and "/" in members[0] else ""
+                    cnt = 0
+                    for m in members:
+                        if m.endswith("/"):
+                            continue
+                        rel = m[len(top):] if top and m.startswith(top) else m
+                        if not rel:
+                            continue
+                        dest = os.path.join(mik_dir, rel.replace("/", os.sep))
+                        os.makedirs(os.path.dirname(dest) or mik_dir, exist_ok=True)
+                        with z.open(m) as src, open(dest, "wb") as out:
+                            out.write(src.read())
+                        cnt += 1
+                log_fn(f"  ✓ MIK: {cnt} файлов в {mik_dir}")
+            except Exception as ex:
+                log_fn(f"  ❌ MIK распаковка: {ex}")
+
+        def worker():
+            errors = []
+
+            # ── 1. Основной репозиторий (files/ + pyamlboot_local/) ───────────
+            log_p("━━ Репозиторий yasta_flasher (полный zip) ━━━━━━━━━━━━━")
+            log_p(f"  Источник: {REPO_ZIP}")
+            try:
+                with urllib.request.urlopen(ua_req(REPO_ZIP), timeout=300) as r:
+                    data = r.read()
+                log_p(f"  Загружено {len(data)//1024} KB, распаковка...")
+                fcount, pcount = extract_repo_zip(data, log_p)
+                log_p(f"  ✓ files/: {fcount} файлов,  pyamlboot_local/: {pcount} файлов")
+                if fcount == 0:
+                    log_p("  ⚠ В архиве не найдена папка files/ — проверьте структуру репо")
+            except Exception as ex:
+                msg = f"  ❌ Репозиторий: {ex}"
+                log_p(msg); errors.append(msg)
+                log_p(f"  → Скачайте вручную: {REPO_ZIP}")
+
+            # ── 2. MIK (отдельный репозиторий) ────────────────────────────────
+            log_p("\n━━ MIK (CryptoNickSoft/MIK) ━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            try:
+                dl_mik(log_p)
+            except Exception as ex:
+                msg = f"  ❌ MIK: {ex}"
+                log_p(msg); errors.append(msg)
+
+            log_p("\n" + "━"*55)
+            log_p("Готово." if not errors else f"Завершено с {len(errors)} ошибкой(ами).")
+            self.root.after(0, lambda: (prog.stop(), status.config(text="Завершено")))
+            self.root.after(0, self.check_all_files)
+            if errors:
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "Частичные ошибки",
+                    "Не всё загружено:\n" + "\n".join(errors), parent=pw))
             else:
-                messagebox.showerror(
-                    "Ошибка загрузки",
-                    "Не удалось загрузить файлы.\n\n"
-                    "Возможные причины:\n"
-                    "• Нет подключения к интернету\n"
-                    "• GitHub недоступен\n"
-                    "• Файлы изменили расположение в репозитории\n\n"
-                    "Решение:\n"
-                    "Загрузите update.exe вручную из:\n"
-                    "https://github.com/khadas/utils/tree/master/"
-                    "aml-flash-tool/tools/windows"
-                )
-        
-        thread = threading.Thread(target=download_thread, daemon=True)
-        thread.start()
-    
+                self.root.after(4000,
+                    lambda: pw.destroy() if pw.winfo_exists() else None)
+
+        import threading as _th
+        _th.Thread(target=worker, daemon=True).start()
+
     def log(self, message):
         """Логирование в журнал операций"""
         self.log_text.config(state='normal')
@@ -1460,83 +2331,83 @@ class FlasherGUI:
         self.log_text.update_idletasks()
     
     def test_usb_detection(self):
-        """Тестовая функция для проверки обнаружения USB"""
+        """Диагностика обнаружения устройства Amlogic (VID_1B8E PID_C003)."""
         self.log("\n" + "="*50)
         self.log("🔍 ДИАГНОСТИКА USB УСТРОЙСТВ")
         self.log("="*50)
-        
-        # Метод 1: WMIC
-        self.log("\n1️⃣ Проверка через WMIC...")
+
+        cflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+        MARKERS = ["1B8E", "C003", "AMLOGIC", "BURNING", "WORLDCUP", "GX-CHIP"]
+        found_any = False
+
+        # Метод 1: WMIC (все PnP, не только USB-класс)
+        self.log("\n1️⃣ WMIC (Win32_PnPEntity)...")
         try:
             result = subprocess.run(
-                ['wmic', 'path', 'Win32_PnPEntity', 'where', 
-                 'DeviceID like "%USB%"', 'get', 'DeviceID,Name'],
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='ignore',
-                timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-            )
-            
-            lines = [line.strip() for line in result.stdout.split('\n') if line.strip()]
-            self.log(f"  Найдено USB устройств: {len(lines) - 1}")
-            
-            # Ищем Amlogic
-            found_amlogic = False
+                ['wmic', 'path', 'Win32_PnPEntity', 'get', 'DeviceID,Name'],
+                capture_output=True, text=True, encoding='utf-8',
+                errors='ignore', timeout=8, creationflags=cflags)
+            lines = [l.strip() for l in result.stdout.split('\n') if l.strip()]
+            self.log(f"  Всего PnP-устройств: {max(0, len(lines)-1)}")
             for line in lines:
-                if any(marker in line.upper() for marker in ["1B8E", "C003", "AMLOGIC", "BURNING"]):
-                    self.log(f"  ✓ НАЙДЕНО: {line}")
-                    found_amlogic = True
-            
-            if not found_amlogic:
-                self.log("  ✗ Amlogic устройство НЕ найдено")
-                self.log("\n  📋 Все USB устройства:")
-                for line in lines[:10]:  # Показываем первые 10
-                    if line and "DeviceID" not in line:
-                        self.log(f"    • {line[:80]}")
-                        
+                if any(m in line.upper() for m in MARKERS):
+                    self.log(f"  ✓ НАЙДЕНО: {line[:90]}")
+                    found_any = True
+            if not found_any:
+                self.log("  ✗ через WMIC не найдено")
         except Exception as e:
-            self.log(f"  ✗ Ошибка: {str(e)}")
-        
-        # Метод 2: PowerShell
-        self.log("\n2️⃣ Проверка через PowerShell...")
+            self.log(f"  ✗ WMIC ошибка: {e}")
+
+        # Метод 2: PowerShell — ВСЕ PnP-устройства (не только -Class USB!)
+        # WorldCup Device регистрируется как libusb/WinUSB, а не USB-класс.
+        self.log("\n2️⃣ PowerShell (Get-PnpDevice, все классы)...")
         try:
             result = subprocess.run(
-                ['powershell', '-Command', 
-                 'Get-PnpDevice -Class USB | Where-Object {$_.Status -eq "OK"} | Select-Object -Property DeviceID,FriendlyName'],
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='ignore',
-                timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-            )
-            
+                ['powershell', '-NoProfile', '-Command',
+                 'Get-PnpDevice | Select-Object -Property InstanceId,FriendlyName,Class | Format-Table -AutoSize'],
+                capture_output=True, text=True, encoding='utf-8',
+                errors='ignore', timeout=8, creationflags=cflags)
             if result.returncode == 0:
-                lines = [line.strip() for line in result.stdout.split('\n') if line.strip()]
-                self.log(f"  Активных USB устройств: {len(lines)}")
-                
-                found = False
+                lines = [l.strip() for l in result.stdout.split('\n') if l.strip()]
+                ps_found = False
                 for line in lines:
-                    if any(marker in line.upper() for marker in ["1B8E", "C003", "AMLOGIC"]):
-                        self.log(f"  ✓ НАЙДЕНО: {line}")
-                        found = True
-                
-                if not found:
-                    self.log("  ✗ Amlogic устройство НЕ найдено")
+                    if any(m in line.upper() for m in MARKERS):
+                        self.log(f"  ✓ НАЙДЕНО: {line[:90]}")
+                        ps_found = True; found_any = True
+                if not ps_found:
+                    self.log("  ✗ через PowerShell не найдено")
             else:
-                self.log("  ✗ PowerShell недоступен или ошибка")
-                
+                self.log("  ⚠ PowerShell недоступен (не критично)")
         except Exception as e:
-            self.log(f"  ✗ Ошибка: {str(e)}")
-        
+            self.log(f"  ⚠ PowerShell: {e}")
+
+        # Метод 3: pyamlboot (прямое USB-обнаружение libusb)
+        self.log("\n3️⃣ pyamlboot (libusb)...")
+        try:
+            import usb.core
+            dev = usb.core.find(idVendor=0x1b8e, idProduct=0xc003)
+            if dev is not None:
+                self.log("  ✓ НАЙДЕНО через libusb (1b8e:c003)")
+                found_any = True
+            else:
+                self.log("  ✗ libusb не видит 1b8e:c003")
+        except ImportError:
+            self.log("  ⚠ pyusb не установлен (pip install pyusb) — пропуск")
+        except Exception as e:
+            self.log(f"  ⚠ libusb: {e}")
+
+        # Итог
         self.log("\n" + "="*50)
-        self.log("💡 Если устройство не найдено:")
-        self.log("  1. Проверьте Диспетчер устройств (devmgmt.msc)")
-        self.log("  2. Установите драйверы USB Burning Tool")
-        self.log("  3. Попробуйте другой USB порт (USB 2.0)")
-        self.log("  4. Проверьте замыкание пина 6 на GND")
+        if found_any:
+            self.log("✅ ИТОГ: устройство Amlogic ОБНАРУЖЕНО (хотя бы одним методом)")
+            self.log("   Разные методы могут расходиться — это нормально:")
+            self.log("   WorldCup Device виден в WMIC, но не в PowerShell -Class USB.")
+        else:
+            self.log("❌ ИТОГ: устройство не обнаружено ни одним методом")
+            self.log("\n💡 Проверьте:")
+            self.log("  1. Диспетчер устройств (devmgmt.msc)")
+            self.log("  2. Драйверы USB Burning Tool / Zadig (WinUSB)")
+            self.log("  3. USB 2.0 порт, замыкание пина 6 на GND")
         self.log("="*50)
     
     def check_drivers(self):
@@ -1576,6 +2447,8 @@ class FlasherGUI:
         instructions_window = tk.Toplevel(self.root)
         instructions_window.title("📥 Установка драйверов")
         instructions_window.geometry("600x500")
+        instructions_window.resizable(True, True)
+        instructions_window.minsize(450, 300)
         instructions_window.transient(self.root)
         
         tk.Label(
@@ -1746,10 +2619,9 @@ class FlasherGUI:
                 pass  # PowerShell может быть недоступен
             
             # Метод 3: Проверка через pyamlboot (если устройство уже в режиме USB Boot)
-            if send_aml_bundle:
+            if get_aml_bundle_sender():
                 try:
                     # pyamlboot сам умеет находить устройства
-                    # Если устройство есть - это будет быстро
                     pass
                 except Exception:
                     pass
@@ -1773,21 +2645,28 @@ class FlasherGUI:
         return False
     
     def aml_bulkcmd(self, cmd):
-        """Выполнение команды U-Boot"""
+        """Выполнение команды U-Boot.
+        Возвращает декодированный stdout+stderr.
+        Весь вывод дублируется в COM-терминал (метка [USB]) —
+        даже если UART не подключён, пользователь видит ответы.
+        """
         update_path = self.get_update_path()
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
         process = subprocess.run(
             [update_path, "bulkcmd", cmd],
-            capture_output=True,
-            text=False,  # Получаем байты
-            timeout=30
+            capture_output=True, text=False, timeout=30,
+            creationflags=creationflags
         )
+        raw = (process.stdout or b"") + (process.stderr or b"")
+        text_out = raw.decode('utf-8', errors='ignore')
+        # Роутим в терминал всегда — если UART не подключён, это единственный лог
+        for line in text_out.splitlines():
+            stripped = line.strip()
+            if stripped:
+                self.root.after(0, lambda l=stripped: self.terminal_log(f"[USB] {l}"))
         if process.returncode != 0:
-            # Пытаемся декодировать вывод
-            try:
-                error_msg = process.stderr.decode('utf-8', errors='ignore')
-            except:
-                error_msg = str(process.stderr)
-            raise Exception(f"Ошибка U-Boot команды: {cmd}\n{error_msg}")
+            raise Exception(f"Ошибка U-Boot команды: {cmd}\n{text_out[:300]}")
+        return text_out
     
     def aml_read_part(self, name, size, outfile):
         """Чтение раздела с устройства"""
@@ -1800,7 +2679,43 @@ class FlasherGUI:
         )
         if process.returncode != 0:
             raise Exception(f"Ошибка чтения раздела {name}")
-    
+
+    @staticmethod
+    def parse_env_blob(path):
+        """Разобрать бинарный образ раздела env U-Boot (Amlogic).
+
+        Формат: [4 байта CRC32][данные]
+        Данные: пары  key=value\\0key=value\\0 ... \\0\\0 (конец).
+        Возвращает dict {key: value}.
+        """
+        result = {}
+        try:
+            with open(path, "rb") as f:
+                blob = f.read()
+        except Exception:
+            return result
+        if len(blob) < 5:
+            return result
+        # Пропускаем 4-байтовый CRC заголовок
+        data = blob[4:]
+        # Делим по нулевым байтам
+        for chunk in data.split(b"\x00"):
+            if not chunk:
+                # Двойной \0 — конец окружения
+                continue
+            try:
+                text = chunk.decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+            if "=" in text:
+                key, _, value = text.partition("=")
+                key = key.strip()
+                # Имена переменных U-Boot — печатные ASCII без пробелов
+                if key and all(32 < ord(c) < 127 for c in key):
+                    result[key] = value
+        return result
+
+
     def aml_write_file_to_ram(self, filename, addr):
         """Запись файла в RAM"""
         update_path = self.get_update_path()
@@ -1831,45 +2746,59 @@ class FlasherGUI:
         )
     
     def flash_partition(self, name, image_path, display, time_estimate):
-        """Прошивка раздела"""
+        """Прошивка раздела.
+        Весь вывод update.exe в реальном времени идёт в COM-терминал.
+        """
         self.log(f"Прошивка {display}... ({time_estimate})")
-        
         update_path = self.get_update_path()
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
         cmd = [update_path, "partition", name, image_path]
-        
+
         try:
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=False,  # Получаем байты, не текст
-                bufsize=0
+                text=False, bufsize=0,
+                creationflags=creationflags
             )
-            
+
             start_time = time.time()
             last_update = 0
-            
+            line_buf = b""
+
             while True:
                 if not self.is_flashing:
                     process.terminate()
                     return False
-                
+
+                # Читаем доступные байты без блокировки
+                try:
+                    chunk = process.stdout.read(256)
+                    if chunk:
+                        line_buf += chunk
+                        # Выводим полные строки в терминал
+                        while b"\n" in line_buf:
+                            ln, line_buf = line_buf.split(b"\n", 1)
+                            decoded = ln.decode('utf-8', errors='ignore').strip()
+                            if decoded:
+                                self.root.after(0,
+                                    lambda d=decoded: self.terminal_log(f"[USB] {d}"))
+                except Exception:
+                    pass
+
                 code = process.poll()
                 if code is not None:
                     break
-                
-                # Показываем прогресс каждые 2 секунды (не каждую секунду!)
+
                 elapsed = int(time.time() - start_time)
-                if elapsed - last_update >= 2:  # Обновляем раз в 2 секунды
-                    # Обновляем только статус, не логируем
+                if elapsed - last_update >= 2:
                     self.status_label.config(
-                        text=f"🔄 Прошивка {display}... {elapsed}с",
-                        fg="#E67E22"
-                    )
+                        text=f"🔄 Прошивка {display}... {elapsed}с", fg="#E67E22")
                     self.root.update_idletasks()
                     last_update = elapsed
-                
-                time.sleep(0.5)
+
+                time.sleep(0.1)
             
             if code == 0:
                 elapsed_total = int(time.time() - start_time)
@@ -1927,12 +2856,13 @@ class FlasherGUI:
             
             # Загрузка U-Boot
             self.log("Загрузка временного U-Boot...")
-            if send_aml_bundle:
+            _sender = get_aml_bundle_sender()
+            if _sender:
                 try:
                     bundle_path = os.path.join(FILE_DIR, "aml_bundle.img")
                     if not os.path.exists(bundle_path):
                         raise FileNotFoundError(f"Файл {bundle_path} не найден")
-                    send_aml_bundle(bundle_path)
+                    _sender(bundle_path)
                     self.log("✓ U-Boot загружен")
                     time.sleep(4)
                 except Exception as e:
@@ -1940,7 +2870,9 @@ class FlasherGUI:
                     self.finish_flashing()
                     return
             else:
-                self.log("✗ pyamlboot не найден! Установите: pip install pyamlboot")
+                self.log("✗ pyamlboot_local не найден или не импортируется!")
+                self.log("  Нажмите «Загрузить утилиты» и ПЕРЕЗАПУСТИТЕ программу.")
+                self.log("  (папка pyamlboot_local/ должна быть рядом с gui.py)")
                 self.finish_flashing()
                 return
             
@@ -1958,78 +2890,99 @@ class FlasherGUI:
             self.log("Модификация переменных окружения (env)...")
             try:
                 env_file = os.path.join(ROOT_DIR, "env_user.bin")
-                
-                # Читаем текущий env
+
+                # Читаем текущий env с устройства
                 self.log("  - Чтение env с устройства...")
                 self.aml_read_part("env", "0x800000", env_file)
-                
+
                 if not os.path.exists(env_file):
                     raise Exception("Не удалось прочитать env с устройства")
-                
+
                 env_size = os.path.getsize(env_file)
                 self.log(f"  - Прочитано: {env_size} байт")
-                
-                # Предлагаем отредактировать
-                if not self.env_data:  # Если не редактировали ещё
-                    response = messagebox.askyesno(
-                        "Редактирование ENV",
-                        "ENV успешно прочитан с устройства.\n\n"
-                        "Хотите отредактировать переменные окружения?\n"
-                        "(Рекомендуется для разблокировки bootloader)"
-                    )
-                    if response:
-                        # Приостанавливаем прошивку
-                        self.is_flashing = False
-                        self.open_env_editor()
-                        
-                        # Ждём закрытия редактора
-                        messagebox.showinfo(
-                            "Продолжение",
-                            "После редактирования ENV нажмите OK для продолжения прошивки."
-                        )
-                        self.is_flashing = True
-                
-                # Загружаем в RAM
+
+                # РАЗБИРАЕМ бинарный env в словарь — чтобы редактор показал
+                # реальные значения с устройства, а не пустые поля.
+                parsed = self.parse_env_blob(env_file)
+                if parsed:
+                    self.log(f"  - Распознано переменных в env: {len(parsed)}")
+                    # Заполняем env_data значениями с устройства (если ещё не
+                    # редактировали вручную в этой сессии)
+                    for k, v in parsed.items():
+                        self.env_data.setdefault(k, v)
+                    # Лог ключевых значений
+                    for key in ("serial", "mac", "lock", "avb2", "EnableSelinux"):
+                        if key in parsed:
+                            self.log(f"      {key} = {parsed[key]}")
+                else:
+                    self.log("  ⚠ Не удалось распарсить env (формат?) — поля будут пустыми")
+
+                # Предлагаем отредактировать, БЛОКИРУЯ прошивку до закрытия редактора
+                response = messagebox.askyesno(
+                    "Редактирование ENV",
+                    f"ENV прочитан с устройства ({len(parsed)} переменных).\n\n"
+                    "Открыть редактор переменных окружения?\n"
+                    "(Рекомендуется для разблокировки bootloader: lock, avb2, SELinux)\n\n"
+                    "Прошивка продолжится ПОСЛЕ закрытия редактора."
+                )
+                if response:
+                    # Редактор и wait_window ДОЛЖНЫ выполняться в главном потоке.
+                    # Прошивка идёт в фоновом потоке — блокируем его через Event.
+                    self.log("  - Открыт редактор ENV, ожидание закрытия...")
+                    import threading as _th_env
+                    done = _th_env.Event()
+
+                    def _open_and_wait():
+                        try:
+                            ed = self.open_env_editor(return_window=True)
+                            if ed is not None:
+                                ed.protocol("WM_DELETE_WINDOW",
+                                            lambda: (ed.destroy()))
+                                self.root.wait_window(ed)
+                        finally:
+                            done.set()
+
+                    self.root.after(0, _open_and_wait)
+                    done.wait()   # фоновый поток ждёт закрытия редактора
+                    self.log(f"  - Редактор закрыт. Переменных к применению: {len(self.env_data)}")
+
+                # Загружаем оригинальный env в RAM
                 self.log("  - Загрузка env в RAM...")
                 self.aml_write_file_to_ram(env_file, "0x200c000")
-                
-                # Импортируем и модифицируем
+
+                # Импортируем существующее окружение
                 self.log("  - Импорт переменных в U-Boot...")
                 self.aml_bulkcmd("env import 200c004")
-                
-                # Применяем изменения из редактора или стандартные
+
+                # Применяем изменения
                 if self.env_data:
-                    self.log("  - Применение пользовательских настроек ENV:")
+                    self.log(f"  - Применение настроек ENV ({len(self.env_data)} перем.):")
                     for key, value in self.env_data.items():
+                        if value == "":
+                            continue  # пустые не трогаем
                         self.log(f"    • {key} = {value}")
                         self.aml_bulkcmd(f"setenv {key} {value}")
                 else:
-                    self.log("  - Применение стандартных настроек:")
-                    self.log("    • silent = 0 (включить вывод)")
+                    self.log("  - Применение стандартных настроек разблокировки:")
+                    self.log("    • silent = 0, lock = 10000000, avb2 = 0")
                     self.aml_bulkcmd("setenv silent 0")
-                    
-                    self.log("    • lock = 10000000 (разблокировать)")
                     self.aml_bulkcmd("setenv lock 10000000")
-                    
-                    self.log("    • avb2 = 0 (отключить Android Verified Boot)")
                     self.aml_bulkcmd("setenv avb2 0")
-                
-                self.log("  - Сохранение изменений...")
+
+                self.log("  - Сохранение изменений (saveenv)...")
                 self.aml_bulkcmd("saveenv")
-                
                 self.log("✓ Переменные окружения успешно модифицированы")
-                
+
                 # Удаляем временный файл
                 if os.path.exists(env_file):
                     try:
                         os.remove(env_file)
-                    except:
-                        pass  # Не критично если не удалилось
-                    
+                    except Exception:
+                        pass
+
             except Exception as e:
                 self.log(f"✗ Ошибка модификации env: {str(e)}")
                 self.log("⚠ Продолжаем без модификации env (может потребоваться ручная настройка)")
-                # Не прерываем процесс, продолжаем прошивку
                 pass
             
             # Прошивка выбранных разделов
@@ -2188,6 +3141,8 @@ def show_initial_help(root):
     help_window = tk.Toplevel(root)
     help_window.title("📋 Необходимые файлы")
     help_window.geometry("600x500")
+    help_window.resizable(True, True)
+    help_window.minsize(450, 300)
     help_window.transient(root)
     help_window.grab_set()
     
