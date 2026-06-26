@@ -109,6 +109,30 @@ ROOT_DIR = os.getcwd()
 FILE_DIR = os.path.join(ROOT_DIR, "files")
 IMG_DIR = os.path.join(ROOT_DIR, "images-bkp")
 
+# Файл настроек приложения (рядом с gui.py)
+SETTINGS_FILE = os.path.join(ROOT_DIR, "flasher_settings.json")
+
+
+def load_settings():
+    """Загрузить настройки приложения из JSON. Возвращает dict."""
+    try:
+        import json
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_settings(data):
+    """Сохранить настройки приложения в JSON."""
+    try:
+        import json
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
 # Репозиторий с утилитами и зависимостями
 GITHUB_REPO       = "https://github.com/suddosu/yasta_flasher"
 GITHUB_RAW_BASE   = "https://raw.githubusercontent.com/suddosu/yasta_flasher/main"
@@ -158,7 +182,9 @@ class FlasherGUI:
         self.serial_running = False
         
         # ENV редактор
-        self.env_data = {}
+        self.env_data = {}        # только ИЗМЕНЕНИЯ env, заданные пользователем
+        self._env_device = {}     # снимок env с устройства (для отображения)
+        self._env_editor_saved = False  # сохранил ли пользователь изменения env
         
         # Кастомные разделы
         self.custom_partitions = []
@@ -212,69 +238,76 @@ class FlasherGUI:
     
     def create_left_panel(self, main_frame):
         
-        # Инструкция
-        instruction_frame = tk.LabelFrame(main_frame, text="📋 Инструкция по подключению", font=("Arial", 10, "bold"))
-        instruction_frame.pack(fill=tk.X, pady=(0, 10))
+        # Инструкция (компактная — одна строка, чтобы освободить место журналу)
+        instruction_frame = tk.LabelFrame(main_frame, text="📋 Подключение", font=("Arial", 9, "bold"))
+        instruction_frame.pack(fill=tk.X, pady=(0, 6))
+
+        instruction_text = ("USB к сервисной колодке (под резинкой у радиатора) → "
+                            "6 пин на GND (3 пин) → USB к ПК → питание")
+
+        instruction_label = tk.Label(instruction_frame, text=instruction_text,
+                                     justify=tk.LEFT, padx=8, pady=3,
+                                     font=("Arial", 8), fg="#555555", wraplength=600)
+        instruction_label.pack(anchor=tk.W)
         
-        instruction_text = """
-1. Подключите USB кабель к сервисной колодке (под резинкой возле радиатора)
-2. Замкните 6 пин на землю (3 пин) для активации USB boot
-3. Подключите USB к ПК
-4. Подключите блок питания к станции
-        """
-        
-        instruction_label = tk.Label(instruction_frame, text=instruction_text, justify=tk.LEFT, padx=10, pady=5)
-        instruction_label.pack()
-        
-        # Секция выбора образов
+        # Секция выбора образов — растягивается вместе с окном (expand=True),
+        # чтобы показывать максимум образов без скролла.
         images_frame = tk.LabelFrame(main_frame, text="🗂️ Выбор образов для прошивки", font=("Arial", 10, "bold"))
-        images_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-        
-        # Canvas для прокрутки
-        canvas = tk.Canvas(images_frame, height=180)  # Уменьшил ещё больше
+        images_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+
+        # Canvas для прокрутки (минимальная высота, но растёт при наличии места)
+        canvas = tk.Canvas(images_frame, height=130, highlightthickness=0)
         scrollbar = ttk.Scrollbar(images_frame, orient="vertical", command=canvas.yview)
         scrollable_frame = tk.Frame(canvas)
-        
+
         scrollable_frame.bind(
             "<Configure>",
             lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+
+        canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
+        # Растягиваем внутренний фрейм на ширину канваса
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(canvas_window, width=e.width))
+
+        # Прокрутка колесом мыши (работает при наведении на список образов)
+        def _on_mousewheel(event):
+            # Windows/Mac: event.delta; Linux: Button-4/5
+            if event.delta:
+                canvas.yview_scroll(int(-event.delta / 120), "units")
+            elif event.num == 4:
+                canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                canvas.yview_scroll(1, "units")
+
+        def _bind_wheel(event):
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            canvas.bind_all("<Button-4>", _on_mousewheel)
+            canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        def _unbind_wheel(event):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        # Привязываем колесо только когда мышь над списком образов
+        canvas.bind("<Enter>", _bind_wheel)
+        canvas.bind("<Leave>", _unbind_wheel)
+        scrollable_frame.bind("<Enter>", _bind_wheel)
+        scrollable_frame.bind("<Leave>", _unbind_wheel)
         
         # Создаем чекбоксы для каждого образа
         self.image_vars = {}
         self.image_path_labels = {}
-        
-        # Кнопка проверки файлов
-        check_frame = tk.Frame(scrollable_frame, bg="#ECF0F1")
-        check_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        tk.Button(
-            check_frame,
-            text="🔍 Проверить наличие файлов",
-            command=self.check_all_files,
-            width=25
-        ).pack(pady=5)
-        
-        self.files_status_label = tk.Label(
-            check_frame,
-            text="Статус файлов будет показан здесь",
-            font=("Arial", 8),
-            fg="gray"
-        )
-        self.files_status_label.pack()
-        
-        tk.Label(scrollable_frame, text="").pack()  # Разделитель
-        
+
         for idx, img in enumerate(PART_IMAGES):
             frame = tk.Frame(scrollable_frame)
-            frame.pack(fill=tk.X, padx=5, pady=2)
-            
+            frame.pack(fill=tk.X, padx=5, pady=1)
+
             var = tk.BooleanVar(value=True)
             self.image_vars[img["name"]] = var
-            
+
             cb = tk.Checkbutton(
                 frame,
                 text=f"{img['display']} ({img['file']})",
@@ -282,19 +315,19 @@ class FlasherGUI:
                 font=("Arial", 9)
             )
             cb.pack(side=tk.LEFT)
-            
+
             btn = tk.Button(
                 frame,
                 text="Обзор...",
                 command=lambda i=img: self.browse_image(i),
-                width=10
+                width=9
             )
             btn.pack(side=tk.RIGHT, padx=5)
-            
+
             path_label = tk.Label(frame, text="", fg="gray", font=("Arial", 8))
             path_label.pack(side=tk.RIGHT, padx=5)
             self.image_path_labels[img["name"]] = path_label
-            
+
             # Проверяем наличие файла
             default_path = os.path.join(IMG_DIR, img["file"])
             if os.path.exists(default_path):
@@ -302,166 +335,153 @@ class FlasherGUI:
                 path_label.config(text=f"✓ {img['file']}", fg="green")
             else:
                 path_label.config(text="✗ Не найден", fg="red")
-        
+
         # Сохраняем ссылку на scrollable_frame для динамического добавления разделов
         self.images_scrollable_frame = scrollable_frame
         self.images_canvas = canvas
 
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Строка статуса файлов + кнопка проверки — ПОД списком (не в скролле)
+        files_bar = tk.Frame(main_frame)
+        files_bar.pack(fill=tk.X, pady=(0, 6))
+        tk.Button(
+            files_bar,
+            text="🔍 Проверить файлы",
+            command=self.check_all_files,
+            width=18
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        self.files_status_label = tk.Label(
+            files_bar,
+            text="Статус файлов будет показан здесь",
+            font=("Arial", 8),
+            fg="gray"
+        )
+        self.files_status_label.pack(side=tk.LEFT)
         
-        # Кнопка "Выбрать все/Снять все"
+        # Панель кнопок — две строки через grid, чтобы ничего не обрезалось
+        # при узком окне (раньше LEFT и RIGHT кнопки наезжали друг на друга).
         select_frame = tk.Frame(main_frame)
         select_frame.pack(fill=tk.X, pady=(0, 10))
+
+        btns = [
+            ("✓ Выбрать все",      self.select_all,            None,      None),
+            ("✗ Снять все",        self.deselect_all,          None,      None),
+            ("🔍 Диагностика USB",  self.test_usb_detection,    "#3498DB", "white"),
+            ("💾 Дамп разделов",    self.dump_partitions,       "#C0392B", "white"),
+            ("📦 Burning-пакет",    self.flash_burning_package, "#D35400", "white"),
+            ("🔨 Собрать пакет",    self.build_burning_package, "#16A085", "white"),
+            ("📥 Загрузить утилиты", self.download_tools_from_github, "#9B59B6", "white"),
+            ("➕ Кастомный раздел", self.add_custom_partition,  "#16A085", "white"),
+            ("📝 Редактор образов", self.open_image_editor,     "#8E44AD", "white"),
+            ("⚙️ Редактор ENV",     self.open_env_editor,       "#E67E22", "white"),
+        ]
+        # Раскладываем в 2 строки, по 5 колонок, все одинаковой ширины
+        cols = 5
+        for i, (text, cmd, bg, fg) in enumerate(btns):
+            kw = {"width": 18}
+            if bg: kw["bg"] = bg
+            if fg: kw["fg"] = fg
+            b = tk.Button(select_frame, text=text, command=cmd, **kw)
+            b.grid(row=i // cols, column=i % cols, padx=3, pady=3, sticky="ew")
+        for c in range(cols):
+            select_frame.columnconfigure(c, weight=1)
         
-        tk.Button(select_frame, text="✓ Выбрать все", command=self.select_all, width=15).pack(side=tk.LEFT, padx=5)
-        tk.Button(select_frame, text="✗ Снять все", command=self.deselect_all, width=15).pack(side=tk.LEFT)
-        tk.Button(
-            select_frame, 
-            text="🔍 Диагностика USB", 
-            command=self.test_usb_detection, 
-            width=18,
-            bg="#3498DB",
-            fg="white"
-        ).pack(side=tk.LEFT, padx=5)
-        tk.Button(
-            select_frame,
-            text="💾 Дамп разделов",
-            command=self.dump_partitions,
-            width=16,
-            bg="#C0392B",
-            fg="white"
-        ).pack(side=tk.LEFT, padx=5)
-        
-        # Правая сторона
-        tk.Button(
-            select_frame,
-            text="⚙️ Редактор ENV",
-            command=self.open_env_editor,
-            width=15,
-            bg="#E67E22",
-            fg="white"
-        ).pack(side=tk.RIGHT, padx=5)
-        
-        tk.Button(
-            select_frame,
-            text="📝 Редактор образов",
-            command=self.open_image_editor,
-            width=17,
-            bg="#8E44AD",
-            fg="white"
-        ).pack(side=tk.RIGHT, padx=5)
-        
-        tk.Button(
-            select_frame,
-            text="➕ Кастомный раздел",
-            command=self.add_custom_partition,
-            width=18,
-            bg="#16A085",
-            fg="white"
-        ).pack(side=tk.RIGHT, padx=5)
-        
-        tk.Button(
-            select_frame, 
-            text="📥 Загрузить утилиты", 
-            command=self.download_tools_from_github, 
-            width=18,
-            bg="#9B59B6",
-            fg="white"
-        ).pack(side=tk.RIGHT, padx=5)
-        
-        # Лог
-        log_frame = tk.LabelFrame(main_frame, text="📄 Журнал операций", font=("Arial", 10, "bold"))
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
-        
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=5, state='disabled', font=("Consolas", 9))
-        self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # Прогресс бар
-        progress_frame = tk.Frame(main_frame)
-        progress_frame.pack(fill=tk.X, pady=(5, 5))
-        
-        tk.Label(progress_frame, text="Прогресс:", font=("Arial", 9)).pack(side=tk.LEFT, padx=(0, 5))
-        self.progress = ttk.Progressbar(progress_frame, mode='indeterminate')
-        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
-        # Информационная панель статуса
-        status_frame = tk.LabelFrame(main_frame, text="📊 Статус готовности", font=("Arial", 10, "bold"))
-        status_frame.pack(fill=tk.X, pady=(5, 5))
-        
+        # ВАЖНО: сначала пакуем ВСЕ нижние элементы с side=BOTTOM, и только
+        # потом — растягивающийся лог.
+
+        # 1. Кнопки управления — в самый низ (компактные)
+        button_frame = tk.Frame(main_frame, bg="#ECF0F1", relief=tk.RIDGE, bd=2)
+        button_frame.pack(fill=tk.X, pady=(4, 0), side=tk.BOTTOM, expand=False)
+
+        # 2. Компактная строка: прогресс-бар + статус в одну линию
+        status_frame = tk.Frame(main_frame)
+        status_frame.pack(fill=tk.X, pady=(4, 4), side=tk.BOTTOM)
+
+        self.progress = ttk.Progressbar(status_frame, mode='indeterminate')
+        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+
         self.status_label = tk.Label(
             status_frame,
-            text="Проверьте наличие файлов перед началом прошивки",
-            font=("Arial", 10),
+            text="Готов к работе",
+            font=("Arial", 9),
             fg="#7F8C8D",
-            pady=8
+            anchor=tk.E
         )
-        self.status_label.pack()
-        
-        # ВАЖНО: Кнопки управления - фиксированные внизу, НЕ expand!
-        button_frame = tk.Frame(main_frame, bg="#ECF0F1", relief=tk.RIDGE, bd=2)
-        button_frame.pack(fill=tk.X, pady=(5, 0), side=tk.BOTTOM, expand=False)  # expand=False!
-        
-        # Добавляем отступы внутри фрейма
+        self.status_label.pack(side=tk.RIGHT)
+
+        # 3. Лог — занимает оставшееся место (пакуется последним, expand=True)
+        log_frame = tk.LabelFrame(main_frame, text="📄 Журнал операций", font=("Arial", 10, "bold"))
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=8, state='disabled', font=("Consolas", 9))
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Чекбокс очистки data/cache + кнопки прошивки в одной компактной панели
+        ctrl_top = tk.Frame(button_frame, bg="#ECF0F1")
+        ctrl_top.pack(fill=tk.X, padx=10, pady=(6, 0))
+        self.wipe_data_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            ctrl_top,
+            text="🧹 Очистить data и cache (сброс к заводским)",
+            variable=self.wipe_data_var,
+            bg="#ECF0F1", font=("Arial", 9)
+        ).pack(side=tk.LEFT)
+
+        # Кнопки прошивки — компактные (height=1, меньше шрифт)
         inner_button_frame = tk.Frame(button_frame, bg="#ECF0F1")
-        inner_button_frame.pack(fill=tk.X, padx=10, pady=10)
-        
+        inner_button_frame.pack(fill=tk.X, padx=10, pady=(4, 8))
+
         self.flash_button = tk.Button(
             inner_button_frame,
             text="🚀 Начать прошивку",
             command=self.start_flashing,
             bg="#27AE60",
             fg="white",
-            font=("Arial", 14, "bold"),
-            height=2,
+            font=("Arial", 11, "bold"),
+            height=1,
             cursor="hand2",
             relief=tk.RAISED,
-            bd=3
+            bd=2
         )
         self.flash_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        
-        # Эффект наведения для кнопки "Начать прошивку"
+
         def on_enter_flash(e):
             if self.flash_button['state'] == tk.NORMAL:
                 self.flash_button['bg'] = '#229954'
-        
         def on_leave_flash(e):
             if self.flash_button['state'] == tk.NORMAL:
                 self.flash_button['bg'] = '#27AE60'
-        
         self.flash_button.bind("<Enter>", on_enter_flash)
         self.flash_button.bind("<Leave>", on_leave_flash)
-        
+
         self.stop_button = tk.Button(
             inner_button_frame,
             text="⏹ Остановить",
             command=self.stop_flashing,
             bg="#E74C3C",
             fg="white",
-            font=("Arial", 14, "bold"),
-            height=2,
+            font=("Arial", 11, "bold"),
+            height=1,
             state=tk.DISABLED,
             cursor="hand2",
             relief=tk.RAISED,
-            bd=3
+            bd=2,
+            width=16
         )
-        self.stop_button.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
-        # Эффект наведения для кнопки "Остановить"
+        self.stop_button.pack(side=tk.LEFT, fill=tk.X, expand=False)
+
         def on_enter_stop(e):
             if self.stop_button['state'] == tk.NORMAL:
                 self.stop_button['bg'] = '#C0392B'
-        
         def on_leave_stop(e):
             if self.stop_button['state'] == tk.NORMAL:
                 self.stop_button['bg'] = '#E74C3C'
-        
         self.stop_button.bind("<Enter>", on_enter_stop)
         self.stop_button.bind("<Leave>", on_leave_stop)
-        
-        # Логируем создание кнопок для отладки
+
         self.log("✓ Интерфейс инициализирован")
-        self.log("✓ Кнопки управления созданы")
     
     def create_com_terminal(self, parent):
         """Создание панели COM терминала"""
@@ -574,24 +594,70 @@ class FlasherGUI:
             self.root.destroy()
     
     def refresh_com_ports(self):
-        """Обновление списка COM портов"""
+        """Обновление списка COM портов.
+
+        Фильтрует виртуальные/Bluetooth-порты, оставляя реальные USB-UART.
+        Признаки реального адаптера: наличие аппаратного VID:PID и/или
+        известный чип в описании (CH340, CP210x, FT232, PL2303 и т.п.).
+        Bluetooth-порты и виртуальные отсеиваются.
+        """
         if not SERIAL_AVAILABLE:
             return
-        
+
+        # Известные чипы USB-UART адаптеров
+        REAL_CHIPS = ("ch340", "ch341", "cp210", "cp2102", "cp2104", "ft232",
+                      "ftdi", "pl2303", "prolific", "silicon labs", "usb serial",
+                      "usb-serial", "usb to uart", "usb-uart", "wch", "arduino")
+        # Маркеры виртуальных/ненужных портов
+        VIRTUAL_MARKERS = ("bluetooth", "bthenum", "блютуз", "по соединению bluetooth",
+                           "стандартный последовательный", "virtual", "виртуальн")
+
+        def is_real_port(port):
+            desc = (port.description or "").lower()
+            hwid = (port.hwid or "").lower()
+            # Явно виртуальный → отсеять
+            if any(m in desc for m in VIRTUAL_MARKERS):
+                return False
+            # Bluetooth по hwid
+            if "bthenum" in hwid or "bluetooth" in hwid:
+                return False
+            # Есть аппаратный VID:PID (реальное USB-устройство) → реальный
+            if getattr(port, "vid", None) is not None:
+                return True
+            # Известный чип в описании → реальный
+            if any(c in desc for c in REAL_CHIPS):
+                return True
+            # USB в hwid без признаков виртуальности → вероятно реальный
+            if "usb vid:pid" in hwid or "usb\\vid" in hwid:
+                return True
+            return False
+
         try:
-            ports = serial.tools.list_ports.comports()
+            all_ports = list(serial.tools.list_ports.comports())
+            real_ports = [p for p in all_ports if is_real_port(p)]
+            hidden = len(all_ports) - len(real_ports)
+
+            # Если фильтр убрал вообще всё, но порты есть — показываем все
+            # (чтобы не остаться без выбора на нестандартном железе)
+            ports = real_ports if real_ports else all_ports
             port_list = [port.device for port in ports]
-            
+
             self.com_port_combo['values'] = port_list
-            
+
             if port_list:
                 if not self.com_port_var.get() or self.com_port_var.get() not in port_list:
                     self.com_port_combo.current(0)
-                self.terminal_log(f"🔍 Найдено портов: {len(port_list)}")
+                self.terminal_log(f"🔍 Реальных USB-UART портов: {len(port_list)}"
+                                  + (f" (скрыто виртуальных: {hidden})" if hidden else ""))
                 for port in ports:
-                    self.terminal_log(f"  • {port.device}: {port.description}")
+                    chip = ""
+                    if getattr(port, "vid", None) is not None:
+                        chip = f"  [{port.vid:04X}:{port.pid:04X}]"
+                    self.terminal_log(f"  • {port.device}: {port.description}{chip}")
             else:
-                self.terminal_log("⚠️ COM порты не найдены")
+                self.terminal_log("⚠️ Реальные COM порты не найдены")
+                if hidden:
+                    self.terminal_log(f"  (отфильтровано {hidden} виртуальных/Bluetooth)")
                 self.com_port_var.set("")
         except Exception as e:
             self.terminal_log(f"✗ Ошибка поиска портов: {str(e)}")
@@ -740,9 +806,24 @@ class FlasherGUI:
             pass
     
     def terminal_log(self, message, timestamp=False, update_line=False):
-        """Добавление сообщения в терминал (совместимость со старым API)"""
+        """Добавление сообщения в терминал (совместимость со старым API).
+
+        Обрабатывает \\r (возврат каретки): update.exe выводит прогресс вида
+        '[ 16%/ 4MB]\\r[ 32%/ 7MB]\\r...' — каждый \\r должен ПЕРЕЗАПИСЫВАТЬ
+        текущую строку, а не добавлять новую. Иначе проценты валятся в кучу.
+        """
         if self._terminal_capture_buf is not None:
             self._terminal_capture_buf.append(message)
+
+        # Если в сообщении есть \r — это динамический прогресс. Берём последний
+        # сегмент после \r и обновляем текущую строку (как делает терминал).
+        if "\r" in message and not message.endswith("\r\n"):
+            segments = message.replace("\r\n", "\n").split("\r")
+            # Последний непустой сегмент — актуальное состояние строки
+            last = segments[-1] if segments[-1] else (segments[-2] if len(segments) > 1 else "")
+            self.terminal_update_line(last)
+            return
+
         if update_line:
             self.terminal_update_line(message)
         else:
@@ -909,6 +990,16 @@ class FlasherGUI:
         editor.minsize(450, 300)
         editor.transient(self.root)
         
+        # Объединённый вид для отображения: снимок с устройства + изменения
+        # пользователя. Поля редактора показывают это, но в self.env_data
+        # при сохранении попадут ТОЛЬКО реально изменённые значения.
+        if not hasattr(self, "_env_device"):
+            self._env_device = {}
+        disp = dict(self._env_device)   # значения с устройства
+        disp.update(self.env_data)      # поверх — пользовательские изменения
+        # Временно используем disp как источник для заполнения полей
+        self._env_display = disp
+
         tk.Label(
             editor,
             text="Редактор переменных окружения U-Boot",
@@ -950,7 +1041,15 @@ class FlasherGUI:
         # Вкладка 3: Система
         sys_frame = tk.Frame(notebook)
         notebook.add(sys_frame, text="⚙️ Система")
-        
+
+        # Вкладка 4: cmdline_keys (переопределение serial/deviceid)
+        cmd_frame = tk.Frame(notebook)
+        notebook.add(cmd_frame, text="🆔 serial/deviceid")
+
+        # Вкладка 5: Все переменные (raw)
+        raw_frame = tk.Frame(notebook)
+        notebook.add(raw_frame, text="📝 Все переменные")
+
         entry_widgets = {}
         
         # === ВКЛАДКА ИДЕНТИФИКАЦИЯ ===
@@ -992,8 +1091,8 @@ class FlasherGUI:
         }
         # Если у нас уже есть сохранённые данные — подставляем их
         for k in id_vars:
-            if k in self.env_data:
-                id_vars[k]["value"] = self.env_data[k]
+            if k in self._env_display:
+                id_vars[k]["value"] = self._env_display[k]
         
         for var_name, var_info in id_vars.items():
             frame = tk.Frame(id_scroll)
@@ -1021,34 +1120,34 @@ class FlasherGUI:
         
         sec_vars = {
             "lock": {
-                "value": self.env_data.get("lock", ""),
+                "value": self._env_display.get("lock", ""),
                 "desc": "🔓 Разблокировка bootloader (10000000 = разблокирован, 0 = заблокирован)",
                 "critical": True
             },
             "avb2": {
-                "value": self.env_data.get("avb2", ""),
+                "value": self._env_display.get("avb2", ""),
                 "desc": "🔓 Android Verified Boot 2.0 (0 = выключен, 1 = включен)",
                 "critical": True
             },
             "EnableSelinux": {
-                "value": self.env_data.get("EnableSelinux", ""),
+                "value": self._env_display.get("EnableSelinux", ""),
                 "desc": "🔓 SELinux режим (permissive = отключен, enforcing = включен)",
                 "critical": True,
                 "options": ["permissive", "enforcing", "disabled"]
             },
             "jtag": {
-                "value": self.env_data.get("jtag", ""),
+                "value": self._env_display.get("jtag", ""),
                 "desc": "🔧 JTAG отладка (enable/disable)",
                 "critical": False,
                 "options": ["disable", "enable"]
             },
             "silent": {
-                "value": self.env_data.get("silent", ""),
+                "value": self._env_display.get("silent", ""),
                 "desc": "📢 Вывод сообщений загрузки (0 = включен, 1 = выключен)",
                 "critical": False
             },
             "rabbit_hole_debug": {
-                "value": self.env_data.get("rabbit_hole_debug", ""),
+                "value": self._env_display.get("rabbit_hole_debug", ""),
                 "desc": "🐰 Режим отладки (0 = выключен, 1 = включен)",
                 "critical": False
             },
@@ -1084,32 +1183,32 @@ class FlasherGUI:
         
         sys_vars = {
             "bootdelay": {
-                "value": self.env_data.get("bootdelay", ""),
+                "value": self._env_display.get("bootdelay", ""),
                 "desc": "⏱️ Задержка перед загрузкой (секунды)",
                 "critical": False
             },
             "led_screen_brightness": {
-                "value": self.env_data.get("led_screen_brightness", ""),
+                "value": self._env_display.get("led_screen_brightness", ""),
                 "desc": "💡 Яркость экрана (0-255)",
                 "critical": False
             },
             "led_ring_brightness": {
-                "value": self.env_data.get("led_ring_brightness", ""),
+                "value": self._env_display.get("led_ring_brightness", ""),
                 "desc": "💡 Яркость кольца подсветки (0-255)",
                 "critical": False
             },
             "localization": {
-                "value": self.env_data.get("localization", ""),
+                "value": self._env_display.get("localization", ""),
                 "desc": "🌍 Локализация устройства",
                 "critical": False
             },
             "hdmimode": {
-                "value": self.env_data.get("hdmimode", ""),
+                "value": self._env_display.get("hdmimode", ""),
                 "desc": "📺 Режим HDMI (1080p60hz, 720p60hz и т.д.)",
                 "critical": False
             },
             "outputmode": {
-                "value": self.env_data.get("outputmode", ""),
+                "value": self._env_display.get("outputmode", ""),
                 "desc": "📺 Режим вывода видео",
                 "critical": False
             },
@@ -1131,53 +1230,252 @@ class FlasherGUI:
             tk.Label(frame, text=var_info["desc"], font=("Arial", 8), fg="gray", anchor=tk.W).pack(side=tk.TOP, anchor=tk.W, pady=(0, 10))
         
         sys_scroll.config(state='disabled')
-        
+
+        # === ВКЛАДКА cmdline_keys (serial/deviceid override) ===
+        cmd_top = tk.Frame(cmd_frame)
+        cmd_top.pack(fill=tk.X, padx=8, pady=6)
+        tk.Label(cmd_top, justify=tk.LEFT, font=("Arial", 9), text=(
+            "⚠️ serialno / deviceid / mac переопределяются при каждой загрузке\n"
+            "через переменную cmdline_keys (она читает значения из keystore по\n"
+            "eFuse-ключам). Обычный setenv serial=… НЕ работает — значение\n"
+            "перезаписывается. Здесь можно жёстко переопределить cmdline_keys,\n"
+            "чтобы прописать свои serial/deviceid/mac/localization."
+        )).pack(anchor=tk.W)
+
+        cmd_fields = tk.LabelFrame(cmd_frame, text="Значения для жёсткой подстановки",
+                                   font=("Arial", 9, "bold"))
+        cmd_fields.pack(fill=tk.X, padx=8, pady=4)
+
+        cmd_vars = {}
+        cur = self._env_display
+        cmd_defs = [
+            ("serialno",     cur.get("serial", cur.get("deviceid", "")), "androidboot.serialno + serial"),
+            ("deviceid",     cur.get("deviceid", cur.get("custom_deviceid", "")), "androidboot.deviceid"),
+            ("mac",          cur.get("mac", cur.get("ethaddr", "")), "mac + androidboot.mac"),
+            ("localization", cur.get("localization", "RU.RU"), "androidboot.localization"),
+        ]
+        for i, (name, val, desc) in enumerate(cmd_defs):
+            row = tk.Frame(cmd_fields); row.pack(fill=tk.X, padx=6, pady=3)
+            tk.Label(row, text=name, font=("Arial", 9, "bold"), width=13,
+                     anchor=tk.W).pack(side=tk.LEFT)
+            e = tk.Entry(row, font=("Consolas", 9))
+            e.insert(0, val)
+            e.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+            tk.Label(row, text=desc, font=("Arial", 7), fg="gray").pack(side=tk.LEFT)
+            cmd_vars[name] = e
+
+        preset_bar = tk.Frame(cmd_frame); preset_bar.pack(fill=tk.X, padx=8, pady=4)
+        cmd_preview = scrolledtext.ScrolledText(cmd_frame, height=7,
+                                                font=("Consolas", 8), wrap=tk.WORD)
+        cmd_preview.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
+
+        def build_cmdline_keys():
+            s  = cmd_vars["serialno"].get().strip()
+            d  = cmd_vars["deviceid"].get().strip()
+            m  = cmd_vars["mac"].get().strip()
+            loc= cmd_vars["localization"].get().strip() or "RU.RU"
+            parts = ["setenv bootargs ${bootargs}"]
+            if s:   parts.append(f"androidboot.serialno={s}")
+            if d:   parts.append(f"androidboot.deviceid={d}")
+            if m:   parts.append(f"mac={m} androidboot.mac={m}")
+            parts.append(f"androidboot.localization={loc}")
+            line = " ".join(parts) + ";"
+            if s:
+                line += f" setenv serial {s};"
+            if d:
+                line += f" setenv deviceid {d}; setenv custom_deviceid {d};"
+            return line
+
+        def refresh_preview():
+            ck = build_cmdline_keys()
+            cmd_preview.delete("1.0", tk.END)
+            cmd_preview.insert("1.0",
+                "Будет установлено cmdline_keys =\n\n" + ck +
+                "\n\n(применяется как: setenv cmdline_keys '…'; saveenv)")
+
+        def apply_cmdline_keys():
+            ck = build_cmdline_keys()
+            self.env_data["cmdline_keys"] = ck
+            s = cmd_vars["serialno"].get().strip()
+            d = cmd_vars["deviceid"].get().strip()
+            m = cmd_vars["mac"].get().strip()
+            if s: self.env_data["serial"] = s
+            if d:
+                self.env_data["deviceid"] = d
+                self.env_data["custom_deviceid"] = d
+            if m:
+                self.env_data["mac"] = m
+                self.env_data["ethaddr"] = m
+            refresh_preview()
+            messagebox.showinfo("cmdline_keys",
+                "cmdline_keys обновлён в наборе ENV.\n"
+                "Нажмите «Сохранить изменения» чтобы записать env с CRC.",
+                parent=editor)
+
+        tk.Button(preset_bar, text="🔄 Предпросмотр", command=refresh_preview,
+                  font=("Arial", 9)).pack(side=tk.LEFT, padx=3)
+        tk.Button(preset_bar, text="✓ Применить cmdline_keys",
+                  command=apply_cmdline_keys, bg="#27AE60", fg="white",
+                  font=("Arial", 9)).pack(side=tk.LEFT, padx=3)
+
+        def preset_restore_stock():
+            self.env_data.pop("cmdline_keys", None)
+            cmd_preview.delete("1.0", tk.END)
+            cmd_preview.insert("1.0",
+                "cmdline_keys удалён из переопределений — вернётся штатное\n"
+                "чтение serial/deviceid из keystore (keyman) при загрузке.")
+        tk.Button(preset_bar, text="↺ Вернуть штатный", command=preset_restore_stock,
+                  font=("Arial", 9)).pack(side=tk.LEFT, padx=3)
+        refresh_preview()
+
+        # === ВКЛАДКА «Все переменные» (raw) ===
+        tk.Label(raw_frame, justify=tk.LEFT, font=("Arial", 9), text=(
+            "Полный список переменных env (key=value, по одной на строку).\n"
+            "Редактируйте напрямую. При сохранении пересчитывается CRC32 и\n"
+            "записывается весь раздел env целиком (надёжнее, чем setenv по одной)."
+        )).pack(anchor=tk.W, padx=8, pady=6)
+        raw_text = scrolledtext.ScrolledText(raw_frame, font=("Consolas", 9), wrap=tk.NONE)
+        raw_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
+
+        def fill_raw():
+            raw_text.delete("1.0", tk.END)
+            for k, v in self._env_display.items():
+                raw_text.insert(tk.END, f"{k}={v}\n")
+
+        raw_bar = tk.Frame(raw_frame); raw_bar.pack(fill=tk.X, padx=8, pady=(0, 6))
+        tk.Button(raw_bar, text="🔄 Обновить из текущего набора", command=fill_raw,
+                  font=("Arial", 9)).pack(side=tk.LEFT, padx=3)
+        tk.Label(raw_bar, font=("Arial", 8), fg="gray",
+                 text="(изменения здесь применяются при «Сохранить изменения»)"
+                 ).pack(side=tk.LEFT, padx=6)
+        fill_raw()
+        editor._raw_text = raw_text
+
         # Кнопки (внутри зафиксированного снизу env_bottom)
         btn_frame = tk.Frame(env_bottom, bg="#ECF0F1")
         btn_frame.pack(fill=tk.X, padx=10, pady=10)
         
         def save_env():
-            """Сохранить изменения ENV"""
-            # Собираем все значения
-            self.env_data = {}
+            """Сохранить изменения ENV.
+
+            Логика: в self.env_data попадают ТОЛЬКО переменные, которые
+            ОТЛИЧАЮТСЯ от снимка с устройства (_env_device). Это критично:
+            при прошивке применяются лишь реальные изменения + обязательные
+            lock/avb2/silent, а огромные скрипт-переменные (bootargs и т.п.)
+            не трогаются (иначе setenv падает и блок env прерывается).
+            """
+            device = getattr(self, "_env_device", {})
+            changes = {}
+
+            # 1. Именованные поля из 3 вкладок
             for name, widget in entry_widgets.items():
-                if isinstance(widget, ttk.Combobox):
-                    self.env_data[name] = widget.get()
-                else:
-                    self.env_data[name] = widget.get()
-            
-            # Проверяем серийные номера
+                val = widget.get()
+                # записываем только если значение задано И отличается от устройства
+                if val != "" and val != device.get(name, ""):
+                    changes[name] = val
+
+            # 2. Вкладка «Все переменные» — берём построчно, но сохраняем
+            #    в changes ТОЛЬКО отличия от снимка устройства.
+            try:
+                raw_content = editor._raw_text.get("1.0", tk.END).strip()
+            except Exception:
+                raw_content = ""
+            if raw_content:
+                for line in raw_content.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, _, v = line.partition("=")
+                    k = k.strip()
+                    if k and v != device.get(k, ""):
+                        changes[k] = v
+
+            # 3. cmdline_keys, если был переопределён через вкладку serial/deviceid
+            if self.env_data.get("cmdline_keys"):
+                changes["cmdline_keys"] = self.env_data["cmdline_keys"]
+            for k in ("serial", "deviceid", "custom_deviceid", "mac", "ethaddr"):
+                if k in self.env_data and self.env_data[k] != device.get(k, ""):
+                    changes[k] = self.env_data[k]
+
+            self.env_data = changes
+            self._env_editor_saved = True
+
             serial = self.env_data.get("serial", "")
-            deviceid = self.env_data.get("deviceid", "")
-            custom_deviceid = self.env_data.get("custom_deviceid", "")
-            
-            if serial != deviceid or serial != custom_deviceid:
-                response = messagebox.askyesno(
-                    "Предупреждение",
-                    f"Серийные номера не совпадают:\n\n"
-                    f"serial: {serial}\n"
-                    f"deviceid: {deviceid}\n"
-                    f"custom_deviceid: {custom_deviceid}\n\n"
-                    f"Рекомендуется использовать одинаковые значения.\n"
-                    f"Продолжить?",
-                    parent=editor
-                )
-                if not response:
-                    return
-            
             messagebox.showinfo(
                 "Сохранено",
-                f"ENV переменные сохранены.\n\n"
-                f"Они будут применены при прошивке через команды:\n"
-                f"• env import (загрузка существующего ENV)\n"
-                f"• setenv <var> <value> (установка значений)\n"
-                f"• saveenv (сохранение на устройство)\n\n"
-                f"Всего переменных: {len(self.env_data)}",
+                f"Изменения ENV сохранены ({len(self.env_data)} переменных).\n\n"
+                "При прошивке применятся:\n"
+                "• обязательные lock=10000000, avb2=0, silent=0\n"
+                f"• ваши изменения ({len(self.env_data)} перем.)\n\n"
+                "Скрипт-переменные (bootargs и т.п.) НЕ трогаются.",
                 parent=editor
             )
-            
-            self.log(f"✓ ENV переменные обновлены: {len(self.env_data)} шт.")
-            self.log(f"  Серийный номер: {serial}")
+            self.log(f"✓ ENV: к применению {len(self.env_data)} изменённых переменных")
+            if serial:
+                self.log(f"  serial → {serial}")
+            if "cmdline_keys" in self.env_data:
+                self.log("  cmdline_keys: переопределён")
+            editor.destroy()
+
+        def write_env_to_device():
+            """Прочитать env с устройства, заменить нашими значениями,
+            пересобрать с CRC32 и записать обратно. Требует подключённого
+            устройства в U-Boot режиме."""
+            if not messagebox.askyesno("Запись env",
+                "Записать env на устройство?\n\n"
+                "Устройство должно быть в режиме U-Boot (после загрузки\n"
+                "временного U-Boot). Будет прочитан env, заменён вашими\n"
+                "значениями, пересчитан CRC32 и записан обратно.",
+                parent=editor):
+                return
+            # Сначала применим текущие поля
+            for name, widget in entry_widgets.items():
+                v = widget.get()
+                if v != "":
+                    self.env_data[name] = v
+
+            def _t():
+                import threading
+                try:
+                    env_file = os.path.join(ROOT_DIR, "env_user.bin")
+                    self.log("📥 Чтение env с устройства...")
+                    self.aml_read_part("env", "0x800000", env_file)
+                    if not os.path.exists(env_file):
+                        self.log("❌ Не удалось прочитать env"); return
+                    part_size = os.path.getsize(env_file)
+                    # Берём оригинальный порядок + наши изменения
+                    orig = self.parse_env_blob_ordered(env_file)
+                    merged = {}
+                    for k, v in orig:
+                        merged[k] = v
+                    merged.update(self.env_data)
+                    blob = self.build_env_blob(list(merged.items()), part_size)
+                    out = os.path.join(ROOT_DIR, "env_new.bin")
+                    with open(out, "wb") as f:
+                        f.write(blob)
+                    self.log(f"✓ Собран env с CRC32 ({len(blob)} байт)")
+                    # Записываем через partition (как остальные разделы)
+                    update_path = self.get_update_path()
+                    cflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                    r = subprocess.run(
+                        [update_path, "partition", "env", out],
+                        capture_output=True, timeout=120, creationflags=cflags)
+                    o = ((r.stdout or b"")+(r.stderr or b"")).decode("utf-8","ignore")
+                    if r.returncode == 0 and "ERR" not in o.upper():
+                        self.log("✓ env записан на устройство (partition env)")
+                        self.root.after(0, lambda: messagebox.showinfo(
+                            "Готово", "env записан на устройство с корректным CRC32.",
+                            parent=self.root))
+                    else:
+                        self.log(f"❌ partition env ошибка: {o.strip()[:120]}")
+                    try:
+                        os.remove(out)
+                    except Exception:
+                        pass
+                except Exception as ex:
+                    self.log(f"❌ Запись env: {ex}")
+            import threading
+            threading.Thread(target=_t, daemon=True).start()
             editor.destroy()
         
         def load_from_file():
@@ -1249,14 +1547,35 @@ class FlasherGUI:
             font=("Arial", 10),
             width=18
         ).pack(side=tk.LEFT, padx=5)
+
+        tk.Button(
+            btn_frame,
+            text="📤 Записать env на устройство",
+            command=write_env_to_device,
+            bg="#C0392B",
+            fg="white",
+            font=("Arial", 10),
+            width=24
+        ).pack(side=tk.LEFT, padx=5)
         
+        def cancel_editor():
+            """Отмена — НЕ применять никакие пользовательские изменения.
+            env_data очищается, чтобы при прошивке применился только
+            необходимый минимум: silent/lock/avb2."""
+            self.env_data = {}
+            self._env_editor_saved = False
+            editor.destroy()
+
         tk.Button(
             btn_frame,
             text="Отмена",
-            command=editor.destroy,
+            command=cancel_editor,
             font=("Arial", 10),
             width=10
         ).pack(side=tk.RIGHT, padx=5)
+
+        # По умолчанию (закрытие крестиком) — тоже отмена
+        editor.protocol("WM_DELETE_WINDOW", cancel_editor)
 
         if return_window:
             return editor
@@ -1598,6 +1917,24 @@ class FlasherGUI:
             except Exception as ex:
                 messagebox.showerror("Ошибка", str(ex), parent=win)
 
+        def do_vbmeta_patch():
+            src = img_var.get()
+            if not src or not os.path.exists(src):
+                messagebox.showwarning("!",
+                    "Выберите vbmeta.img в поле «Образ раздела»", parent=win)
+                return
+            out = os.path.splitext(src)[0] + "-disabled.img"
+            ok, msg = self.patch_vbmeta_disable_verity(src, out)
+            log(f"🔓 vbmeta patch: {msg}")
+            if ok:
+                log(f"  → {out}")
+                messagebox.showinfo("vbmeta пропатчен",
+                    msg + f"\n\nСохранено: {out}\n\n"
+                    "Прошейте этот vbmeta, чтобы убрать dm-verity бутлуп\n"
+                    "после прошивки несовместимых system/product.", parent=win)
+            else:
+                messagebox.showerror("Ошибка", msg, parent=win)
+
         # ── Кнопки ──
         if tools["bin_dir"]:
             tk.Button(btn_row, text="📂 Распаковать",
@@ -1608,6 +1945,10 @@ class FlasherGUI:
                       command=do_pack, bg="#27AE60", fg="white",
                       font=("Arial", 10, "bold"), height=2
                       ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        tk.Button(btn_row, text="🔓 vbmeta\ndisable-verity",
+                  command=do_vbmeta_patch, bg="#D35400", fg="white",
+                  font=("Arial", 9), height=2
+                  ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
         if tools["mik_gui"]:
             tk.Button(btn_row, text="🖥 Открыть GUI MIK",
                       command=open_gui, bg="#8E44AD", fg="white",
@@ -1622,6 +1963,8 @@ class FlasherGUI:
                   font=("Arial", 9), height=2, width=10).pack(side=tk.RIGHT)
 
         log("Редактор образов готов.")
+        log("🔓 Кнопка «vbmeta disable-verity» патчит vbmeta.img (флаги AVB)")
+        log("   — лечит dm-verity бутлуп после прошивки несовместимых разделов.")
         if tools["bin_dir"]:
             log(f"Утилиты bin/: {tools['bin_dir']}")
             for k in ("simg2img", "img2simg", "make_ext4fs", "imgextractor"):
@@ -2644,6 +2987,852 @@ class FlasherGUI:
         
         return False
     
+    def _find_aml_packer(self):
+        """Найти aml_image_v2_packer (Windows) в files/ и подпапках.
+
+        В USB Burning Tool v2 есть только AmlImagePack.dll (библиотека GUI),
+        консольный packer туда не входит. Берём его из khadas/utils
+        (tools/windows/aml_image_v2_packer.exe).
+        """
+        candidates = [
+            os.path.join(FILE_DIR, "aml_image_v2_packer.exe"),
+            os.path.join(FILE_DIR, "aml_image_v2_packer"),
+            os.path.join(FILE_DIR, "tools", "windows", "aml_image_v2_packer.exe"),
+            os.path.join(FILE_DIR, "AmlImagePacker", "aml_image_v2_packer.exe"),
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+        # Рекурсивный поиск
+        if os.path.isdir(FILE_DIR):
+            for root_d, _dirs, files in os.walk(FILE_DIR):
+                for n in ("aml_image_v2_packer.exe", "aml_image_v2_packer"):
+                    if n in files:
+                        return os.path.join(root_d, n)
+        return None
+
+    def _download_aml_packer(self, log_fn=None):
+        """Скачать aml_image_v2_packer.exe (Windows) из репозитория khadas/utils.
+
+        Путь в репо: aml-flash-tool/tools/windows/aml_image_v2_packer.exe
+        Кладём в files/tools/windows/ вместе с DLL-зависимостями той же папки.
+        """
+        def _log(m):
+            if log_fn: log_fn(m)
+            else: self.log(m)
+
+        RAW = ("https://raw.githubusercontent.com/khadas/utils/master/"
+               "aml-flash-tool/tools/windows")
+        API = ("https://api.github.com/repos/khadas/utils/contents/"
+               "aml-flash-tool/tools/windows")
+        dest_dir = os.path.join(FILE_DIR, "tools", "windows")
+        os.makedirs(dest_dir, exist_ok=True)
+
+        def ua(url):
+            return urllib.request.Request(url, headers={
+                "User-Agent": "yasta_flasher/1.0",
+                "Accept": "application/vnd.github+json"})
+
+        _log("📥 Загрузка aml_image_v2_packer из khadas/utils...")
+
+        # Пытаемся получить список файлов папки windows через API,
+        # чтобы скачать и .exe, и нужные .dll рядом.
+        files_to_get = []
+        try:
+            import json
+            with urllib.request.urlopen(ua(API), timeout=20) as r:
+                items = json.loads(r.read().decode())
+            for it in items:
+                if it["type"] == "file" and (
+                        it["name"].endswith(".exe") or it["name"].endswith(".dll")):
+                    files_to_get.append((it["name"], it["download_url"]))
+        except Exception as ex:
+            _log(f"  ⚠ API недоступен ({ex}), качаем только packer по raw URL")
+            files_to_get = [("aml_image_v2_packer.exe",
+                             f"{RAW}/aml_image_v2_packer.exe")]
+
+        ok = 0
+        for name, url in files_to_get:
+            dest = os.path.join(dest_dir, name)
+            if os.path.exists(dest):
+                _log(f"  ⏭ есть: {name}")
+                ok += 1
+                continue
+            try:
+                with urllib.request.urlopen(ua(url), timeout=120) as r:
+                    data = r.read()
+                with open(dest, "wb") as f:
+                    f.write(data)
+                _log(f"  ↓ {name} ({len(data)//1024} KB)")
+                ok += 1
+            except Exception as ex:
+                _log(f"  ❌ {name}: {ex}")
+        if ok:
+            _log(f"✓ Готово. Packer в {dest_dir}")
+        else:
+            _log("❌ Не удалось скачать packer. Возьмите вручную из:")
+            _log("   github.com/khadas/utils → aml-flash-tool/tools/windows/")
+
+    @staticmethod
+    def patch_vbmeta_disable_verity(in_path, out_path,
+                                     disable_verity=True, disable_verification=True):
+        """Пропатчить vbmeta.img — выставить флаги отключения проверки.
+
+        Формат AVB (avb_vbmeta_image.h):
+          • offset 0: магия "AVB0"
+          • offset 120: flags — 32-битное BIG-ENDIAN поле (байты 120..123)
+          • bit 0 = HASHTREE_DISABLED  (--disable-verity)
+          • bit 1 = VERIFICATION_DISABLED (--disable-verification)
+        Изменяется младший байт поля (offset 123). Эквивалент:
+          fastboot --disable-verity --disable-verification flash vbmeta
+        Возвращает (ok, message).
+        """
+        try:
+            with open(in_path, "rb") as f:
+                data = bytearray(f.read())
+        except Exception as ex:
+            return False, f"Не удалось открыть: {ex}"
+        if len(data) < 256 or data[0:4] != b"AVB0":
+            return False, ("Это не похоже на vbmeta (нет магии 'AVB0' в начале).\n"
+                           "Нужен standalone vbmeta.img, а не sparse/раздел с footer.")
+        flags_off = 123   # младший байт 32-битного BE поля flags (120..123)
+        old = data[flags_off]
+        new = old
+        if disable_verity:
+            new |= 0x01
+        if disable_verification:
+            new |= 0x02
+        data[flags_off] = new
+        try:
+            with open(out_path, "wb") as f:
+                f.write(data)
+        except Exception as ex:
+            return False, f"Не удалось записать: {ex}"
+        return True, (f"vbmeta пропатчен. flags байт: 0x{old:02x} → 0x{new:02x}\n"
+                      f"(disable-verity={disable_verity}, "
+                      f"disable-verification={disable_verification})")
+
+    def build_burning_package(self):
+        """Собрать burning-пакет (aml_upgrade_package.img) для USB Burning Tool.
+
+        Обратная операция к flash_burning_package. Поскольку формат пакета
+        требует служебных файлов (DDR, UBOOT, DTB, platform.conf) и корректного
+        image.cfg, самый надёжный путь — взять ШАБЛОН (распакованный пакет от
+        этого же устройства) и заменить в нём нужные разделы своими файлами,
+        затем переупаковать через  aml_image_v2_packer -r image.cfg <dir> <out>.
+
+        Шаги в окне:
+          1. Шаблон: папка с распакованным пакетом (image.cfg + platform.conf +
+             служебные файлы). Можно получить из «Burning-пакет» → распаковка,
+             либо распаковать любой .img-пакет прямо здесь.
+          2. Таблица разделов из image.cfg — для каждого можно подменить файл.
+          3. Сборка → новый aml_upgrade_package.img.
+        """
+        import threading as _th, re as _re, shutil as _sh
+
+        win = tk.Toplevel(self.root)
+        win.title("Сборка burning-пакета (aml_upgrade_package.img)")
+        win.resizable(True, True)
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.geometry(f"{min(920, sw-60)}x{min(760, sh-60)}")
+        win.minsize(740, 620)
+        win.transient(self.root)
+
+        # ── Низ: кнопки ──
+        bottom = tk.Frame(win, bg="#ECF0F1", relief=tk.RIDGE, bd=2)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
+        btn_row = tk.Frame(bottom, bg="#ECF0F1")
+        btn_row.pack(fill=tk.X, padx=10, pady=8)
+
+        # ── Лог ──
+        logf = tk.LabelFrame(win, text="Журнал", font=("Arial", 9, "bold"))
+        logf.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 4))
+        log_box = scrolledtext.ScrolledText(logf, height=9, font=("Consolas", 8),
+                                            bg="#1E1E1E", fg="#00FF00", state='disabled')
+        log_box.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        def log(m):
+            log_box.config(state='normal')
+            log_box.insert(tk.END, m + "\n"); log_box.see(tk.END)
+            log_box.config(state='disabled'); log_box.update_idletasks()
+
+        top = tk.Frame(win)
+        top.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=8)
+
+        # 1. Шаблон
+        f1 = tk.LabelFrame(top, text="1. Шаблон (папка распакованного пакета или .img)",
+                           font=("Arial", 9, "bold"))
+        f1.pack(fill=tk.X, pady=(0, 6))
+        tpl_var = tk.StringVar()
+        r1 = tk.Frame(f1); r1.pack(fill=tk.X, padx=6, pady=4)
+        tk.Entry(r1, textvariable=tpl_var, font=("Arial", 9)
+                 ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+
+        def pick_tpl_dir():
+            d = filedialog.askdirectory(
+                title="Папка распакованного пакета (с image.cfg)", parent=win)
+            if d: tpl_var.set(d)
+        def pick_tpl_img():
+            fn = filedialog.askopenfilename(
+                title="Шаблонный aml_upgrade_package.img", parent=win,
+                filetypes=[("Amlogic image", "*.img"), ("All", "*.*")])
+            if fn: tpl_var.set(fn)
+
+        tk.Button(r1, text="Папка…", command=pick_tpl_dir, width=8).pack(side=tk.LEFT)
+        tk.Button(r1, text=".img…", command=pick_tpl_img, width=7).pack(side=tk.LEFT, padx=(3,0))
+
+        tk.Label(f1, font=("Arial", 8), fg="gray", justify=tk.LEFT, text=(
+            "Шаблон даёт служебные файлы (DDR/UBOOT/DTB/platform.conf) и image.cfg.\n"
+            "Берите шаблон ОТ ЭТОГО ЖЕ устройства (Yandex Station Max), иначе пакет\n"
+            "может не прошиться. Свои разделы подмените в таблице ниже."
+        )).pack(anchor=tk.W, padx=6, pady=(0, 4))
+
+        # 2. Таблица разделов
+        f2 = tk.LabelFrame(top, text="2. Разделы (дабл-клик — подменить файл)",
+                           font=("Arial", 9, "bold"))
+        f2.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+        tree = ttk.Treeview(f2, columns=("name", "file", "type", "src"),
+                            show="headings", height=9)
+        for c, t, w in (("name","Раздел",130),("file","Файл в пакете",180),
+                        ("type","Тип",70),("src","Свой файл (подмена)",260)):
+            tree.heading(c, text=t)
+            tree.column(c, width=w, anchor="w", stretch=(c=="src"))
+        vsb = ttk.Scrollbar(f2, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # state
+        state = {"tpl_dir": None, "cfg_path": None, "parts": [], "svc": {},
+                 "overrides": {}}  # name → custom file path
+
+        def override_file(event):
+            row = tree.identify_row(event.y)
+            if not row: return
+            name = tree.set(row, "name")
+            fn = filedialog.askopenfilename(
+                title=f"Файл для раздела {name}", parent=win,
+                filetypes=[("Image", "*.img *.PARTITION *.bin"), ("All", "*.*")])
+            if fn:
+                state["overrides"][name] = fn
+                tree.set(row, "src", fn)
+                log(f"  ↪ {name} ← {os.path.basename(fn)}")
+        tree.bind("<Double-1>", override_file)
+
+        # 3. Выход
+        f3 = tk.LabelFrame(top, text="3. Выходной пакет (.img)", font=("Arial", 9, "bold"))
+        f3.pack(fill=tk.X, pady=(0, 6))
+        out_var = tk.StringVar(value=os.path.join(ROOT_DIR, "aml_upgrade_package_new.img"))
+        r3 = tk.Frame(f3); r3.pack(fill=tk.X, padx=6, pady=4)
+        tk.Entry(r3, textvariable=out_var, font=("Arial", 9)
+                 ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        tk.Button(r3, text="Обзор…",
+                  command=lambda: out_var.set(
+                      filedialog.asksaveasfilename(parent=win, defaultextension=".img",
+                          filetypes=[("Amlogic image","*.img")]) or out_var.get()),
+                  width=9).pack(side=tk.LEFT)
+
+        prog = ttk.Progressbar(top, mode="indeterminate")
+        prog.pack(fill=tk.X, pady=(4, 0))
+
+        # ── Загрузка шаблона ──
+        def load_template():
+            tpl = tpl_var.get()
+            if not tpl or not os.path.exists(tpl):
+                messagebox.showwarning("!", "Укажите шаблон", parent=win); return
+            def _t():
+                prog.start(10)
+                try:
+                    if os.path.isdir(tpl):
+                        tpl_dir = tpl
+                    else:
+                        # это .img — распакуем во временную папку
+                        packer = self._find_aml_packer()
+                        if not packer:
+                            log("❌ Нет aml_image_v2_packer для распаковки шаблона.")
+                            log("  Откройте «Burning-пакет» → «Скачать packer».")
+                            return
+                        tpl_dir = os.path.join(os.path.dirname(tpl), "_tpl_unpack")
+                        os.makedirs(tpl_dir, exist_ok=True)
+                        log(f"📦 Распаковка шаблона...")
+                        cf = subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0
+                        for flag in ("-d", "-unpack"):
+                            r = subprocess.run([packer, flag, tpl, tpl_dir],
+                                               capture_output=True, timeout=300,
+                                               creationflags=cf)
+                            o = ((r.stdout or b"")+(r.stderr or b"")).decode("utf-8","ignore")
+                            if "Image unpack OK" in o or os.path.exists(
+                                    os.path.join(tpl_dir, "image.cfg")):
+                                break
+                    cfg = os.path.join(tpl_dir, "image.cfg")
+                    if not os.path.exists(cfg):
+                        log("❌ image.cfg не найден в шаблоне.")
+                        return
+                    state["tpl_dir"] = tpl_dir
+                    state["cfg_path"] = cfg
+                    parts, svc = self._parse_image_cfg_full(cfg)
+                    state["parts"] = parts
+                    state["svc"] = svc
+                    state["overrides"].clear()
+                    def _fill():
+                        for row in tree.get_children(): tree.delete(row)
+                        for p in parts:
+                            tree.insert("", tk.END,
+                                values=(p["name"], p["file"], p["type"], ""))
+                    self.root.after(0, _fill)
+                    log(f"✓ Шаблон загружен. Разделов: {len(parts)}")
+                    log("  Дабл-клик по разделу — подменить файл своим.")
+                except Exception as ex:
+                    log(f"❌ {ex}")
+                finally:
+                    self.root.after(0, prog.stop)
+            _th.Thread(target=_t, daemon=True).start()
+
+        # ── Сборка ──
+        def build_pkg():
+            if not state["cfg_path"]:
+                messagebox.showwarning("!", "Сначала загрузите шаблон", parent=win); return
+            packer = self._find_aml_packer()
+            if not packer:
+                messagebox.showwarning("!",
+                    "Нужен aml_image_v2_packer (кнопка в «Burning-пакет»)", parent=win)
+                return
+            out = out_var.get()
+            if not out:
+                messagebox.showwarning("!", "Укажите выходной файл", parent=win); return
+            if _re.search(r'[ \u0400-\u04FF]', out + state["tpl_dir"]):
+                if not messagebox.askyesno("Внимание",
+                    "В пути есть пробелы/кириллица — packer может не собрать.\n"
+                    "Продолжить?", parent=win):
+                    return
+
+            def _t():
+                prog.start(10)
+                try:
+                    tpl_dir = state["tpl_dir"]
+                    # Готовим рабочую копию папки шаблона, чтобы не портить оригинал
+                    work = os.path.join(os.path.dirname(out), "_build_pkg")
+                    if os.path.exists(work):
+                        _sh.rmtree(work, ignore_errors=True)
+                    log("📋 Копирование шаблона в рабочую папку...")
+                    _sh.copytree(tpl_dir, work)
+
+                    # Подменяем файлы разделов
+                    for name, src in state["overrides"].items():
+                        # находим имя файла для этого раздела
+                        part = next((p for p in state["parts"] if p["name"]==name), None)
+                        if not part:
+                            continue
+                        dest = os.path.join(work, part["file"])
+                        log(f"  ↪ {name}: {os.path.basename(src)} → {part['file']}")
+                        _sh.copy2(src, dest)
+
+                    cfg = os.path.join(work, "image.cfg")
+                    log(f"🔨 Сборка пакета через {os.path.basename(packer)} -r ...")
+                    cf = subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0
+                    # aml_image_v2_packer -r <image.cfg> <dir> <out.img>
+                    r = subprocess.run([packer, "-r", cfg, work, out],
+                                       capture_output=True, timeout=1800,
+                                       creationflags=cf)
+                    o = ((r.stdout or b"")+(r.stderr or b"")).decode("utf-8","ignore")
+                    for ln in o.splitlines():
+                        if ln.strip(): log("  " + ln.strip())
+                    if ("Image pack OK" in o or "pack OK" in o
+                            or (os.path.exists(out) and os.path.getsize(out) > 0)):
+                        sz = os.path.getsize(out) // (1024*1024) if os.path.exists(out) else 0
+                        log(f"✓ Готово! {os.path.basename(out)} ({sz} MB)")
+                        self.root.after(0, lambda: messagebox.showinfo(
+                            "Готово",
+                            f"Пакет собран:\n{out}\n\n"
+                            "Его можно прошить через оригинальный USB Burning Tool.",
+                            parent=win))
+                    else:
+                        log("❌ Сборка не удалась (нет 'Image pack OK').")
+                    # Чистим рабочую папку
+                    _sh.rmtree(work, ignore_errors=True)
+                except Exception as ex:
+                    log(f"❌ Сборка: {ex}")
+                finally:
+                    self.root.after(0, prog.stop)
+            _th.Thread(target=_t, daemon=True).start()
+
+        tk.Button(btn_row, text="📂 Загрузить шаблон",
+                  command=load_template, bg="#2980B9", fg="white",
+                  font=("Arial", 10, "bold"), height=2
+                  ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        tk.Button(btn_row, text="🔨 Собрать пакет",
+                  command=build_pkg, bg="#16A085", fg="white",
+                  font=("Arial", 10, "bold"), height=2
+                  ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        tk.Button(btn_row, text="Закрыть", command=win.destroy,
+                  font=("Arial", 9), height=2, width=10).pack(side=tk.RIGHT)
+
+        log("Сборка burning-пакета для оригинального USB Burning Tool.")
+        log("1) Загрузите шаблон (распакованный пакет от этого устройства)")
+        log("2) Дабл-клик по разделам — подмените свои файлы")
+        log("3) Соберите новый aml_upgrade_package.img")
+
+    def _parse_image_cfg_full(self, cfg_path):
+        """Разобрать image.cfg → (список разделов, служебные файлы).
+        Используется и при сборке, и при прошивке пакета."""
+        import re as _re
+        parts, svc = [], {}
+        try:
+            with open(cfg_path, "r", errors="ignore") as fh:
+                text = fh.read()
+        except Exception:
+            return parts, svc
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            fm = _re.search(r'file="([^"]+)"', line)
+            sm = _re.search(r'sub_type="([^"]+)"', line)
+            mm = _re.search(r'main_type="([^"]+)"', line)
+            tm = _re.search(r'file_type="([^"]+)"', line)
+            if not fm:
+                continue
+            fname = fm.group(1)
+            sub = sm.group(1) if sm else ""
+            main = mm.group(1) if mm else ""
+            ftype = tm.group(1) if tm else "normal"
+            if main == "PARTITION":
+                parts.append({"name": sub, "file": fname, "type": ftype})
+            else:
+                svc[sub] = fname
+        return parts, svc
+
+    def flash_burning_package(self):
+        """Прошивка целого Amlogic burning-пакета (aml_upgrade_package.img).
+
+        Воспроизводит логику Amlogic USB Burning Tool / aml-flash для SoC gxl
+        (S905X2/g12a), БЕЗ поддержки пароля (USB-режим открыт). Шаги:
+          1. Распаковка пакета через aml_image_v2_packer / AmlImagePack.exe
+          2. Разбор image.cfg + platform.conf (адреса DDR/UBOOT, список разделов)
+          3. Инициализация DDR и запуск U-Boot из пакета
+          4. Запись DTB, создание разделов (disk_initial), bootloader
+          5. Прошивка всех (или выбранных) разделов
+          6. Reset (burn_complete)
+
+        ⚠️ Это низкоуровневая операция. Неверный пакет может превратить
+        устройство в «кирпич».
+        """
+        import threading as _th, re as _re
+
+        win = tk.Toplevel(self.root)
+        win.title("Прошивка burning-пакета (aml_upgrade_package.img)")
+        win.resizable(True, True)
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.geometry(f"{min(900, sw-60)}x{min(740, sh-60)}")
+        win.minsize(720, 600)
+        win.transient(self.root)
+
+        # ── Низ: кнопки ──
+        bottom = tk.Frame(win, bg="#ECF0F1", relief=tk.RIDGE, bd=2)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
+        btn_row = tk.Frame(bottom, bg="#ECF0F1")
+        btn_row.pack(fill=tk.X, padx=10, pady=8)
+
+        # ── Лог (тоже снизу) ──
+        logf = tk.LabelFrame(win, text="Журнал прошивки", font=("Arial", 9, "bold"))
+        logf.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 4))
+        log_box = scrolledtext.ScrolledText(logf, height=10, font=("Consolas", 8),
+                                            bg="#1E1E1E", fg="#00FF00", state='disabled')
+        log_box.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        def log(m):
+            log_box.config(state='normal')
+            log_box.insert(tk.END, m + "\n"); log_box.see(tk.END)
+            log_box.config(state='disabled'); log_box.update_idletasks()
+
+        # ── Верх ──
+        top = tk.Frame(win)
+        top.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=8)
+
+        # Выбор пакета
+        f1 = tk.LabelFrame(top, text="1. Burning-пакет (.img)", font=("Arial", 9, "bold"))
+        f1.pack(fill=tk.X, pady=(0, 6))
+        pkg_var = tk.StringVar()
+        r1 = tk.Frame(f1); r1.pack(fill=tk.X, padx=6, pady=4)
+        tk.Entry(r1, textvariable=pkg_var, font=("Arial", 9)
+                 ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+
+        # Packer status — ищем aml_image_v2_packer (Windows) в files/ и подпапках
+        packer_path = self._find_aml_packer()
+
+        parts_info = []     # list of dict: {name, file, type}
+        platform_cfg = {}   # parsed platform.conf addresses
+        unpack_dir = [None] # mutable holder
+
+        def pick_pkg():
+            fn = filedialog.askopenfilename(
+                title="Выберите aml_upgrade_package.img", parent=win,
+                filetypes=[("Amlogic burning image", "*.img"), ("All", "*.*")])
+            if fn:
+                pkg_var.set(fn)
+
+        tk.Button(r1, text="Обзор…", command=pick_pkg, width=9).pack(side=tk.LEFT)
+
+        pk_row = tk.Frame(f1); pk_row.pack(fill=tk.X, padx=6, pady=(0, 4))
+        pk_lbl = tk.Label(pk_row, font=("Arial", 8),
+                          text=(f"✓ packer: {os.path.relpath(packer_path, FILE_DIR)}"
+                                if packer_path else
+                                "✗ aml_image_v2_packer.exe не найден — нужен из репо khadas/utils"),
+                          fg="#27AE60" if packer_path else "#E74C3C")
+        pk_lbl.pack(side=tk.LEFT)
+
+        def dl_packer():
+            self._download_aml_packer(log_fn=log)
+            # обновить статус
+            np = self._find_aml_packer()
+            if np:
+                pk_lbl.config(text=f"✓ packer: {os.path.relpath(np, FILE_DIR)}",
+                              fg="#27AE60")
+                nonlocal_holder["packer"] = np
+
+        nonlocal_holder = {"packer": packer_path}
+        if not packer_path:
+            tk.Button(pk_row, text="📥 Скачать packer", command=dl_packer,
+                      font=("Arial", 8), bg="#9B59B6", fg="white"
+                      ).pack(side=tk.LEFT, padx=(8, 0))
+
+        # Опции
+        f2 = tk.LabelFrame(top, text="2. Опции прошивки", font=("Arial", 9, "bold"))
+        f2.pack(fill=tk.X, pady=(0, 6))
+        wipe_var  = tk.BooleanVar(value=False)
+        reset_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(f2, text="Стереть data/cache (--wipe) — сброс к заводским",
+                       variable=wipe_var, font=("Arial", 9)).pack(anchor=tk.W, padx=6)
+        tk.Checkbutton(f2, text="Перезагрузить устройство после прошивки (reset)",
+                       variable=reset_var, font=("Arial", 9)).pack(anchor=tk.W, padx=6)
+
+        # Таблица разделов из пакета
+        f3 = tk.LabelFrame(top, text="3. Разделы в пакете (✓ = прошить)",
+                           font=("Arial", 9, "bold"))
+        f3.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+
+        sel_bar = tk.Frame(f3); sel_bar.pack(side=tk.TOP, fill=tk.X, padx=2, pady=2)
+        tree = ttk.Treeview(f3, columns=("sel", "name", "file", "type"),
+                            show="headings", height=8)
+        for c, t, w in (("sel","✓",40),("name","Раздел",150),
+                        ("file","Файл",200),("type","Тип",80)):
+            tree.heading(c, text=t)
+            tree.column(c, width=w, anchor="center" if c in ("sel","type") else "w",
+                        stretch=(c=="file"))
+        vsb = ttk.Scrollbar(f3, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        psel = {}  # name → bool
+        def set_all(state):
+            for row in tree.get_children():
+                n = tree.set(row, "name")
+                psel[n] = state
+                tree.set(row, "sel", "✓" if state else "")
+        tk.Button(sel_bar, text="✓ Все", font=("Arial", 8),
+                  command=lambda: set_all(True), width=8).pack(side=tk.LEFT, padx=2)
+        tk.Button(sel_bar, text="✗ Никого", font=("Arial", 8),
+                  command=lambda: set_all(False), width=8).pack(side=tk.LEFT, padx=2)
+        def toggle(e):
+            row = tree.identify_row(e.y)
+            if not row: return
+            n = tree.set(row, "name")
+            psel[n] = not psel.get(n, True)
+            tree.set(row, "sel", "✓" if psel[n] else "")
+        tree.bind("<ButtonRelease-1>", toggle)
+
+        prog = ttk.Progressbar(top, mode="indeterminate")
+        prog.pack(fill=tk.X, pady=(4, 0))
+
+        # ── Распаковка и разбор пакета ──
+        def parse_image_cfg(cfg_path):
+            """Разобрать image.cfg → разделы и имена служебных файлов."""
+            parts = []
+            svc = {}
+            try:
+                with open(cfg_path, "r", errors="ignore") as fh:
+                    text = fh.read()
+            except Exception as ex:
+                log(f"❌ image.cfg: {ex}")
+                return parts, svc
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                fm = _re.search(r'file="([^"]+)"', line)
+                sm = _re.search(r'sub_type="([^"]+)"', line)
+                mm = _re.search(r'main_type="([^"]+)"', line)
+                tm = _re.search(r'file_type="([^"]+)"', line)
+                if not fm:
+                    continue
+                fname = fm.group(1)
+                sub = sm.group(1) if sm else ""
+                main = mm.group(1) if mm else ""
+                ftype = tm.group(1) if tm else "normal"
+                if main == "PARTITION":
+                    parts.append({"name": sub, "file": fname, "type": ftype})
+                else:
+                    svc[sub] = fname   # DDR, UBOOT, UBOOT_COMP, platform, meson1 ...
+            return parts, svc
+
+        def parse_platform_conf(path):
+            """Разобрать platform.conf → адреса загрузки."""
+            cfg = {}
+            try:
+                with open(path, "r", errors="ignore") as fh:
+                    for line in fh:
+                        m = _re.match(r'\s*(\w+):\s*(\S+)', line)
+                        if m:
+                            cfg[m.group(1)] = m.group(2)
+                        m2 = _re.match(r'\s*(\w+)=\s*(\S+)', line)
+                        if m2:
+                            cfg[m2.group(1)] = m2.group(2)
+            except Exception as ex:
+                log(f"⚠ platform.conf: {ex}")
+            return cfg
+
+        def do_unpack():
+            pkg = pkg_var.get()
+            if not pkg or not os.path.exists(pkg):
+                messagebox.showwarning("!", "Выберите пакет", parent=win); return
+            cur_packer = nonlocal_holder.get("packer") or self._find_aml_packer()
+            if not cur_packer:
+                messagebox.showwarning("!",
+                    "aml_image_v2_packer.exe не найден.\n\n"
+                    "Скачайте кнопкой «📥 Скачать packer» (из khadas/utils),\n"
+                    "либо положите его вручную в files/.\n\n"
+                    "Примечание: в USB Burning Tool v2 есть только AmlImagePack.dll —\n"
+                    "это библиотека внутри GUI, из консоли не вызывается.",
+                    parent=win)
+                return
+            def _t():
+                prog.start(10)
+                try:
+                    out_dir = os.path.join(os.path.dirname(pkg), "_pkg_unpack")
+                    os.makedirs(out_dir, exist_ok=True)
+                    unpack_dir[0] = out_dir
+                    log(f"📦 Распаковка через {os.path.basename(cur_packer)}...")
+                    cflags = subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0
+                    # Khadas-синтаксис: aml_image_v2_packer -d <img> <outdir>
+                    # Успех определяется по строке "Image unpack OK!"
+                    ok = False
+                    o = ""
+                    for flag in ("-d", "-unpack"):
+                        try:
+                            r = subprocess.run([cur_packer, flag, pkg, out_dir],
+                                               capture_output=True, timeout=300,
+                                               creationflags=cflags)
+                        except Exception as ex:
+                            log(f"  ⚠ {flag}: {ex}")
+                            continue
+                        o = ((r.stdout or b"")+(r.stderr or b"")).decode("utf-8","ignore")
+                        for ln in o.splitlines():
+                            if ln.strip(): log("  " + ln.strip())
+                        if "Image unpack OK" in o or os.path.exists(
+                                os.path.join(out_dir, "image.cfg")):
+                            ok = True
+                            break
+                        log(f"  ⚠ флаг {flag} не сработал, пробуем другой...")
+                    cfg = os.path.join(out_dir, "image.cfg")
+                    if not ok or not os.path.exists(cfg):
+                        log("❌ Распаковка не удалась (нет image.cfg / 'Image unpack OK').")
+                        log("  Проверьте, что packer — Windows-версия из khadas/utils,")
+                        log("  и что пакет действительно формата Amlogic V2.")
+                        return
+                    parts, svc = parse_image_cfg(cfg)
+                    parts_info.clear(); parts_info.extend(parts)
+                    plat_name = svc.get("platform", "platform.conf")
+                    plat_path = os.path.join(out_dir, plat_name)
+                    if os.path.exists(plat_path):
+                        platform_cfg.clear()
+                        platform_cfg.update(parse_platform_conf(plat_path))
+                        platform_cfg["_svc"] = svc
+                    log(f"✓ Распаковано. Разделов в пакете: {len(parts)}")
+                    def _fill():
+                        for row in tree.get_children(): tree.delete(row)
+                        psel.clear()
+                        for p in parts:
+                            psel[p["name"]] = True
+                            tree.insert("", tk.END,
+                                values=("✓", p["name"], p["file"], p["type"]))
+                    self.root.after(0, _fill)
+                except Exception as ex:
+                    log(f"❌ Распаковка: {ex}")
+                finally:
+                    self.root.after(0, prog.stop)
+            _th.Thread(target=_t, daemon=True).start()
+
+        # ── Прошивка ──
+        def do_flash():
+            if not parts_info:
+                messagebox.showwarning("!",
+                    "Сначала распакуйте пакет", parent=win); return
+            if not messagebox.askyesno("Подтверждение",
+                "Будет выполнена низкоуровневая прошивка burning-пакета.\n\n"
+                "НЕ ОТКЛЮЧАЙТЕ устройство во время процесса!\n\n"
+                "Продолжить?", icon='warning', parent=win):
+                return
+            to_flash = [p for p in parts_info if psel.get(p["name"], False)]
+            wipe = wipe_var.get()
+            do_reset = reset_var.get()
+            wd = unpack_dir[0]
+
+            def _t():
+                prog.start(10)
+                try:
+                    self._burn_package_sequence(
+                        wd, parts_info, to_flash, platform_cfg,
+                        wipe, do_reset, log)
+                except Exception as ex:
+                    log(f"\n❌ ОШИБКА: {ex}")
+                finally:
+                    self.root.after(0, prog.stop)
+            _th.Thread(target=_t, daemon=True).start()
+
+        tk.Button(btn_row, text="📂 Распаковать и прочитать пакет",
+                  command=do_unpack, bg="#2980B9", fg="white",
+                  font=("Arial", 10, "bold"), height=2
+                  ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        tk.Button(btn_row, text="🚀 Прошить пакет",
+                  command=do_flash, bg="#C0392B", fg="white",
+                  font=("Arial", 10, "bold"), height=2
+                  ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        tk.Button(btn_row, text="Закрыть", command=win.destroy,
+                  font=("Arial", 9), height=2, width=10).pack(side=tk.RIGHT)
+
+        log("Окно прошивки burning-пакета (aml_upgrade_package.img).")
+        log("Алгоритм основан на Amlogic USB Burning Tool / aml-flash (soc=gxl).")
+        if not packer_path:
+            log("⚠ Нужен aml_image_v2_packer.exe — кнопка «📥 Скачать packer»")
+            log("  (из khadas/utils). В USB Burning Tool v2 его НЕТ — там")
+            log("  только AmlImagePack.dll, которая из консоли не вызывается.")
+        log("1) Выберите пакет → 2) Распакуйте → 3) Прошейте.")
+
+    def _burn_package_sequence(self, wd, all_parts, to_flash,
+                                platform_cfg, wipe, do_reset, log):
+        """Последовательность команд update.exe для прошивки burning-пакета.
+        soc=gxl (S905X2). Адреса берутся из platform.conf, имена служебных
+        файлов — из image.cfg (._svc)."""
+        import time as _t
+
+        svc = platform_cfg.get("_svc", {})
+
+        def f(name):
+            return os.path.join(wd, name) if name else None
+
+        # Дождаться устройства
+        log("🔌 Поиск устройства (identify)...")
+        for attempt in range(30):
+            rc, out = self.aml_update_raw(["identify", "7"], timeout=10, log_fn=log)
+            if "firmware" in out.lower():
+                log("✓ Устройство найдено")
+                break
+            _t.sleep(2)
+        else:
+            raise Exception("Amlogic устройство не найдено (USB Boot режим?)")
+
+        # Адреса из platform.conf
+        ddr_load  = platform_cfg.get("DDRLoad", "0xfffa0000")
+        ddr_run   = platform_cfg.get("DDRRun",  "0xfffa0000")
+        uboot_load= platform_cfg.get("UbootLoad","0x0200c000")
+        uboot_run = platform_cfg.get("UbootRun", "0x0200c000")
+        bl2_para  = platform_cfg.get("bl2ParaAddr", "0xfffd0000")
+
+        ddr_init = os.path.join(FILE_DIR, "usbbl2runpara_ddrinit.bin")
+        fip_run  = os.path.join(FILE_DIR, "usbbl2runpara_runfipimg.bin")
+
+        # Имена bl2/uboot из пакета
+        bl2_name = svc.get("DDR")
+        tpl_name = svc.get("UBOOT_COMP") or svc.get("UBOOT")
+        bl2 = f(bl2_name); tpl = f(tpl_name)
+
+        # bootloader/dtb разделы из списка
+        boot_part = next((p for p in all_parts if p["name"] == "bootloader"), None)
+        dtb_part  = next((p for p in all_parts if p["name"] in ("_aml_dtb","dtb")), None)
+        dtb_meson1 = svc.get("meson1")
+
+        # ── Инициализация DDR (gxl) ──
+        if bl2 and os.path.exists(bl2) and os.path.exists(ddr_init):
+            log("⚙ Инициализация DDR...")
+            self.aml_update_raw(["cwr", bl2, ddr_load], timeout=30, log_fn=log)
+            self.aml_update_raw(["write", ddr_init, bl2_para], timeout=30, log_fn=log)
+            self.aml_update_raw(["run", ddr_run], timeout=30, log_fn=log)
+            for _ in range(8):
+                _t.sleep(1)
+            rc, out = self.aml_update_raw(["identify", "7"], timeout=10, log_fn=log)
+            # ── Запуск U-Boot ──
+            log("⚙ Запуск U-Boot...")
+            self.aml_update_raw(["write", bl2, ddr_load], timeout=30, log_fn=log)
+            if os.path.exists(fip_run):
+                self.aml_update_raw(["write", fip_run, bl2_para], timeout=30, log_fn=log)
+            if tpl and os.path.exists(tpl):
+                self.aml_update_raw(["write", tpl, uboot_load], timeout=60, log_fn=log)
+            self.aml_update_raw(["run", uboot_run], timeout=30, log_fn=log)
+            for _ in range(8):
+                _t.sleep(1)
+            log("✓ U-Boot загружен")
+        else:
+            log("⚠ Не найдены bl2/ddrinit — предполагаем, что U-Boot уже запущен")
+
+        # ── DTB в память ──
+        if dtb_meson1 and os.path.exists(f(dtb_meson1)):
+            log("🌳 Запись device tree...")
+            self.aml_update_raw(["mwrite", f(dtb_meson1), "mem", "dtb", "normal"],
+                                timeout=60, log_fn=log)
+
+        # ── Создание разделов ──
+        log(f"🗂 Создание разделов (disk_initial {'1' if wipe else '0'})...")
+        self.aml_bulkcmd(f"disk_initial {'1' if wipe else '0'}")
+
+        # ── DTB раздел + bootloader ──
+        if dtb_part and os.path.exists(f(dtb_part["file"])):
+            log("🌳 Прошивка _aml_dtb...")
+            self.aml_update_raw(["partition", "_aml_dtb", f(dtb_part["file"])],
+                                timeout=120, log_fn=log)
+        if boot_part and os.path.exists(f(boot_part["file"])):
+            log("🔧 Прошивка bootloader...")
+            self.aml_update_raw(["partition", "bootloader", f(boot_part["file"])],
+                                timeout=180, log_fn=log)
+
+        self.aml_bulkcmd("setenv upgrade_step 1")
+        self.aml_bulkcmd("save")
+
+        # ── Wipe data/cache ──
+        if wipe:
+            log("🧹 Очистка data/cache...")
+            for c in ("setenv firstboot 1", "save", "rpmb_reset",
+                      "amlmmc erase data", "amlmmc erase cache"):
+                try: self.aml_bulkcmd(c)
+                except Exception: pass
+
+        # ── Прошивка всех выбранных разделов ──
+        log(f"\n📥 Прошивка разделов ({len(to_flash)})...")
+        skip = {"bootloader", "_aml_dtb", "dtb"}
+        for p in to_flash:
+            if p["name"] in skip:
+                continue   # уже прошиты выше
+            pf = f(p["file"])
+            if not pf or not os.path.exists(pf):
+                log(f"  ⚠ {p['name']}: файл не найден, пропуск")
+                continue
+            log(f"  ⬇ {p['name']} ({p['file']})...")
+            rc, out = self.aml_update_raw(
+                ["partition", p["name"], pf, p["type"]],
+                timeout=1800, log_fn=log)
+            if rc == 0:
+                log(f"     ✓ {p['name']}")
+            else:
+                log(f"     ❌ {p['name']} — ошибка")
+
+        # ── Reset ──
+        if do_reset:
+            log("\n🔄 Перезагрузка устройства (burn_complete 1)...")
+            try: self.aml_bulkcmd("burn_complete 1")
+            except Exception: pass
+
+        log("\n🎉 Прошивка burning-пакета завершена!")
+        self.root.after(0, lambda: messagebox.showinfo(
+            "Готово", "Прошивка burning-пакета завершена!", parent=self.root))
+
     def aml_bulkcmd(self, cmd):
         """Выполнение команды U-Boot.
         Возвращает декодированный stdout+stderr.
@@ -2667,7 +3856,178 @@ class FlasherGUI:
         if process.returncode != 0:
             raise Exception(f"Ошибка U-Boot команды: {cmd}\n{text_out[:300]}")
         return text_out
+
+    def aml_update_raw(self, args, timeout=60, log_fn=None):
+        """Произвольная команда update.exe (write/run/cwr/mwrite/identify/partition).
+
+        args — список аргументов после update.exe, например:
+            ["identify", "7"]
+            ["write", "bl2.bin", "0xfffa0000"]
+            ["partition", "boot", "boot.PARTITION"]
+        Возвращает (returncode, текст_вывода). Вывод роутится в COM-терминал.
+        Команда считается ошибочной, если в выводе есть "ERR" (как в aml-flash).
+        """
+        update_path = self.get_update_path()
+        cflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+        try:
+            p = subprocess.run([update_path] + list(args),
+                               capture_output=True, text=False,
+                               timeout=timeout, creationflags=cflags)
+        except subprocess.TimeoutExpired:
+            if log_fn: log_fn(f"  ❌ таймаут: update {' '.join(map(str,args))}")
+            return -1, "timeout"
+        out = ((p.stdout or b"") + (p.stderr or b"")).decode('utf-8', errors='ignore')
+        for ln in out.splitlines():
+            s = ln.strip()
+            if s:
+                self.root.after(0, lambda l=s: self.terminal_log(f"[USB] {l}"))
+        # Amlogic update возвращает 0 даже при ошибке — проверяем по "ERR"
+        rc = p.returncode
+        if "ERR" in out.upper():
+            rc = 1
+        return rc, out
     
+    def _apply_env_setenv(self, env_file):
+        """Применить env через setenv (только простые скалярные переменные).
+
+        Повторяет логику рабочего linux-скрипта: грузит env в RAM, импортирует,
+        применяет silent/lock/avb2 + простые пользовательские изменения, saveenv.
+        НЕ трогает скрипт-переменные (bootargs и т.п.).
+        """
+        SKIP_VARS = {
+            "bootargs", "initargs", "storeargs", "storeboot", "preboot",
+            "bootcmd", "cmdline_keys", "recovery_from_flash",
+            "recovery_from_udisk", "recovery_from_sdcard",
+            "factory_reset_poweroff_protect", "init_display",
+            "switch_bootmode", "start_boot_animation", "sysrecovery_check",
+            "upgrade_check", "irremote_update", "set_factory_env",
+            "usb_burning", "sdc_burning", "update", "try_auto_burn",
+            "bcb_cmd", "factoryboot", "serial", "deviceid", "custom_deviceid",
+            "mac", "ethaddr",  # эти идут только через бинарный способ
+        }
+
+        self.log("  - Загрузка env в RAM...")
+        self.aml_write_file_to_ram(env_file, "0x200c000")
+        self.log("  - Импорт переменных в U-Boot...")
+        self.aml_bulkcmd("env import 200c004")
+
+        def safe_setenv(key, value):
+            sval = str(value)
+            if any(c in sval for c in ";${}\n\t") or len(sval) > 200:
+                self.log(f"    ⊘ {key}: пропущен (скрипт/сложное значение)")
+                return
+            try:
+                if " " in sval:
+                    self.aml_bulkcmd(f"setenv {key} '{sval}'")
+                else:
+                    self.aml_bulkcmd(f"setenv {key} {sval}")
+                self.log(f"    • {key} = {sval}")
+            except Exception as ex:
+                self.log(f"    ⚠ {key}: не применён ({str(ex)[:60]})")
+
+        # ВСЕГДА — необходимый минимум (как рабочий скрипт)
+        self.log("  - Необходимый минимум (silent/lock/avb2):")
+        safe_setenv("silent", "0")
+        safe_setenv("lock", "10000000")
+        safe_setenv("avb2", "0")
+
+        # Простые пользовательские изменения
+        extra = 0
+        for key, value in (self.env_data or {}).items():
+            if key in SKIP_VARS or key in ("silent", "lock", "avb2") or value == "":
+                continue
+            safe_setenv(key, value)
+            extra += 1
+        if extra:
+            self.log(f"  - Дополнительно простых переменных: {extra}")
+
+        self.log("  - Сохранение (saveenv)...")
+        self.aml_bulkcmd("saveenv")
+        self.log("✓ ENV применён через setenv")
+
+    def _apply_env_binary(self, env_file):
+        """Применить env БИНАРНО с пересчётом CRC32.
+
+        Нужно когда меняются serial/deviceid/cmdline_keys — их нельзя задать
+        через setenv (cmdline_keys — это скрипт с ${} и ;, U-Boot ломается).
+
+        Алгоритм:
+          1. читаем env с устройства (env_file уже прочитан вызывающим)
+          2. парсим, мёржим наши изменения + минимум (lock/avb2/silent)
+          3. пересобираем бинарь с правильным CRC32, ТОГО ЖЕ размера что прочитали
+          4. пишем обратно через update mwrite store env normal <size> <file>
+             — это ЗЕРКАЛО команды mread, которой делается дамп (надёжный CLI-путь,
+             в отличие от bulkcmd 'store write', который не сработал).
+        """
+        if not os.path.exists(env_file):
+            self.log("  ❌ env-файл отсутствует, бинарная запись невозможна")
+            return
+        part_size = os.path.getsize(env_file)
+
+        orig_pairs = self.parse_env_blob_ordered(env_file)
+        if not orig_pairs:
+            self.log("  ⚠ env не распознан как valid — fallback на setenv")
+            self._apply_env_setenv(env_file)
+            return
+
+        merged = {}
+        for k, v in orig_pairs:
+            merged[k] = v
+        merged["silent"] = "0"
+        merged["lock"] = "10000000"
+        merged["avb2"] = "0"
+        for k, v in (self.env_data or {}).items():
+            if v != "":
+                merged[k] = v
+
+        self.log(f"  - Пересборка env ({len(merged)} переменных) с CRC32...")
+        try:
+            blob = self.build_env_blob(list(merged.items()), part_size)
+        except Exception as ex:
+            self.log(f"  ❌ Сборка env не удалась: {ex}")
+            self.log("  → fallback на setenv (без serial/deviceid)")
+            self._apply_env_setenv(env_file)
+            return
+
+        out = os.path.join(ROOT_DIR, "env_new.bin")
+        with open(out, "wb") as f:
+            f.write(blob)
+        self.log(f"  - Запись env на устройство ({len(blob)} байт)...")
+
+        # env-раздел пишется ТАК ЖЕ, как остальные разделы — через partition:
+        #   update partition env <file>
+        # (mwrite store env не работает — выдаёт 'Open file store failed').
+        update_path = self.get_update_path()
+        cflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+        try:
+            r = subprocess.run(
+                [update_path, "partition", "env", out],
+                capture_output=True, timeout=120, creationflags=cflags)
+            o = ((r.stdout or b"") + (r.stderr or b"")).decode("utf-8", "ignore")
+            for ln in o.splitlines():
+                if ln.strip():
+                    self.root.after(0, lambda l=ln.strip(): self.terminal_log(f"[USB] {l}"))
+            if r.returncode == 0 and "ERR" not in o.upper():
+                self.log("✓ ENV записан бинарно с корректным CRC32 (partition env)")
+                if "serial" in self.env_data:
+                    self.log(f"  serial = {self.env_data['serial']}")
+                if "cmdline_keys" in self.env_data:
+                    self.log("  cmdline_keys: переопределён (serial/deviceid жёстко)")
+            else:
+                self.log(f"  ⚠ partition env вернул ошибку: {o.strip()[:120]}")
+                self.log("  → fallback: применяем простые переменные через setenv")
+                self._apply_env_setenv(env_file)
+        except subprocess.TimeoutExpired:
+            self.log("  ❌ partition env таймаут")
+            self._apply_env_setenv(env_file)
+        except Exception as ex:
+            self.log(f"  ❌ partition env: {str(ex)[:80]}")
+            self._apply_env_setenv(env_file)
+        try:
+            os.remove(out)
+        except Exception:
+            pass
+
     def aml_read_part(self, name, size, outfile):
         """Чтение раздела с устройства"""
         update_path = self.get_update_path()
@@ -2684,11 +4044,18 @@ class FlasherGUI:
     def parse_env_blob(path):
         """Разобрать бинарный образ раздела env U-Boot (Amlogic).
 
-        Формат: [4 байта CRC32][данные]
-        Данные: пары  key=value\\0key=value\\0 ... \\0\\0 (конец).
+        Формат: [4 байта CRC32 LE][данные ENV_SIZE]
+        Данные: пары key=value\\0key=value\\0 ... \\0\\0 (двойной \\0 = конец).
         Возвращает dict {key: value}.
         """
-        result = {}
+        ordered = FlasherGUI.parse_env_blob_ordered(path)
+        return dict(ordered)
+
+    @staticmethod
+    def parse_env_blob_ordered(path):
+        """То же, но сохраняет порядок переменных — список кортежей (key, value).
+        Нужно для корректного round-trip редактирования."""
+        result = []
         try:
             with open(path, "rb") as f:
                 blob = f.read()
@@ -2696,25 +4063,53 @@ class FlasherGUI:
             return result
         if len(blob) < 5:
             return result
-        # Пропускаем 4-байтовый CRC заголовок
-        data = blob[4:]
-        # Делим по нулевым байтам
+        data = blob[4:]   # пропускаем CRC
+        # Останавливаемся на первом \0\0 (конец окружения)
+        end = data.find(b"\x00\x00")
+        if end >= 0:
+            data = data[:end + 1]
         for chunk in data.split(b"\x00"):
             if not chunk:
-                # Двойной \0 — конец окружения
                 continue
-            try:
-                text = chunk.decode("utf-8", errors="ignore")
-            except Exception:
-                continue
+            text = chunk.decode("utf-8", errors="ignore")
             if "=" in text:
                 key, _, value = text.partition("=")
                 key = key.strip()
-                # Имена переменных U-Boot — печатные ASCII без пробелов
                 if key and all(32 < ord(c) < 127 for c in key):
-                    result[key] = value
+                    result.append((key, value))
         return result
 
+    @staticmethod
+    def build_env_blob(env_pairs, part_size):
+        """Собрать бинарный образ раздела env с корректным CRC32.
+
+        env_pairs — список (key, value) или dict.
+        part_size — полный размер раздела env в байтах (например 0x10000).
+        Структура: [CRC32 LE (4 байта)][data до part_size-4, забит \\0].
+        CRC32 (zlib/POSIX) считается ПО data. Так делает U-Boot saveenv.
+        """
+        import zlib
+        if isinstance(env_pairs, dict):
+            items = list(env_pairs.items())
+        else:
+            items = list(env_pairs)
+        # Формируем data: key=value\0 ... \0 (финальный двойной \0)
+        body = b""
+        for key, value in items:
+            if key == "":
+                continue
+            body += f"{key}={value}".encode("utf-8") + b"\x00"
+        body += b"\x00"   # завершающий \0 (двойной в сумме)
+        data_size = part_size - 4
+        if len(body) > data_size:
+            raise ValueError(
+                f"ENV не помещается: {len(body)} > {data_size} байт. "
+                "Сократите значения переменных.")
+        # Дополняем нулями до data_size
+        data = body + b"\x00" * (data_size - len(body))
+        crc = zlib.crc32(data) & 0xFFFFFFFF
+        import struct
+        return struct.pack("<I", crc) + data
 
     def aml_write_file_to_ram(self, filename, addr):
         """Запись файла в RAM"""
@@ -2745,6 +4140,17 @@ class FlasherGUI:
             "Скачайте update.exe из USB Burning Tool для Windows."
         )
     
+    def _set_flash_progress(self, pct, display=""):
+        """Обновить прогресс-бар значением процента записи раздела."""
+        try:
+            self.progress.config(mode='determinate', maximum=100)
+            self.progress['value'] = pct
+            if display:
+                self.status_label.config(
+                    text=f"🔄 Прошивка {display}... {pct}%", fg="#E67E22")
+        except Exception:
+            pass
+
     def flash_partition(self, name, image_path, display, time_estimate):
         """Прошивка раздела.
         Весь вывод update.exe в реальном времени идёт в COM-терминал.
@@ -2753,6 +4159,14 @@ class FlasherGUI:
         update_path = self.get_update_path()
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
         cmd = [update_path, "partition", name, image_path]
+
+        # Прогресс-бар в режим процентов на время записи раздела
+        try:
+            self.progress.stop()
+            self.progress.config(mode='determinate', maximum=100)
+            self.progress['value'] = 0
+        except Exception:
+            pass
 
         try:
             process = subprocess.Popen(
@@ -2777,11 +4191,44 @@ class FlasherGUI:
                     chunk = process.stdout.read(256)
                     if chunk:
                         line_buf += chunk
-                        # Выводим полные строки в терминал
-                        while b"\n" in line_buf:
-                            ln, line_buf = line_buf.split(b"\n", 1)
-                            decoded = ln.decode('utf-8', errors='ignore').strip()
-                            if decoded:
+                        # Обрабатываем и \n (новая строка), и \r (обновление
+                        # текущей строки — прогресс update.exe).
+                        while True:
+                            nl = line_buf.find(b"\n")
+                            cr = line_buf.find(b"\r")
+                            # Нет ни \n ни \r — ждём ещё байт
+                            if nl < 0 and cr < 0:
+                                break
+                            # Выбираем ближайший разделитель
+                            if nl < 0:
+                                idx, sep = cr, b"\r"
+                            elif cr < 0:
+                                idx, sep = nl, b"\n"
+                            else:
+                                if cr < nl:
+                                    idx, sep = cr, b"\r"
+                                else:
+                                    idx, sep = nl, b"\n"
+                            seg = line_buf[:idx]
+                            line_buf = line_buf[idx + 1:]
+                            decoded = seg.decode('utf-8', errors='ignore').strip()
+                            if not decoded:
+                                continue
+                            if sep == b"\r":
+                                # Прогресс — обновляем текущую строку терминала
+                                self.root.after(0,
+                                    lambda d=decoded: self.terminal_update_line(f"[USB] {d}"))
+                                # Извлекаем % для прогресс-бара: '[ 16%/  4MB]'
+                                import re as _re_pct
+                                pcts = _re_pct.findall(r'(\d{1,3})%', decoded)
+                                if pcts:
+                                    try:
+                                        pct = int(pcts[-1])  # последний % в строке
+                                        self.root.after(0,
+                                            lambda p=pct, d=display: self._set_flash_progress(p, d))
+                                    except ValueError:
+                                        pass
+                            else:
                                 self.root.after(0,
                                     lambda d=decoded: self.terminal_log(f"[USB] {d}"))
                 except Exception:
@@ -2791,17 +4238,14 @@ class FlasherGUI:
                 if code is not None:
                     break
 
-                elapsed = int(time.time() - start_time)
-                if elapsed - last_update >= 2:
-                    self.status_label.config(
-                        text=f"🔄 Прошивка {display}... {elapsed}с", fg="#E67E22")
-                    self.root.update_idletasks()
-                    last_update = elapsed
-
                 time.sleep(0.1)
-            
+
             if code == 0:
                 elapsed_total = int(time.time() - start_time)
+                try:
+                    self.progress['value'] = 100
+                except Exception:
+                    pass
                 self.log(f"  ✓ Успешно прошит раздел {display} за {elapsed_total}с")
                 return True
             else:
@@ -2901,21 +4345,23 @@ class FlasherGUI:
                 env_size = os.path.getsize(env_file)
                 self.log(f"  - Прочитано: {env_size} байт")
 
-                # РАЗБИРАЕМ бинарный env в словарь — чтобы редактор показал
-                # реальные значения с устройства, а не пустые поля.
+                # РАЗБИРАЕМ бинарный env в словарь — для показа в редакторе.
+                # ВАЖНО: НЕ сваливаем все ~80 переменных в self.env_data —
+                # там должны быть только пользовательские ИЗМЕНЕНИЯ. Полный
+                # снимок с устройства храним отдельно (self._env_device).
                 parsed = self.parse_env_blob(env_file)
                 if parsed:
                     self.log(f"  - Распознано переменных в env: {len(parsed)}")
-                    # Заполняем env_data значениями с устройства (если ещё не
-                    # редактировали вручную в этой сессии)
-                    for k, v in parsed.items():
-                        self.env_data.setdefault(k, v)
-                    # Лог ключевых значений
+                    self._env_device = dict(parsed)   # снимок с устройства
                     for key in ("serial", "mac", "lock", "avb2", "EnableSelinux"):
                         if key in parsed:
                             self.log(f"      {key} = {parsed[key]}")
                 else:
+                    self._env_device = {}
                     self.log("  ⚠ Не удалось распарсить env (формат?) — поля будут пустыми")
+
+                # Сбрасываем флаг сохранения перед открытием редактора
+                self._env_editor_saved = False
 
                 # Предлагаем отредактировать, БЛОКИРУЯ прошивку до закрытия редактора
                 response = messagebox.askyesno(
@@ -2923,6 +4369,8 @@ class FlasherGUI:
                     f"ENV прочитан с устройства ({len(parsed)} переменных).\n\n"
                     "Открыть редактор переменных окружения?\n"
                     "(Рекомендуется для разблокировки bootloader: lock, avb2, SELinux)\n\n"
+                    "Если нажать «Нет» — применится только необходимый минимум:\n"
+                    "silent=0, lock=10000000, avb2=0 (как в рабочем скрипте).\n\n"
                     "Прошивка продолжится ПОСЛЕ закрытия редактора."
                 )
                 if response:
@@ -2936,42 +4384,36 @@ class FlasherGUI:
                         try:
                             ed = self.open_env_editor(return_window=True)
                             if ed is not None:
-                                ed.protocol("WM_DELETE_WINDOW",
-                                            lambda: (ed.destroy()))
                                 self.root.wait_window(ed)
                         finally:
                             done.set()
 
                     self.root.after(0, _open_and_wait)
                     done.wait()   # фоновый поток ждёт закрытия редактора
-                    self.log(f"  - Редактор закрыт. Переменных к применению: {len(self.env_data)}")
-
-                # Загружаем оригинальный env в RAM
-                self.log("  - Загрузка env в RAM...")
-                self.aml_write_file_to_ram(env_file, "0x200c000")
-
-                # Импортируем существующее окружение
-                self.log("  - Импорт переменных в U-Boot...")
-                self.aml_bulkcmd("env import 200c004")
-
-                # Применяем изменения
-                if self.env_data:
-                    self.log(f"  - Применение настроек ENV ({len(self.env_data)} перем.):")
-                    for key, value in self.env_data.items():
-                        if value == "":
-                            continue  # пустые не трогаем
-                        self.log(f"    • {key} = {value}")
-                        self.aml_bulkcmd(f"setenv {key} {value}")
+                    if self._env_editor_saved:
+                        self.log(f"  - Редактор: сохранено {len(self.env_data)} изменений")
+                    else:
+                        self.log("  - Редактор: отмена, применяется только минимум")
+                        self.env_data = {}
                 else:
-                    self.log("  - Применение стандартных настроек разблокировки:")
-                    self.log("    • silent = 0, lock = 10000000, avb2 = 0")
-                    self.aml_bulkcmd("setenv silent 0")
-                    self.aml_bulkcmd("setenv lock 10000000")
-                    self.aml_bulkcmd("setenv avb2 0")
+                    # Пользователь отказался открывать редактор → только минимум
+                    self.env_data = {}
+                    self.log("  - Редактор пропущен, применяется только минимум")
 
-                self.log("  - Сохранение изменений (saveenv)...")
-                self.aml_bulkcmd("saveenv")
-                self.log("✓ Переменные окружения успешно модифицированы")
+                # Решаем, нужен ли БИНАРНЫЙ способ записи env (с CRC32).
+                # Он нужен ТОЛЬКО если пользователь переопределил скрипт-переменные
+                # (cmdline_keys) или serial/deviceid — их нельзя задать через setenv.
+                SCRIPT_OVERRIDES = {"cmdline_keys", "serial", "deviceid",
+                                    "custom_deviceid", "mac", "ethaddr"}
+                need_binary = any(k in self.env_data for k in SCRIPT_OVERRIDES)
+
+                if need_binary:
+                    self.log("  - Обнаружены изменения serial/deviceid/cmdline_keys")
+                    self.log("    → запись env БИНАРНО с пересчётом CRC32")
+                    self._apply_env_binary(env_file)
+                else:
+                    self.log("  - Применение env через setenv (простые переменные)")
+                    self._apply_env_setenv(env_file)
 
                 # Удаляем временный файл
                 if os.path.exists(env_file):
@@ -3021,6 +4463,25 @@ class FlasherGUI:
                     else:
                         self.log(f"⚠ Образ для {img['display']} не выбран, пропускаем")
             
+            # Очистка data/cache (если включено)
+            if self.is_flashing and getattr(self, "wipe_data_var", None) and self.wipe_data_var.get():
+                self.log("\n🧹 Очистка data и cache (сброс к заводским)...")
+                for part in ("data", "cache"):
+                    try:
+                        self.log(f"  - Очистка {part}...")
+                        self.aml_bulkcmd(f"amlmmc erase {part}")
+                        self.log(f"    ✓ {part} очищен")
+                    except Exception as ex:
+                        self.log(f"    ⚠ {part}: {str(ex)[:80]}")
+                # misc — сброс reboot-флагов (как в стоковом sysrecovery)
+                try:
+                    self.log("  - Очистка misc (флаги загрузки)...")
+                    self.aml_bulkcmd("amlmmc erase misc")
+                    self.log("    ✓ misc очищен")
+                except Exception as ex:
+                    self.log(f"    ⚠ misc: {str(ex)[:80]}")
+                self.log("✓ Очистка завершена")
+
             if self.is_flashing:
                 self.log("\n" + "="*50)
                 self.log("✓ Прошивка завершена!")
@@ -3089,6 +4550,9 @@ class FlasherGUI:
         self.is_flashing = True
         self.flash_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
+        # На этапе подготовки (загрузка U-Boot, env) — бегущая полоса;
+        # при записи разделов flash_partition переключит на проценты.
+        self.progress.config(mode='indeterminate')
         self.progress.start(10)
         
         self.status_label.config(
@@ -3117,7 +4581,12 @@ class FlasherGUI:
     def finish_flashing(self):
         """Завершение процесса прошивки"""
         self.is_flashing = False
-        self.progress.stop()
+        try:
+            self.progress.stop()
+            self.progress.config(mode='indeterminate')
+            self.progress['value'] = 0
+        except Exception:
+            pass
         self.flash_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
         self.status_label.config(
@@ -3126,12 +4595,49 @@ class FlasherGUI:
         )
 
 
+def _relaunch_without_console():
+    """На Windows: если скрипт запущен через python.exe (с консолью),
+    перезапустить через pythonw.exe (без консольного окна).
+
+    Срабатывает только один раз (флаг в переменной окружения), и только
+    если рядом есть pythonw.exe. Возвращает True если перезапустил
+    (вызывающий должен завершиться)."""
+    if sys.platform != "win32":
+        return False
+    if os.environ.get("YASTA_NO_CONSOLE") == "1":
+        return False  # уже перезапущены
+    exe = sys.executable or ""
+    # Если уже pythonw — ничего не делаем
+    if exe.lower().endswith("pythonw.exe"):
+        return False
+    pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    if not os.path.exists(pythonw):
+        return False
+    try:
+        env = dict(os.environ)
+        env["YASTA_NO_CONSOLE"] = "1"
+        # DETACHED_PROCESS, чтобы не держать родительскую консоль
+        DETACHED = 0x00000008
+        subprocess.Popen([pythonw, os.path.abspath(sys.argv[0])] + sys.argv[1:],
+                         env=env, creationflags=DETACHED,
+                         close_fds=True)
+        return True
+    except Exception:
+        return False
+
+
 def main():
+    # Прячем консольное окно py.exe — перезапуск через pythonw.exe
+    if _relaunch_without_console():
+        sys.exit(0)
+
     root = tk.Tk()
-    
-    # Показываем окно помощи при первом запуске
-    show_initial_help(root)
-    
+
+    # Показываем окно помощи при первом запуске (если не отключено в настройках)
+    settings = load_settings()
+    if not settings.get("hide_initial_help", False):
+        show_initial_help(root)
+
     app = FlasherGUI(root)
     root.mainloop()
 
@@ -3140,9 +4646,9 @@ def show_initial_help(root):
     """Показать помощь по необходимым файлам"""
     help_window = tk.Toplevel(root)
     help_window.title("📋 Необходимые файлы")
-    help_window.geometry("600x500")
+    help_window.geometry("600x540")
     help_window.resizable(True, True)
-    help_window.minsize(450, 300)
+    help_window.minsize(450, 340)
     help_window.transient(root)
     help_window.grab_set()
     
@@ -3221,18 +4727,36 @@ https://github.com/khadas/utils/tree/master/aml-flash-tool/tools/windows
     
     help_text.insert("1.0", instructions)
     help_text.config(state='disabled')
-    
+
+    # Чекбокс «не показывать снова»
+    dont_show_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(
+        help_window,
+        text="Не показывать это окно при следующих запусках",
+        variable=dont_show_var,
+        font=("Arial", 10)
+    ).pack(pady=(4, 0))
+
+    def close_help():
+        if dont_show_var.get():
+            s = load_settings()
+            s["hide_initial_help"] = True
+            save_settings(s)
+        help_window.destroy()
+
     # Кнопка закрытия
     tk.Button(
         help_window,
         text="Понятно, продолжить",
-        command=help_window.destroy,
+        command=close_help,
         font=("Arial", 11),
         bg="#27AE60",
         fg="white",
         pady=10
     ).pack(pady=10, padx=20, fill=tk.X)
-    
+
+    help_window.protocol("WM_DELETE_WINDOW", close_help)
+
     # Центрируем окно
     help_window.update_idletasks()
     x = (help_window.winfo_screenwidth() // 2) - (help_window.winfo_width() // 2)
