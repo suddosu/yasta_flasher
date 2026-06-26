@@ -1,5 +1,5 @@
 # 🔧 Yandex Station Max Flasher - Графический инсталлятор прошивки
-<img width="1441" height="827" alt="image" src="https://github.com/user-attachments/assets/a58eca58-9339-4b81-bf44-fa78c920d3f5" />
+<img width="1096" height="826" alt="Снимок экрана 2026-06-26 115428" src="https://github.com/user-attachments/assets/1b21fb5c-1a3c-4ff6-b0be-8e827f427532" />
 
 # Yandex Station Max Flasher
 
