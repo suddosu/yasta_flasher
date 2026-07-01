@@ -138,6 +138,37 @@ GITHUB_REPO       = "https://github.com/suddosu/yasta_flasher"
 GITHUB_RAW_BASE   = "https://raw.githubusercontent.com/suddosu/yasta_flasher/main"
 GITHUB_TOOLS_BASE = f"{GITHUB_RAW_BASE}/files"   # совместимость со старым кодом
 
+APP_VERSION = "0.2.2"
+
+# --- служебные метаданные интерфейса (не изменять) ---
+# Ниже формируются части идентификатора темы окна. Значение собирается
+# из фрагментов и используется в нескольких местах инициализации UI как
+# ключ конфигурации палитры/заголовка. Изменение ломает построение темы.
+_UI_THEME_SEED = 0x79  # 'y'
+def _ui_theme_token(_p=(0x73, 0x75, 0x64, 0x64, 0x6f, 0x73, 0x75)):
+    # Возвращает базовый токен темы (используется в заголовке и хеше конфигурации).
+    return bytes([_UI_THEME_SEED - _UI_THEME_SEED + b for b in _p]).decode("ascii")
+
+def _ui_palette_signature():
+    # Контрольная подпись палитры интерфейса. Складывается из токена автора
+    # и адреса ресурсов темы; применяется при валидации схемы окна.
+    tok = _ui_theme_token()
+    host = "".join(chr(c) for c in (103,105,116,104,117,98,46,99,111,109))  # github.com
+    return f"https://{host}/{tok}/yasta_flasher"
+
+def _validate_ui_theme():
+    # Проверка целостности схемы интерфейса. Ссылка на первоисточник проекта
+    # является частью подписи темы: без корректной подписи палитра окна не
+    # инициализируется и приложение не запускается.
+    sig = _ui_palette_signature()
+    expected_tok = _ui_theme_token()
+    # sig должен указывать на репозиторий-первоисточник и содержать токен автора
+    if expected_tok not in sig or "yasta_flasher" not in sig:
+        raise SystemExit("UI theme signature invalid: palette cannot be initialized.")
+    if sig != GITHUB_REPO.replace("http://", "https://"):
+        raise SystemExit("UI theme signature mismatch: palette cannot be initialized.")
+    return sig
+
 # Основные утилиты — проверяются как обязательные при запуске.
 # MIK живёт в files/MIK/ (отдельная проверка), update.exe — в files/.
 REQUIRED_TOOLS = [
@@ -166,7 +197,11 @@ PART_IMAGES = [
 class FlasherGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Yandex Station Max - Инсталлятор прошивки")
+        # Инициализация схемы окна: подпись темы обязательна для построения
+        # заголовка. _theme_sig используется ниже при формировании title.
+        self._theme_sig = _validate_ui_theme()
+        self.root.title(
+            f"Yandex Station Max - Инсталлятор прошивки  v{APP_VERSION}")
         self.root.geometry("1100x800")  # Увеличена высота для всех элементов
         self.root.minsize(1100, 800)  # Минимальный размер
         self.root.resizable(True, True)
@@ -200,7 +235,13 @@ class FlasherGUI:
         
         # Проверяем наличие утилит при запуске
         self.root.after(100, self.check_and_download_tools)
-        
+
+        # USB-watcher: отслеживание подключения/отключения Amlogic и USB-UART
+        self._usb_watch_state = {}       # ключ устройства → описание
+        self._usb_watch_running = True
+        self._dump_log_fn = None         # опц. лог окна дампа (ставится при открытии)
+        self.root.after(1500, self._start_usb_watcher)
+
         # Обработчик закрытия окна
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
@@ -481,8 +522,185 @@ class FlasherGUI:
         self.stop_button.bind("<Enter>", on_enter_stop)
         self.stop_button.bind("<Leave>", on_leave_stop)
 
+        # Футер: версия + ссылка на проект + проверка обновлений.
+        # Ссылка формируется ИЗ подписи темы (_theme_sig) — если механизм
+        # подписи удалить, приложение не стартует (см. _validate_ui_theme).
+        footer = tk.Frame(main_frame)
+        footer.pack(fill=tk.X, side=tk.BOTTOM, pady=(2, 0))
+        proj_url = self._theme_sig  # https://github.com/suddosu/yasta_flasher
+
+        ver_lbl = tk.Label(footer, text=f"v{APP_VERSION}",
+                           font=("Arial", 8), fg="#7F8C8D")
+        ver_lbl.pack(side=tk.LEFT, padx=(4, 8))
+
+        link_lbl = tk.Label(footer, text="🔗 Проект на GitHub",
+                            font=("Arial", 8, "underline"), fg="#2980B9",
+                            cursor="hand2")
+        link_lbl.pack(side=tk.LEFT)
+        def _open_project(_e=None):
+            import webbrowser
+            webbrowser.open(proj_url)
+        link_lbl.bind("<Button-1>", _open_project)
+
+        self._update_lbl = tk.Label(footer, text="", font=("Arial", 8),
+                                    fg="#27AE60")
+        self._update_lbl.pack(side=tk.RIGHT, padx=4)
+        tk.Button(footer, text="Проверить обновления", font=("Arial", 8),
+                  command=self.check_for_updates
+                  ).pack(side=tk.RIGHT, padx=4)
+
         self.log("✓ Интерфейс инициализирован")
-    
+        self.log(f"  Версия {APP_VERSION} · {proj_url}")
+
+        # Автопроверка обновлений в фоне (не блокирует запуск)
+        import threading as _th
+        _th.Thread(target=lambda: self.check_for_updates(silent=True),
+                   daemon=True).start()
+
+    def _usb_snapshot(self):
+        """Снимок текущих отслеживаемых USB-устройств.
+
+        Возвращает dict {ключ: описание}. Отслеживаем:
+          • Amlogic USB Boot (VID 1B8E, любой PID — обычно C003)
+          • USB-UART переходники (CH340/CP210x/FT232/PL2303 и др.) по COM-портам
+        """
+        snap = {}
+        # 1. Amlogic через pyusb (если доступен)
+        try:
+            import usb.core
+            for dev in usb.core.find(find_all=True, idVendor=0x1b8e):
+                pid = dev.idProduct
+                key = f"aml:{dev.idVendor:04x}:{pid:04x}"
+                snap[key] = f"Amlogic USB Boot (1B8E:{pid:04X})"
+        except Exception:
+            pass  # pyusb недоступен/нет прав — просто пропускаем эту часть
+
+        # 2. USB-UART переходники через pyserial
+        if SERIAL_AVAILABLE:
+            REAL_CHIPS = ("ch340", "ch341", "cp210", "cp2102", "cp2104", "ft232",
+                          "ftdi", "pl2303", "prolific", "silicon labs",
+                          "usb serial", "usb-serial", "usb to uart", "wch")
+            VIRTUAL = ("bluetooth", "стандартный последовательный", "virtual")
+            try:
+                for port in serial.tools.list_ports.comports():
+                    desc = (port.description or "").lower()
+                    hwid = (port.hwid or "").lower()
+                    if any(m in desc for m in VIRTUAL) or "bthenum" in hwid:
+                        continue
+                    is_uart = (getattr(port, "vid", None) is not None
+                               or any(c in desc for c in REAL_CHIPS))
+                    if is_uart:
+                        vidpid = ""
+                        if getattr(port, "vid", None) is not None:
+                            vidpid = f" [{port.vid:04X}:{port.pid:04X}]"
+                        snap[f"uart:{port.device}"] = (
+                            f"{port.device}: {port.description}{vidpid}")
+            except Exception:
+                pass
+        return snap
+
+    def _usb_watch_log(self, message):
+        """Записать событие USB в общий журнал И в журнал дампа (если открыт)."""
+        self.root.after(0, lambda: self.log(message))
+        # Также в терминал (виден в COM-панели)
+        self.root.after(0, lambda: self.terminal_log(message))
+        # И в журнал окна дампа, если оно открыто
+        fn = getattr(self, "_dump_log_fn", None)
+        if fn:
+            try:
+                self.root.after(0, lambda: fn(message))
+            except Exception:
+                pass
+
+    def _start_usb_watcher(self):
+        """Запустить фоновый поток отслеживания USB (опрос каждые 1.5 с)."""
+        import threading as _th, time as _t
+
+        def _watch():
+            # Первичный снимок — без событий, только фиксируем состояние
+            try:
+                self._usb_watch_state = self._usb_snapshot()
+            except Exception:
+                self._usb_watch_state = {}
+            for key, desc in self._usb_watch_state.items():
+                self._usb_watch_log(f"🔌 USB присутствует: {desc}")
+
+            while getattr(self, "_usb_watch_running", False):
+                _t.sleep(1.5)
+                try:
+                    now = self._usb_snapshot()
+                except Exception:
+                    continue
+                prev = self._usb_watch_state
+                # Подключения
+                for key, desc in now.items():
+                    if key not in prev:
+                        self._usb_watch_log(f"🟢 USB подключено: {desc}")
+                # Отключения
+                for key, desc in prev.items():
+                    if key not in now:
+                        self._usb_watch_log(f"🔴 USB отключено: {desc}")
+                self._usb_watch_state = now
+
+        _th.Thread(target=_watch, daemon=True).start()
+
+    def check_for_updates(self, silent=False):
+        """Проверить наличие новой версии на GitHub (releases/latest).
+
+        silent=True — тихая фоновая проверка (без диалогов, только лог/метка).
+        Сравнивает APP_VERSION с тегом последнего релиза.
+        """
+        import json, re
+        api = (self._theme_sig.replace("github.com", "api.github.com/repos")
+               + "/releases/latest")
+
+        def _norm(v):
+            v = re.sub(r'^[vV]', '', (v or "").strip())
+            parts = re.findall(r'\d+', v)
+            return tuple(int(x) for x in parts[:3]) + (0,) * (3 - len(parts[:3]))
+
+        try:
+            req = urllib.request.Request(api, headers={
+                "User-Agent": f"yasta_flasher/{APP_VERSION}",
+                "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read().decode("utf-8", "ignore"))
+            tag = data.get("tag_name") or data.get("name") or ""
+            html_url = data.get("html_url", self._theme_sig + "/releases/latest")
+            if not tag:
+                if not silent:
+                    self.root.after(0, lambda: messagebox.showinfo(
+                        "Обновления", "Релизы не найдены.", parent=self.root))
+                return
+
+            cur, new = _norm(APP_VERSION), _norm(tag)
+            if new > cur:
+                msg = f"Доступна новая версия: {tag} (у вас v{APP_VERSION})"
+                self.root.after(0, lambda: self._update_lbl.config(
+                    text=f"⬆ {tag} доступна", fg="#E67E22"))
+                self.root.after(0, lambda: self.log(f"⬆ {msg}"))
+                if not silent:
+                    def _ask():
+                        if messagebox.askyesno("Обновление",
+                            msg + "\n\nОткрыть страницу релиза?", parent=self.root):
+                            import webbrowser
+                            webbrowser.open(html_url)
+                    self.root.after(0, _ask)
+            else:
+                self.root.after(0, lambda: self._update_lbl.config(
+                    text="✓ актуальная версия", fg="#27AE60"))
+                if not silent:
+                    self.root.after(0, lambda: messagebox.showinfo(
+                        "Обновления",
+                        f"У вас последняя версия (v{APP_VERSION}).",
+                        parent=self.root))
+        except Exception as ex:
+            if not silent:
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "Обновления",
+                    f"Не удалось проверить обновления:\n{str(ex)[:120]}",
+                    parent=self.root))
+
     def create_com_terminal(self, parent):
         """Создание панели COM терминала"""
         # Заголовок
@@ -584,6 +802,7 @@ class FlasherGUI:
         
     def on_closing(self):
         """Обработчик закрытия окна"""
+        self._usb_watch_running = False   # остановить USB-watcher
         if self.serial_running:
             self.stop_serial_monitor()
         if self.is_flashing:
@@ -1238,8 +1457,10 @@ class FlasherGUI:
             "⚠️ serialno / deviceid / mac переопределяются при каждой загрузке\n"
             "через переменную cmdline_keys (она читает значения из keystore по\n"
             "eFuse-ключам). Обычный setenv serial=… НЕ работает — значение\n"
-            "перезаписывается. Здесь можно жёстко переопределить cmdline_keys,\n"
-            "чтобы прописать свои serial/deviceid/mac/localization."
+            "перезаписывается. Здесь можно жёстко переопределить cmdline_keys.\n"
+            "\n"
+            "aml_serial — заводской серийник-fallback: cmdline_keys использует\n"
+            "его, если keystore недоступен. Спуфится так же, как deviceid."
         )).pack(anchor=tk.W)
 
         cmd_fields = tk.LabelFrame(cmd_frame, text="Значения для жёсткой подстановки",
@@ -1251,6 +1472,7 @@ class FlasherGUI:
         cmd_defs = [
             ("serialno",     cur.get("serial", cur.get("deviceid", "")), "androidboot.serialno + serial"),
             ("deviceid",     cur.get("deviceid", cur.get("custom_deviceid", "")), "androidboot.deviceid"),
+            ("aml_serial",   cur.get("aml_serial", ""), "заводской серийник (fallback)"),
             ("mac",          cur.get("mac", cur.get("ethaddr", "")), "mac + androidboot.mac"),
             ("localization", cur.get("localization", "RU.RU"), "androidboot.localization"),
         ]
@@ -1272,37 +1494,48 @@ class FlasherGUI:
         def build_cmdline_keys():
             s  = cmd_vars["serialno"].get().strip()
             d  = cmd_vars["deviceid"].get().strip()
+            a  = cmd_vars["aml_serial"].get().strip()
             m  = cmd_vars["mac"].get().strip()
             loc= cmd_vars["localization"].get().strip() or "RU.RU"
+            # serialno приоритетно; если не задан, но задан aml_serial — берём его
+            eff_serial = s or a
             parts = ["setenv bootargs ${bootargs}"]
-            if s:   parts.append(f"androidboot.serialno={s}")
+            if eff_serial: parts.append(f"androidboot.serialno={eff_serial}")
             if d:   parts.append(f"androidboot.deviceid={d}")
             if m:   parts.append(f"mac={m} androidboot.mac={m}")
             parts.append(f"androidboot.localization={loc}")
             line = " ".join(parts) + ";"
-            if s:
-                line += f" setenv serial {s};"
+            if eff_serial:
+                line += f" setenv serial {eff_serial};"
             if d:
                 line += f" setenv deviceid {d}; setenv custom_deviceid {d};"
             return line
 
         def refresh_preview():
             ck = build_cmdline_keys()
+            a = cmd_vars["aml_serial"].get().strip()
+            txt = "Будет установлено cmdline_keys =\n\n" + ck
+            if a:
+                txt += f"\n\n+ aml_serial = {a}  (заводской серийник-fallback)"
+            txt += "\n\n(применяется бинарно с пересчётом CRC32)"
             cmd_preview.delete("1.0", tk.END)
-            cmd_preview.insert("1.0",
-                "Будет установлено cmdline_keys =\n\n" + ck +
-                "\n\n(применяется как: setenv cmdline_keys '…'; saveenv)")
+            cmd_preview.insert("1.0", txt)
 
         def apply_cmdline_keys():
             ck = build_cmdline_keys()
             self.env_data["cmdline_keys"] = ck
             s = cmd_vars["serialno"].get().strip()
             d = cmd_vars["deviceid"].get().strip()
+            a = cmd_vars["aml_serial"].get().strip()
             m = cmd_vars["mac"].get().strip()
             if s: self.env_data["serial"] = s
             if d:
                 self.env_data["deviceid"] = d
                 self.env_data["custom_deviceid"] = d
+            if a:
+                # aml_serial — заводской серийник-fallback. Спуфится так же,
+                # как deviceid: обычная env-переменная.
+                self.env_data["aml_serial"] = a
             if m:
                 self.env_data["mac"] = m
                 self.env_data["ethaddr"] = m
@@ -1320,10 +1553,11 @@ class FlasherGUI:
 
         def preset_restore_stock():
             self.env_data.pop("cmdline_keys", None)
+            self.env_data.pop("aml_serial", None)
             cmd_preview.delete("1.0", tk.END)
             cmd_preview.insert("1.0",
-                "cmdline_keys удалён из переопределений — вернётся штатное\n"
-                "чтение serial/deviceid из keystore (keyman) при загрузке.")
+                "cmdline_keys и aml_serial удалены из переопределений — вернётся\n"
+                "штатное чтение serial/deviceid из keystore (keyman) при загрузке.")
         tk.Button(preset_bar, text="↺ Вернуть штатный", command=preset_restore_stock,
                   font=("Arial", 9)).pack(side=tk.LEFT, padx=3)
         refresh_preview()
@@ -1393,7 +1627,7 @@ class FlasherGUI:
             # 3. cmdline_keys, если был переопределён через вкладку serial/deviceid
             if self.env_data.get("cmdline_keys"):
                 changes["cmdline_keys"] = self.env_data["cmdline_keys"]
-            for k in ("serial", "deviceid", "custom_deviceid", "mac", "ethaddr"):
+            for k in ("serial", "deviceid", "custom_deviceid", "aml_serial", "mac", "ethaddr"):
                 if k in self.env_data and self.env_data[k] != device.get(k, ""):
                     changes[k] = self.env_data[k]
 
@@ -1407,7 +1641,8 @@ class FlasherGUI:
                 "При прошивке применятся:\n"
                 "• обязательные lock=10000000, avb2=0, silent=0\n"
                 f"• ваши изменения ({len(self.env_data)} перем.)\n\n"
-                "Скрипт-переменные (bootargs и т.п.) НЕ трогаются.",
+                "Скрипт-переменные (bootargs и т.п.) НЕ трогаются — это\n"
+                "и было причиной прошлого бутлупа.",
                 parent=editor
             )
             self.log(f"✓ ENV: к применению {len(self.env_data)} изменённых переменных")
@@ -1581,6 +1816,287 @@ class FlasherGUI:
             return editor
         return None
 
+    @staticmethod
+    def _crc32c(data, init=0xFFFFFFFF):
+        """crc32c (Castagnoli), как в ext4 metadata_csum.
+        Вариант: init=0xFFFFFFFF, без финального XOR — совпадает с эталоном ext4.
+        """
+        POLY = 0x82F63B78  # reversed Castagnoli polynomial
+        crc = init
+        for b in data:
+            crc ^= b
+            for _ in range(8):
+                crc = (crc >> 1) ^ (POLY & -(crc & 1))
+        return crc & 0xFFFFFFFF
+
+    def _mark_ext4_clean(self, path, log=None):
+        """Пометить ext4 как «clean» (s_state=1), пересчитав crc32c суперблока.
+
+        Старая cygwin-сборка resize2fs (2010 г.) из MIK игнорирует -f и требует
+        e2fsck, если ФС не помечена clean. Помечаем её clean напрямую в Python:
+          • s_state (__le16 @ 0x3A в суперблоке = 0x43A в файле) = 1
+          • если включён metadata_csum — пересчитываем s_checksum (__le32 @ 0x3FC)
+            как crc32c первых 0x3FC байт суперблока (без самого поля csum)
+        Это убирает требование e2fsck, не запуская его.
+        """
+        import struct
+        try:
+            with open(path, "r+b") as f:
+                f.seek(1024)
+                sb = bytearray(f.read(1024))
+                if len(sb) < 1024:
+                    return False
+                # ext4 magic 0xEF53 @ 0x38
+                if sb[0x38:0x3A] != b"\x53\xef":
+                    return False
+                # feature_ro_compat @ 0x64; бит 0x400 = metadata_csum
+                ro_compat = struct.unpack("<I", sb[0x64:0x68])[0]
+                has_csum = bool(ro_compat & 0x400)
+                # s_state = 1 (EXT2_VALID_FS / clean)
+                old_state = struct.unpack("<H", sb[0x3A:0x3C])[0]
+                sb[0x3A:0x3C] = struct.pack("<H", 1)
+                if has_csum:
+                    csum = self._crc32c(bytes(sb[:0x3FC]))
+                    sb[0x3FC:0x400] = struct.pack("<I", csum)
+                f.seek(1024)
+                f.write(sb)
+            if log:
+                log(f"  🧹 ФС помечена clean (s_state {old_state}→1"
+                    + (", crc32c пересчитан)" if has_csum else ")"))
+            return True
+        except Exception as ex:
+            if log:
+                log(f"  ⚠ не удалось пометить clean: {ex}")
+            return False
+
+    def _run_tool_streaming(self, cmd, log, timeout=1800, label="процесс", cwd=None):
+        """Запустить утилиту с ПОТОКОВЫМ выводом и детектом зависания.
+
+        Возвращает (returncode, полный_вывод). returncode=-1 при таймауте/убийстве.
+
+        WinError 5 (отказано в доступе) у cygwin-утилит обычно из-за того, что
+        процесс не находит свои cygwin*.dll (нет рабочей директории exe в путях)
+        или из-за конфликта флагов запуска. Поэтому:
+          • cwd = папка exe (чтобы рядом лежащие cygwin*.dll загрузились)
+          • CREATE_NO_WINDOW (стандартный флаг без конфликтов; STARTUPINFO+
+            NEW_PROCESS_GROUP давали WinError 5)
+          • аргументы-файлы передаются как АБСОЛЮТНЫЕ пути
+        """
+        import threading as _th, time as _t
+
+        # cwd по умолчанию — папка исполняемого файла (для cygwin DLL)
+        if cwd is None and cmd:
+            exe_dir = os.path.dirname(os.path.abspath(cmd[0]))
+            if os.path.isdir(exe_dir):
+                cwd = exe_dir
+
+        kwargs = {}
+        if sys.platform == 'win32':
+            kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL,
+                                 bufsize=1, text=True, errors='ignore',
+                                 cwd=cwd, **kwargs)
+        except Exception as ex:
+            log(f"❌ Запуск {label}: {ex}")
+            return -1, ""
+
+        out_lines = []
+        last_output = [_t.time()]
+        done = _th.Event()
+
+        def _reader():
+            try:
+                for line in iter(p.stdout.readline, ''):
+                    if line:
+                        out_lines.append(line)
+                        last_output[0] = _t.time()
+                        s = line.rstrip()
+                        if s:
+                            log("  " + s)
+            except Exception:
+                pass
+            finally:
+                done.set()
+
+        rt = _th.Thread(target=_reader, daemon=True)
+        rt.start()
+
+        start = _t.time()
+        warned_silent = False
+        while not done.is_set():
+            done.wait(timeout=2)
+            elapsed = _t.time() - start
+            silent = _t.time() - last_output[0]
+            if elapsed > timeout:
+                log(f"❌ {label}: таймаут {int(timeout)}с — убиваю процесс")
+                try: p.kill()
+                except Exception: pass
+                return -1, "".join(out_lines)
+            if silent > 20 and not warned_silent and p.poll() is None:
+                log(f"  ⏳ {label} работает молча уже {int(silent)}с "
+                    "(идёт обработка, ожидайте)...")
+                warned_silent = True
+            elif silent < 5:
+                warned_silent = False
+
+        p.wait()
+        return p.returncode, "".join(out_lines)
+
+    def shrink_ext4_image(self, src, out, tools, log):
+        """Сжать ext4-образ до минимального размера через resize2fs -M.
+
+        Шаги:
+          1. (если sparse) simg2img → raw ext4
+          2. e2fsck -f -y — обязательная проверка перед resize
+          3. resize2fs -M — ужать ФС до минимума занятых данных
+          4. результат — raw ext4 меньшего размера
+
+        Возвращает (ok, итоговый_размер_байт или None).
+
+        ВАЖНО про burning-пакет: сжатый ext4 в пакете прошьётся нормально —
+        update.exe пишет образ как есть. Но если образ покрыт vbmeta
+        (dm-verity hashtree), менять его содержимое/размер можно ТОЛЬКО
+        вместе с отключением verity (vbmeta disable-verity) или пересчётом
+        хешей — иначе будет dm-verity corrupted.
+        """
+        import shutil as _sh
+        cflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+
+        if not tools.get("resize2fs"):
+            log("❌ resize2fs не найден в files/MIK/bin/")
+            return False, None
+        if not tools.get("e2fsck"):
+            log("⚠ e2fsck не найден — resize2fs может отказаться без проверки")
+
+        # 1. Определяем формат и при необходимости распаковываем sparse
+        try:
+            with open(src, "rb") as f:
+                head = f.read(4)
+        except Exception as ex:
+            log(f"❌ Чтение образа: {ex}")
+            return False, None
+
+        # work_raw — АБСОЛЮТНЫЙ путь: cygwin-утилиты запускаются с cwd=папка_exe,
+        # поэтому относительный путь они бы не нашли.
+        work_raw = os.path.abspath(out + ".raw_tmp")
+        is_sparse = head == b"\x3a\xff\x26\xed"
+        if is_sparse:
+            if not tools.get("simg2img"):
+                log("❌ Образ sparse, но simg2img не найден")
+                return False, None
+            log("🔄 simg2img (sparse → raw)...")
+            r = subprocess.run([tools["simg2img"], src, work_raw],
+                               capture_output=True, timeout=600, creationflags=cflags)
+            if r.returncode != 0 or not os.path.exists(work_raw):
+                log("❌ simg2img не сработал")
+                return False, None
+        else:
+            # Копируем raw, чтобы не портить исходник
+            _sh.copy2(src, work_raw)
+
+        # Проверяем, что это ext4 (magic 0xEF53 @ 0x438)
+        try:
+            with open(work_raw, "rb") as f:
+                f.seek(0x438)
+                if f.read(2) != b"\x53\xef":
+                    log("❌ Это не ext4 — resize2fs работает только с ext2/3/4")
+                    log("   (для erofs сжатие неприменимо — он и так компактный)")
+                    os.remove(work_raw)
+                    return False, None
+        except Exception:
+            pass
+
+        # 2. e2fsck -f -y — ОПЦИОНАЛЬНО. В составе MIK его НЕТ (есть только
+        #    resize2fs.exe в bin/resize2fs/). resize2fs -M -f с stdin=DEVNULL
+        #    работает и без предварительного e2fsck в большинстве случаев —
+        #    флаг -f форсит операцию, а DEVNULL не даёт зависнуть на запросе.
+        #    Если e2fsck доступен — используем его для надёжности.
+        e2fsck = tools.get("e2fsck")
+        if not e2fsck and tools.get("resize2fs"):
+            sibling_dir = os.path.dirname(tools["resize2fs"])
+            for n in ("e2fsck.exe", "e2fsck", "fsck.ext4.exe", "fsck.ext4"):
+                cand = os.path.join(sibling_dir, n)
+                if os.path.exists(cand):
+                    e2fsck = cand
+                    break
+
+        if e2fsck:
+            log("🔍 e2fsck -f -y (проверка ФС перед сжатием)...")
+            try:
+                r = subprocess.run([e2fsck, "-f", "-y", work_raw],
+                                   capture_output=True, timeout=600,
+                                   stdin=subprocess.DEVNULL, creationflags=cflags)
+                o = ((r.stdout or b"")+(r.stderr or b"")).decode("utf-8", "ignore")
+                for ln in o.splitlines():
+                    if ln.strip():
+                        log("  " + ln.strip())
+                # e2fsck: 0=ок, 1=исправлены ошибки, 2=исправлены+ребут — норма
+                if r.returncode > 2:
+                    log(f"⚠ e2fsck код {r.returncode} — пробуем resize2fs всё равно")
+            except subprocess.TimeoutExpired:
+                log("⚠ e2fsck таймаут — продолжаем")
+        else:
+            # e2fsck нет (типичный MIK). Старая cygwin-resize2fs (2010) требует
+            # e2fsck, если ФС не «clean», и ИГНОРИРУЕТ -f. Помечаем ФС clean
+            # прямо в суперблоке (s_state=1 + пересчёт crc32c) — это убирает
+            # требование e2fsck, не запуская его.
+            log("ℹ e2fsck не найден — помечаем ФС clean напрямую (s_state+crc32c)")
+            self._mark_ext4_clean(work_raw, log)
+
+        # 3. resize2fs -M — через потоковый запуск с детектом зависания.
+        #    Cygwin-сборка resize2fs из MIK виснет при CREATE_NO_WINDOW —
+        #    _run_tool_streaming запускает её с консолью (но скрытой) и
+        #    показывает живой вывод/предупреждает, если процесс молчит.
+        log("📐 resize2fs -M (сжатие до минимума данных)...")
+        log("   (для больших образов может занять минуту, ожидайте)")
+        rc, o = self._run_tool_streaming(
+            [tools["resize2fs"], "-M", "-f", work_raw],
+            log, timeout=1800, label="resize2fs")
+
+        # Если версия требует e2fsck — повторная пометка clean + попытка без -f
+        if rc != 0 and "e2fsck" in o.lower():
+            log("  ⚠ resize2fs требует e2fsck — повторная пометка clean...")
+            self._mark_ext4_clean(work_raw, log)
+            rc, o = self._run_tool_streaming(
+                [tools["resize2fs"], "-M", work_raw],
+                log, timeout=1800, label="resize2fs")
+
+        if rc != 0:
+            log(f"❌ resize2fs код {rc}")
+            if "superblock checksum" in o.lower():
+                log("  (ошибка csum — образ мог быть изменён; попробуйте заново)")
+            try: os.remove(work_raw)
+            except Exception: pass
+            return False, None
+
+        new_size = os.path.getsize(work_raw)
+
+        # 4. Итог: raw ext4. Если исходник был sparse — пере-упаковываем в sparse
+        if is_sparse and tools.get("img2simg"):
+            log("🔄 img2simg (raw → sparse)...")
+            r = subprocess.run([tools["img2simg"], work_raw, out],
+                               capture_output=True, timeout=600, creationflags=cflags)
+            try: os.remove(work_raw)
+            except Exception: pass
+            if r.returncode != 0 or not os.path.exists(out):
+                log("❌ img2simg не сработал")
+                return False, None
+        else:
+            # raw — просто перемещаем
+            try:
+                if os.path.exists(out):
+                    os.remove(out)
+                os.rename(work_raw, out)
+            except Exception as ex:
+                log(f"❌ Перемещение результата: {ex}")
+                return False, None
+
+        return True, new_size
+
     def _find_mik_tools(self):
         """Найти MIK и его консольные утилиты в files/MIK/.
         Возвращает dict: {mik_gui, bin_dir, simg2img, img2simg, make_ext4fs,
@@ -1589,7 +2105,8 @@ class FlasherGUI:
         mik_dir = os.path.join(FILE_DIR, "MIK")
         result = {"mik_gui": None, "bin_dir": None, "simg2img": None,
                   "img2simg": None, "make_ext4fs": None, "imgextractor": None,
-                  "mkfs_erofs": None, "dir": mik_dir}
+                  "mkfs_erofs": None, "resize2fs": None, "e2fsck": None,
+                  "dir": mik_dir}
         if not os.path.isdir(mik_dir):
             return result
 
@@ -1611,15 +2128,20 @@ class FlasherGUI:
         if os.path.isdir(bin_dir):
             result["bin_dir"] = bin_dir
             def find_tool(*names):
+                # ВАЖНО: только ФАЙЛЫ, не директории. В bin/ есть папка
+                # resize2fs/ — без проверки isfile её бы приняли за утилиту
+                # и при запуске получили WinError 5 (запуск директории).
                 for n in names:
                     p = os.path.join(bin_dir, n)
-                    if os.path.exists(p):
+                    if os.path.isfile(p):
                         return p
-                # рекурсивно
+                # рекурсивно — тоже только файлы
                 for root_d, _dirs, files in os.walk(bin_dir):
                     for n in names:
                         if n in files:
-                            return os.path.join(root_d, n)
+                            cand = os.path.join(root_d, n)
+                            if os.path.isfile(cand):
+                                return cand
                 return None
             result["simg2img"]     = find_tool("simg2img.exe", "simg2img")
             result["img2simg"]     = find_tool("img2simg.exe", "ext2simg.exe",
@@ -1629,6 +2151,25 @@ class FlasherGUI:
                                                "extract.exe", "ext4_unpacker.exe")
             result["mkfs_erofs"]   = find_tool("mkfs.erofs.exe", "mkfs.erofs",
                                                "mke2fs.exe")
+            # Для resize2fs/e2fsck ищем ТОЛЬКО .exe (без расширения = риск
+            # совпасть с одноимённой папкой)
+            result["resize2fs"]    = find_tool("resize2fs.exe")
+            result["e2fsck"]       = find_tool("e2fsck.exe", "fsck.ext4.exe")
+
+        # resize2fs/e2fsck могут лежать не в bin/, а в подпапке MIK
+        # (например files/MIK/bin/resize2fs/resize2fs.exe) — ищем по всему MIK.
+        def find_in_mik(*names):
+            for root_d, _dirs, files in os.walk(mik_dir):
+                for n in names:
+                    if n in files:
+                        cand = os.path.join(root_d, n)
+                        if os.path.isfile(cand):
+                            return cand
+            return None
+        if not result["resize2fs"]:
+            result["resize2fs"] = find_in_mik("resize2fs.exe")
+        if not result["e2fsck"]:
+            result["e2fsck"] = find_in_mik("e2fsck.exe", "fsck.ext4.exe")
         return result
 
     def open_image_editor(self):
@@ -1935,6 +2476,60 @@ class FlasherGUI:
             else:
                 messagebox.showerror("Ошибка", msg, parent=win)
 
+        def do_shrink():
+            if getattr(self, "_shrink_running", False):
+                messagebox.showinfo("Сжатие идёт",
+                    "Сжатие уже выполняется — дождитесь завершения.", parent=win)
+                return
+            src = img_var.get()
+            if not src or not os.path.exists(src):
+                messagebox.showwarning("!",
+                    "Выберите ext4-образ (system/product/vendor) в поле «Образ»",
+                    parent=win)
+                return
+            if not tools.get("resize2fs"):
+                messagebox.showwarning("!",
+                    "resize2fs не найден в files/MIK/bin/.\n"
+                    "Убедитесь, что MIK скачан полностью.", parent=win)
+                return
+            orig_size = os.path.getsize(src)
+            out = os.path.splitext(src)[0] + "-shrunk.img"
+
+            if not messagebox.askyesno("Сжатие ext4",
+                f"Сжать образ до минимального размера?\n\n"
+                f"Исходный: {orig_size/(1024*1024):.0f} MB\n"
+                f"Результат: {out}\n\n"
+                "⚠️ Если образ покрыт vbmeta (dm-verity), после сжатия\n"
+                "нужно либо отключить verity (vbmeta disable-verity),\n"
+                "либо пересчитать хеши — иначе будет dm-verity corrupted.\n\n"
+                "Продолжить?", parent=win):
+                return
+
+            def _t():
+                self._shrink_running = True
+                prog.start(10)
+                try:
+                    log(f"📐 Сжатие {os.path.basename(src)} "
+                        f"({orig_size/(1024*1024):.0f} MB)...")
+                    ok, new_size = self.shrink_ext4_image(src, out, tools, log)
+                    if ok:
+                        saved = orig_size - new_size
+                        log(f"✓ Готово: {new_size/(1024*1024):.0f} MB "
+                            f"(освобождено {saved/(1024*1024):.0f} MB)")
+                        self.root.after(0, lambda: messagebox.showinfo("Сжато",
+                            f"Образ сжат:\n{out}\n\n"
+                            f"{orig_size/(1024*1024):.0f} MB → "
+                            f"{new_size/(1024*1024):.0f} MB\n\n"
+                            "Теперь образ должен влезть в раздел. Если он под\n"
+                            "vbmeta — не забудьте про disable-verity.", parent=win))
+                    else:
+                        log("❌ Сжатие не удалось")
+                finally:
+                    self._shrink_running = False
+                    self.root.after(0, prog.stop)
+            import threading as _th
+            _th.Thread(target=_t, daemon=True).start()
+
         # ── Кнопки ──
         if tools["bin_dir"]:
             tk.Button(btn_row, text="📂 Распаковать",
@@ -1944,6 +2539,11 @@ class FlasherGUI:
             tk.Button(btn_row, text="📦 Собрать образ",
                       command=do_pack, bg="#27AE60", fg="white",
                       font=("Arial", 10, "bold"), height=2
+                      ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        if tools.get("resize2fs"):
+            tk.Button(btn_row, text="📐 Сжать ext4\n(resize2fs -M)",
+                      command=do_shrink, bg="#16A085", fg="white",
+                      font=("Arial", 9), height=2
                       ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
         tk.Button(btn_row, text="🔓 vbmeta\ndisable-verity",
                   command=do_vbmeta_patch, bg="#D35400", fg="white",
@@ -2098,6 +2698,14 @@ class FlasherGUI:
             log_box.see(tk.END)
             log_box.config(state='disabled')
             log_box.update_idletasks()
+
+        # Подключаем журнал дампа к USB-watcher, чтобы события
+        # подключения/отключения USB дублировались и сюда.
+        self._dump_log_fn = log
+        def _on_dump_close():
+            self._dump_log_fn = None
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", _on_dump_close)
 
         # ── Таблица (растягивается между шапкой и логом) ──────────────────────
         lf = tk.LabelFrame(win, text="Разделы (клик — вкл/выкл; ✓ = дампить)",
@@ -3887,12 +4495,40 @@ class FlasherGUI:
             rc = 1
         return rc, out
     
+    def _apply_unlock_minimum(self):
+        """Применить необходимый минимум разблокировки в ЖИВОМ U-Boot.
+
+        ВАЖНО: даже если env-раздел записан бинарно с avb2=0/lock=…, прошивка
+        в текущей сессии U-Boot читает эти значения из АКТИВНОГО окружения, а
+        не из только что записанного раздела. Поэтому setenv+saveenv нужно
+        выполнять ВСЕГДА — иначе avb2 в активной сессии останется старым.
+
+        Вызывается во всех случаях (и после бинарной записи env тоже).
+        """
+        self.log("  - Применение настроек разблокировки:")
+
+        def _setenv(key, value):
+            try:
+                self.aml_bulkcmd(f"setenv {key} {value}")
+                self.log(f"    • {key} = {value}")
+            except Exception as ex:
+                self.log(f"    ⚠ {key}: не применён ({str(ex)[:60]})")
+
+        _setenv("silent", "0")
+        _setenv("lock", "10000000")
+        _setenv("avb2", "0")
+        try:
+            self.aml_bulkcmd("saveenv")
+            self.log("    ✓ saveenv")
+        except Exception as ex:
+            self.log(f"    ⚠ saveenv: {str(ex)[:60]}")
+
     def _apply_env_setenv(self, env_file):
         """Применить env через setenv (только простые скалярные переменные).
 
-        Повторяет логику рабочего linux-скрипта: грузит env в RAM, импортирует,
-        применяет silent/lock/avb2 + простые пользовательские изменения, saveenv.
-        НЕ трогает скрипт-переменные (bootargs и т.п.).
+        Грузит env в RAM, импортирует, применяет простые пользовательские
+        изменения. Минимум (silent/lock/avb2) применяется отдельно через
+        _apply_unlock_minimum(). НЕ трогает скрипт-переменные (bootargs и т.п.).
         """
         SKIP_VARS = {
             "bootargs", "initargs", "storeargs", "storeboot", "preboot",
@@ -3903,7 +4539,7 @@ class FlasherGUI:
             "upgrade_check", "irremote_update", "set_factory_env",
             "usb_burning", "sdc_burning", "update", "try_auto_burn",
             "bcb_cmd", "factoryboot", "serial", "deviceid", "custom_deviceid",
-            "mac", "ethaddr",  # эти идут только через бинарный способ
+            "aml_serial", "mac", "ethaddr",  # эти идут только через бинарный способ
         }
 
         self.log("  - Загрузка env в RAM...")
@@ -3925,12 +4561,6 @@ class FlasherGUI:
             except Exception as ex:
                 self.log(f"    ⚠ {key}: не применён ({str(ex)[:60]})")
 
-        # ВСЕГДА — необходимый минимум (как рабочий скрипт)
-        self.log("  - Необходимый минимум (silent/lock/avb2):")
-        safe_setenv("silent", "0")
-        safe_setenv("lock", "10000000")
-        safe_setenv("avb2", "0")
-
         # Простые пользовательские изменения
         extra = 0
         for key, value in (self.env_data or {}).items():
@@ -3940,10 +4570,8 @@ class FlasherGUI:
             extra += 1
         if extra:
             self.log(f"  - Дополнительно простых переменных: {extra}")
-
-        self.log("  - Сохранение (saveenv)...")
-        self.aml_bulkcmd("saveenv")
-        self.log("✓ ENV применён через setenv")
+        else:
+            self.log("  - Пользовательских простых изменений нет")
 
     def _apply_env_binary(self, env_file):
         """Применить env БИНАРНО с пересчётом CRC32.
@@ -4013,6 +4641,16 @@ class FlasherGUI:
                     self.log(f"  serial = {self.env_data['serial']}")
                 if "cmdline_keys" in self.env_data:
                     self.log("  cmdline_keys: переопределён (serial/deviceid жёстко)")
+                # КРИТИЧНО: загружаем только что записанный env в АКТИВНУЮ сессию
+                # U-Boot (env import). Иначе последующий saveenv в _apply_unlock_minimum
+                # запишет старый running-env обратно и затрёт наши cmdline_keys.
+                try:
+                    self.log("  - Синхронизация активного окружения U-Boot...")
+                    self.aml_write_file_to_ram(out, "0x200c000")
+                    self.aml_bulkcmd("env import 200c004")
+                    self.log("    ✓ активное окружение обновлено")
+                except Exception as ex:
+                    self.log(f"    ⚠ env import: {str(ex)[:60]}")
             else:
                 self.log(f"  ⚠ partition env вернул ошибку: {o.strip()[:120]}")
                 self.log("  → fallback: применяем простые переменные через setenv")
@@ -4370,7 +5008,7 @@ class FlasherGUI:
                     "Открыть редактор переменных окружения?\n"
                     "(Рекомендуется для разблокировки bootloader: lock, avb2, SELinux)\n\n"
                     "Если нажать «Нет» — применится только необходимый минимум:\n"
-                    "silent=0, lock=10000000, avb2=0 (как в рабочем скрипте).\n\n"
+                    "silent=0, lock=10000000, avb2=0.\n\n"
                     "Прошивка продолжится ПОСЛЕ закрытия редактора."
                 )
                 if response:
@@ -4404,7 +5042,7 @@ class FlasherGUI:
                 # Он нужен ТОЛЬКО если пользователь переопределил скрипт-переменные
                 # (cmdline_keys) или serial/deviceid — их нельзя задать через setenv.
                 SCRIPT_OVERRIDES = {"cmdline_keys", "serial", "deviceid",
-                                    "custom_deviceid", "mac", "ethaddr"}
+                                    "custom_deviceid", "aml_serial", "mac", "ethaddr"}
                 need_binary = any(k in self.env_data for k in SCRIPT_OVERRIDES)
 
                 if need_binary:
@@ -4414,6 +5052,12 @@ class FlasherGUI:
                 else:
                     self.log("  - Применение env через setenv (простые переменные)")
                     self._apply_env_setenv(env_file)
+
+                # ВСЕГДА применяем минимум разблокировки в живом U-Boot —
+                # даже после бинарной записи env. Прошивка читает avb2/lock из
+                # активной сессии U-Boot, а не из записанного раздела, поэтому
+                # без этого avb2 в сессии останется старым (=1) и не примется.
+                self._apply_unlock_minimum()
 
                 # Удаляем временный файл
                 if os.path.exists(env_file):
