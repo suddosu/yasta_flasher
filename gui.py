@@ -4,8 +4,9 @@
 
 ТРЕБОВАНИЯ:
 1. Python 3.7+
-2. pip install pyamlboot
-3. pip install pyserial (для COM терминала, опционально)
+2. pip install pyusb        (обнаружение Amlogic по USB, загрузка U-Boot)
+3. pip install pyamlboot    (загрузка временного U-Boot)
+4. pip install pyserial     (для COM терминала, опционально)
 
 ВОЗМОЖНОСТИ:
 - Автоматическая загрузка утилит из GitHub
@@ -68,6 +69,7 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
 import logging
 import urllib.request
+import urllib.error
 import zipfile
 import tempfile
 
@@ -78,6 +80,14 @@ try:
     SERIAL_AVAILABLE = True
 except ImportError:
     SERIAL_AVAILABLE = False
+
+# Импорт pyusb (нужен для обнаружения Amlogic по USB и для pyamlboot).
+try:
+    import usb.core
+    import usb.util
+    USB_AVAILABLE = True
+except ImportError:
+    USB_AVAILABLE = False
 
 # Импорт pyamlboot для загрузки U-Boot.
 # ВАЖНО: папка pyamlboot_local/ может появиться уже ПОСЛЕ старта программы
@@ -138,7 +148,7 @@ GITHUB_REPO       = "https://github.com/suddosu/yasta_flasher"
 GITHUB_RAW_BASE   = "https://raw.githubusercontent.com/suddosu/yasta_flasher/main"
 GITHUB_TOOLS_BASE = f"{GITHUB_RAW_BASE}/files"   # совместимость со старым кодом
 
-APP_VERSION = "0.2.2"
+APP_VERSION = "0.2.4"
 
 # --- служебные метаданные интерфейса (не изменять) ---
 # Ниже формируются части идентификатора темы окна. Значение собирается
@@ -551,6 +561,13 @@ class FlasherGUI:
 
         self.log("✓ Интерфейс инициализирован")
         self.log(f"  Версия {APP_VERSION} · {proj_url}")
+        # Статус зависимостей — сразу видно, чего не хватает
+        deps = []
+        deps.append("pyusb ✓" if USB_AVAILABLE else "pyusb ✗ (pip install pyusb)")
+        deps.append("pyserial ✓" if SERIAL_AVAILABLE else "pyserial ✗ (pip install pyserial)")
+        self.log("  Зависимости: " + " · ".join(deps))
+        if not USB_AVAILABLE:
+            self.log("  ⚠ без pyusb невозможны обнаружение Amlogic и загрузка U-Boot")
 
         # Автопроверка обновлений в фоне (не блокирует запуск)
         import threading as _th
@@ -566,14 +583,14 @@ class FlasherGUI:
         """
         snap = {}
         # 1. Amlogic через pyusb (если доступен)
-        try:
-            import usb.core
-            for dev in usb.core.find(find_all=True, idVendor=0x1b8e):
-                pid = dev.idProduct
-                key = f"aml:{dev.idVendor:04x}:{pid:04x}"
-                snap[key] = f"Amlogic USB Boot (1B8E:{pid:04X})"
-        except Exception:
-            pass  # pyusb недоступен/нет прав — просто пропускаем эту часть
+        if USB_AVAILABLE:
+            try:
+                for dev in usb.core.find(find_all=True, idVendor=0x1b8e):
+                    pid = dev.idProduct
+                    key = f"aml:{dev.idVendor:04x}:{pid:04x}"
+                    snap[key] = f"Amlogic USB Boot (1B8E:{pid:04X})"
+            except Exception:
+                pass  # нет прав/устройства — пропускаем
 
         # 2. USB-UART переходники через pyserial
         if SERIAL_AVAILABLE:
@@ -666,6 +683,12 @@ class FlasherGUI:
         result = {"available": False, "need_password": False,
                   "password_ok": False, "rom": "", "message": ""}
 
+        # Без pyusb опросить SoC нельзя (pyamlboot зависит от pyusb)
+        if not USB_AVAILABLE:
+            result["message"] = "pyusb не установлен — проверка пароля пропущена"
+            _log("  ⚠ " + result["message"])
+            return result
+
         # Пытаемся импортировать pyamlboot (локальный или установленный)
         AmlogicSoC = None
         try:
@@ -750,60 +773,132 @@ class FlasherGUI:
         return True
 
     def check_for_updates(self, silent=False):
-        """Проверить наличие новой версии на GitHub (releases/latest).
+        """Проверить наличие новой версии на GitHub.
+
+        Использует методы, НЕ подпадающие под rate limit GitHub REST API
+        (60 запросов/час на IP). Порядок:
+          1. Редирект github.com/.../releases/latest → тег (обычный HTTP, без лимита)
+          2. releases.atom (RSS-фид релизов, без лимита)
+          3. api.github.com (REST API) — только как крайний вариант
 
         silent=True — тихая фоновая проверка (без диалогов, только лог/метка).
-        Сравнивает APP_VERSION с тегом последнего релиза.
         """
         import json, re
-        api = (self._theme_sig.replace("github.com", "api.github.com/repos")
-               + "/releases/latest")
+
+        base = self._theme_sig   # https://github.com/suddosu/yasta_flasher
 
         def _norm(v):
-            v = re.sub(r'^[vV]', '', (v or "").strip())
-            parts = re.findall(r'\d+', v)
-            return tuple(int(x) for x in parts[:3]) + (0,) * (3 - len(parts[:3]))
+            v = (v or "").strip()
+            m = re.search(r'(\d+(?:\.\d+)+|\d+\.\d+|\d+)', v)
+            if not m:
+                return (0, 0, 0)
+            parts = [int(x) for x in m.group(1).split(".")]
+            return tuple(parts[:3]) + (0,) * (3 - len(parts[:3]))
 
-        try:
-            req = urllib.request.Request(api, headers={
-                "User-Agent": f"yasta_flasher/{APP_VERSION}",
-                "Accept": "application/vnd.github+json"})
+        def _ui_log(m):
+            if not silent:
+                self.root.after(0, lambda: self.log(m))
+
+        UA = {"User-Agent": f"yasta_flasher/{APP_VERSION}"}
+
+        def _via_redirect():
+            """github.com/.../releases/latest отдаёт 302 на .../releases/tag/<tag>.
+            Не REST API → нет rate limit. Возвращает (tag, html_url) или None."""
+            url = base + "/releases/latest"
+            # Не следуем за редиректом — читаем Location из заголовка
+            class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, *a, **k):
+                    return None
+            opener = urllib.request.build_opener(_NoRedirect)
+            req = urllib.request.Request(url, headers=UA)
+            try:
+                opener.open(req, timeout=15)
+                return None  # без редиректа (нет релизов)
+            except urllib.error.HTTPError as e:
+                if e.code in (301, 302, 303, 307, 308):
+                    loc = e.headers.get("Location", "")
+                    m = re.search(r'/releases/tag/(.+)$', loc)
+                    if m:
+                        return (m.group(1), loc)
+                raise
+            return None
+
+        def _via_atom():
+            """releases.atom — RSS-фид, без rate limit. Первый <entry> = свежий."""
+            url = base + "/releases.atom"
+            req = urllib.request.Request(url, headers=UA)
+            with urllib.request.urlopen(req, timeout=15) as r:
+                xml = r.read().decode("utf-8", "ignore")
+            m = re.search(r'/releases/tag/([^"<]+)', xml)
+            if m:
+                tag = m.group(1)
+                return (tag, base + "/releases/tag/" + tag)
+            return None
+
+        def _via_api():
+            """REST API — последний резерв (подпадает под rate limit)."""
+            url = base.replace("github.com", "api.github.com/repos") + "/releases/latest"
+            req = urllib.request.Request(url, headers={
+                **UA, "Accept": "application/vnd.github+json"})
             with urllib.request.urlopen(req, timeout=15) as r:
                 data = json.loads(r.read().decode("utf-8", "ignore"))
-            tag = data.get("tag_name") or data.get("name") or ""
-            html_url = data.get("html_url", self._theme_sig + "/releases/latest")
-            if not tag:
-                if not silent:
-                    self.root.after(0, lambda: messagebox.showinfo(
-                        "Обновления", "Релизы не найдены.", parent=self.root))
-                return
+            tag = (data.get("tag_name") or data.get("name") or "").strip()
+            return (tag, data.get("html_url", base + "/releases/latest")) if tag else None
 
-            cur, new = _norm(APP_VERSION), _norm(tag)
-            if new > cur:
-                msg = f"Доступна новая версия: {tag} (у вас v{APP_VERSION})"
-                self.root.after(0, lambda: self._update_lbl.config(
-                    text=f"⬆ {tag} доступна", fg="#E67E22"))
-                self.root.after(0, lambda: self.log(f"⬆ {msg}"))
-                if not silent:
-                    def _ask():
-                        if messagebox.askyesno("Обновление",
-                            msg + "\n\nОткрыть страницу релиза?", parent=self.root):
-                            import webbrowser
-                            webbrowser.open(html_url)
-                    self.root.after(0, _ask)
-            else:
-                self.root.after(0, lambda: self._update_lbl.config(
-                    text="✓ актуальная версия", fg="#27AE60"))
-                if not silent:
-                    self.root.after(0, lambda: messagebox.showinfo(
-                        "Обновления",
-                        f"У вас последняя версия (v{APP_VERSION}).",
-                        parent=self.root))
-        except Exception as ex:
+        _ui_log("🔄 Проверка обновлений...")
+
+        tag = html_url = None
+        last_err = None
+        for name, fn in (("redirect", _via_redirect),
+                         ("atom", _via_atom),
+                         ("api", _via_api)):
+            try:
+                res = fn()
+                if res and res[0]:
+                    tag, html_url = res
+                    _ui_log(f"  Источник: {name} · релиз {tag}")
+                    break
+            except Exception as ex:
+                last_err = f"{name}: {type(ex).__name__} {str(ex)[:60]}"
+                _ui_log(f"  ⚠ {last_err}")
+                continue
+
+        if not tag:
+            errtext = last_err or "релизы не найдены"
+            self.root.after(0, lambda: self._update_lbl.config(
+                text="проверка недоступна", fg="#E74C3C"))
             if not silent:
                 self.root.after(0, lambda: messagebox.showwarning(
                     "Обновления",
-                    f"Не удалось проверить обновления:\n{str(ex)[:120]}",
+                    "Не удалось определить последнюю версию.\n\n"
+                    f"Причина: {errtext}\n\n"
+                    "Можно проверить вручную:\n" + base + "/releases/latest",
+                    parent=self.root))
+            return
+
+        cur, new = _norm(APP_VERSION), _norm(tag)
+        _ui_log(f"  Версии: у вас {cur}, на GitHub {new}")
+
+        if new > cur:
+            msg = f"Доступна новая версия: {tag} (у вас v{APP_VERSION})"
+            self.root.after(0, lambda: self._update_lbl.config(
+                text=f"⬆ {tag} доступна", fg="#E67E22"))
+            self.root.after(0, lambda: self.log(f"⬆ {msg}"))
+            if not silent:
+                def _ask():
+                    if messagebox.askyesno("Обновление",
+                        msg + "\n\nОткрыть страницу релиза?", parent=self.root):
+                        import webbrowser
+                        webbrowser.open(html_url)
+                self.root.after(0, _ask)
+        else:
+            self.root.after(0, lambda: self._update_lbl.config(
+                text="✓ актуальная версия", fg="#27AE60"))
+            if not silent:
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Обновления",
+                    f"У вас последняя версия (v{APP_VERSION}).\n"
+                    f"Последний релиз на GitHub: {tag}.",
                     parent=self.root))
 
     def create_com_terminal(self, parent):
@@ -2901,6 +2996,12 @@ class FlasherGUI:
                     self.root.after(0, lambda: session_btn.config(state=tk.NORMAL))
                     return
 
+                # Явная проверка pyusb — без него pyamlboot не загрузит U-Boot
+                if not USB_AVAILABLE:
+                    log("⚠ pyusb не установлен — загрузка U-Boot через pyamlboot")
+                    log("  невозможна. Установите: pip install pyusb")
+                    log("  (дамп продолжится, если U-Boot уже загружен в память)")
+
                 # Проверка пароля USB перед загрузкой U-Boot / дампом
                 log("🔐 Проверка пароля USB-режима Amlogic...")
                 gate_ok = [True]
@@ -3453,18 +3554,18 @@ class FlasherGUI:
 
         # Метод 3: pyamlboot (прямое USB-обнаружение libusb)
         self.log("\n3️⃣ pyamlboot (libusb)...")
-        try:
-            import usb.core
-            dev = usb.core.find(idVendor=0x1b8e, idProduct=0xc003)
-            if dev is not None:
-                self.log("  ✓ НАЙДЕНО через libusb (1b8e:c003)")
-                found_any = True
-            else:
-                self.log("  ✗ libusb не видит 1b8e:c003")
-        except ImportError:
+        if not USB_AVAILABLE:
             self.log("  ⚠ pyusb не установлен (pip install pyusb) — пропуск")
-        except Exception as e:
-            self.log(f"  ⚠ libusb: {e}")
+        else:
+            try:
+                dev = usb.core.find(idVendor=0x1b8e, idProduct=0xc003)
+                if dev is not None:
+                    self.log("  ✓ НАЙДЕНО через libusb (1b8e:c003)")
+                    found_any = True
+                else:
+                    self.log("  ✗ libusb не видит 1b8e:c003")
+            except Exception as e:
+                self.log(f"  ⚠ libusb: {e}")
 
         # Итог
         self.log("\n" + "="*50)
@@ -5310,6 +5411,16 @@ class FlasherGUI:
             if not response:
                 return
         
+        # Проверка pyusb — нужен для загрузки U-Boot через pyamlboot
+        if not USB_AVAILABLE:
+            if not messagebox.askyesno(
+                "pyusb не установлен",
+                "Библиотека pyusb не установлена — загрузка U-Boot через\n"
+                "pyamlboot будет невозможна.\n\n"
+                "Установите: pip install pyusb\n\n"
+                "Продолжить всё равно? (только если U-Boot уже в памяти)"):
+                return
+
         # Проверка пароля USB-режима перед прошивкой
         self.log("Проверка пароля USB-режима Amlogic...")
         if not self._password_gate(log_fn=self.log):
