@@ -644,6 +644,111 @@ class FlasherGUI:
 
         _th.Thread(target=_watch, daemon=True).start()
 
+    def check_aml_usb_password(self, log_fn=None):
+        """Проверить, требует ли устройство Amlogic пароль для USB-режима.
+
+        На защищённых SoC вход в USB-режим требует password.bin, иначе команды
+        update.exe падают. identify() возвращает socid, где:
+          socid[4] = Need Password (1 = требуется пароль)
+          socid[5] = Password OK   (1 = пароль уже принят)
+
+        Возвращает dict:
+          {"available": bool,   # удалось ли опросить устройство
+           "need_password": bool,
+           "password_ok": bool,
+           "rom": str, "message": str}
+        Если устройство не в USB Boot режиме или pyamlboot недоступен —
+        available=False (это НЕ блокирует прошивку, просто не смогли проверить).
+        """
+        def _log(m):
+            if log_fn: log_fn(m)
+
+        result = {"available": False, "need_password": False,
+                  "password_ok": False, "rom": "", "message": ""}
+
+        # Пытаемся импортировать pyamlboot (локальный или установленный)
+        AmlogicSoC = None
+        try:
+            if ROOT_DIR not in sys.path:
+                sys.path.insert(0, ROOT_DIR)
+            try:
+                from pyamlboot_local.pyamlboot import AmlogicSoC as _A
+                AmlogicSoC = _A
+            except Exception:
+                from pyamlboot.pyamlboot import AmlogicSoC as _A
+                AmlogicSoC = _A
+        except Exception:
+            result["message"] = "pyamlboot недоступен — проверка пароля пропущена"
+            _log("  ⚠ " + result["message"])
+            return result
+
+        try:
+            dev = AmlogicSoC()
+            socid = dev.identify()
+            # socid — bytes или str; берём байты 0..5
+            def _b(i):
+                v = socid[i]
+                return ord(v) if isinstance(v, str) else int(v)
+            rom = f"{_b(0)}.{_b(1)}"
+            need = _b(4)
+            pok = _b(5)
+            result.update({
+                "available": True,
+                "need_password": bool(need),
+                "password_ok": bool(pok),
+                "rom": rom,
+            })
+            _log(f"  🔐 SoC ROM {rom}: Need Password={need}, Password OK={pok}")
+            if need and not pok:
+                result["message"] = ("Устройство ТРЕБУЕТ password.bin для "
+                                     "USB-режима, и пароль ещё не введён.")
+            elif need and pok:
+                result["message"] = "Пароль требуется, но уже принят — можно работать."
+            else:
+                result["message"] = "Пароль не требуется."
+            # Пытаемся освободить устройство
+            try:
+                import usb.util
+                usb.util.dispose_resources(dev.dev)
+            except Exception:
+                pass
+        except Exception as ex:
+            # Устройство не в USB Boot или занято — не критично
+            result["message"] = f"Не удалось опросить SoC: {str(ex)[:80]}"
+            _log("  ⚠ " + result["message"])
+        return result
+
+    def _password_gate(self, log_fn=None, parent=None):
+        """Проверка пароля перед прошивкой/дампом. Возвращает True если можно
+        продолжать, False если пользователь отменил из-за требования пароля.
+
+        Если устройство требует password.bin и пароль не введён — предупреждаем
+        и даём выбор: продолжить (на свой риск) или отменить.
+        """
+        info = self.check_aml_usb_password(log_fn=log_fn)
+        if not info["available"]:
+            # Не смогли проверить (нет устройства в USB Boot / нет pyamlboot).
+            # Не блокируем — операция сама покажет ошибку, если что.
+            return True
+        if info["need_password"] and not info["password_ok"]:
+            msg = (
+                "⚠️ Устройство Amlogic ТРЕБУЕТ пароль для USB-режима\n"
+                f"(SoC ROM {info['rom']}: Need Password=1, Password OK=0).\n\n"
+                "Без ввода password.bin команды прошивки/дампа, скорее всего,\n"
+                "завершатся ошибкой авторизации.\n\n"
+                "Введите пароль командой:\n"
+                "    update.exe password password.bin\n"
+                "или через USB Burning Tool, затем повторите.\n\n"
+                "Продолжить всё равно?"
+            )
+            if log_fn:
+                log_fn("  ⛔ " + info["message"])
+            proceed = messagebox.askyesno("Требуется пароль USB", msg,
+                                          icon='warning',
+                                          parent=parent or self.root)
+            return proceed
+        return True
+
     def check_for_updates(self, silent=False):
         """Проверить наличие новой версии на GitHub (releases/latest).
 
@@ -2793,6 +2898,20 @@ class FlasherGUI:
                     self.get_update_path()
                 except FileNotFoundError as ex:
                     log(f"❌ {ex}")
+                    self.root.after(0, lambda: session_btn.config(state=tk.NORMAL))
+                    return
+
+                # Проверка пароля USB перед загрузкой U-Boot / дампом
+                log("🔐 Проверка пароля USB-режима Amlogic...")
+                gate_ok = [True]
+                gate_done = __import__("threading").Event()
+                def _gate():
+                    gate_ok[0] = self._password_gate(log_fn=log, parent=win)
+                    gate_done.set()
+                self.root.after(0, _gate)
+                gate_done.wait()
+                if not gate_ok[0]:
+                    log("⛔ Сессия отменена (требуется пароль USB).")
                     self.root.after(0, lambda: session_btn.config(state=tk.NORMAL))
                     return
 
@@ -5191,6 +5310,12 @@ class FlasherGUI:
             if not response:
                 return
         
+        # Проверка пароля USB-режима перед прошивкой
+        self.log("Проверка пароля USB-режима Amlogic...")
+        if not self._password_gate(log_fn=self.log):
+            self.log("⛔ Прошивка отменена (требуется пароль USB).")
+            return
+
         self.is_flashing = True
         self.flash_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
