@@ -143,12 +143,66 @@ def save_settings(data):
         pass
 
 
+def safe_decode(data):
+    """Универсальное декодирование байтов в строку.
+
+    Windows-утилиты (libusb, update.exe) выводят системные сообщения об
+    ошибках в кодировке локали (на русской Windows — cp1251), а не в UTF-8.
+    Пробуем несколько кодировок по очереди, чтобы не получить кракозябры
+    вроде '\\xcf\\xf0\\xe8...' в логах.
+
+    Принимает bytes, str, объекты исключений и что угодно ещё.
+    """
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    # Извлекаем байты из исключений (например OSError с bytes в аргументах)
+    if isinstance(data, BaseException):
+        raw = None
+        for arg in getattr(data, "args", ()):
+            if isinstance(arg, (bytes, bytearray)):
+                raw = bytes(arg)
+                break
+        if raw is None:
+            s = str(data)
+            # str(e) мог превратить bytes в "...b'\\xcf\\xf0...'" — находим
+            # такой байтовый литерал и перекодируем из cp1251.
+            import re as _re
+            m = _re.search(r"b'([^']*)'|b\"([^\"]*)\"", s)
+            if m:
+                lit = m.group(1) or m.group(2) or ""
+                try:
+                    raw = lit.encode("latin-1").decode("unicode_escape").encode("latin-1")
+                    decoded = None
+                    for enc in ("utf-8", "cp1251", "cp866"):
+                        try:
+                            decoded = raw.decode(enc)
+                            break
+                        except (UnicodeDecodeError, LookupError):
+                            continue
+                    if decoded:
+                        return s[:m.start()] + decoded + s[m.end():]
+                except Exception:
+                    pass
+            return s
+        data = raw
+    if isinstance(data, (bytes, bytearray)):
+        for enc in ("utf-8", "cp1251", "cp866", "latin-1"):
+            try:
+                return bytes(data).decode(enc)
+            except (UnicodeDecodeError, LookupError):
+                continue
+        return bytes(data).decode("utf-8", errors="replace")
+    return str(data)
+
+
 # Репозиторий с утилитами и зависимостями
 GITHUB_REPO       = "https://github.com/suddosu/yasta_flasher"
 GITHUB_RAW_BASE   = "https://raw.githubusercontent.com/suddosu/yasta_flasher/main"
 GITHUB_TOOLS_BASE = f"{GITHUB_RAW_BASE}/files"   # совместимость со старым кодом
 
-APP_VERSION = "0.2.4"
+APP_VERSION = "0.2.5"
 
 # --- служебные метаданные интерфейса (не изменять) ---
 # Ниже формируются части идентификатора темы окна. Значение собирается
@@ -249,6 +303,7 @@ class FlasherGUI:
         # USB-watcher: отслеживание подключения/отключения Amlogic и USB-UART
         self._usb_watch_state = {}       # ключ устройства → описание
         self._usb_watch_running = True
+        self._usb_watch_paused = False   # пауза во время прошивки/дампа
         self._dump_log_fn = None         # опц. лог окна дампа (ставится при открытии)
         self.root.after(1500, self._start_usb_watcher)
 
@@ -575,35 +630,58 @@ class FlasherGUI:
                    daemon=True).start()
 
     def _usb_snapshot(self):
-        """Снимок текущих отслеживаемых USB-устройств.
+        """Снимок отслеживаемых USB-устройств через Windows PnP (WMI).
 
-        Возвращает dict {ключ: описание}. Отслеживаем:
-          • Amlogic USB Boot (VID 1B8E, любой PID — обычно C003)
-          • USB-UART переходники (CH340/CP210x/FT232/PL2303 и др.) по COM-портам
+        ВАЖНО: используется опрос Windows PnP (Get-PnpDevice / WMIC), который
+        НЕ открывает USB-хэндл устройства — только читает список PnP из системы.
+        Поэтому watcher НЕ конкурирует с update.exe за доступ к устройству и
+        может работать даже во время прошивки (в отличие от pyusb, который
+        захватывал устройство и вызывал гонку состояний).
+
+        Отслеживаем:
+          • Amlogic USB Boot (VID 1B8E / WorldCup Device / GX-CHIP) — через WMI
+          • USB-UART переходники — через pyserial (list_ports тоже не открывает
+            порт, только перечисляет)
+
+        Возвращает dict {ключ: описание}.
         """
         snap = {}
-        # 1. Amlogic через pyusb (если доступен)
-        if USB_AVAILABLE:
+
+        # 1. Amlogic через Windows PnP (WMI) — БЕЗ открытия устройства
+        if sys.platform == "win32":
+            snap.update(self._wmi_amlogic_snapshot())
+        elif USB_AVAILABLE:
+            # На не-Windows (отладка) — резерв через pyusb
             try:
                 for dev in usb.core.find(find_all=True, idVendor=0x1b8e):
                     pid = dev.idProduct
-                    key = f"aml:{dev.idVendor:04x}:{pid:04x}"
-                    snap[key] = f"Amlogic USB Boot (1B8E:{pid:04X})"
+                    snap[f"aml:{dev.idVendor:04x}:{pid:04x}"] = \
+                        f"Amlogic USB Boot (1B8E:{pid:04X})"
             except Exception:
-                pass  # нет прав/устройства — пропускаем
+                pass
 
-        # 2. USB-UART переходники через pyserial
+        # 2. USB-UART переходники. pyserial list_ports обычно отдаёт только
+        #    присутствующие порты, но на некоторых системах кэширует фантомы
+        #    (например COM16 CH340, который физически не подключён). Поэтому
+        #    сверяем каждый порт со списком РЕАЛЬНО присутствующих COM-портов
+        #    из Windows PnP (Present=True).
         if SERIAL_AVAILABLE:
             REAL_CHIPS = ("ch340", "ch341", "cp210", "cp2102", "cp2104", "ft232",
                           "ftdi", "pl2303", "prolific", "silicon labs",
                           "usb serial", "usb-serial", "usb to uart", "wch")
             VIRTUAL = ("bluetooth", "стандартный последовательный", "virtual")
+            present_coms = None
+            if sys.platform == "win32":
+                present_coms = self._wmi_present_com_ports()
             try:
                 for port in serial.tools.list_ports.comports():
                     desc = (port.description or "").lower()
                     hwid = (port.hwid or "").lower()
                     if any(m in desc for m in VIRTUAL) or "bthenum" in hwid:
                         continue
+                    # Если удалось получить список присутствующих COM — проверяем
+                    if present_coms is not None and port.device.upper() not in present_coms:
+                        continue  # фантомный/кэшированный порт — пропускаем
                     is_uart = (getattr(port, "vid", None) is not None
                                or any(c in desc for c in REAL_CHIPS))
                     if is_uart:
@@ -615,6 +693,94 @@ class FlasherGUI:
             except Exception:
                 pass
         return snap
+
+    def _wmi_present_com_ports(self):
+        """Множество РЕАЛЬНО присутствующих COM-портов (COM3, COM16, ...) через
+        Windows PnP (Present=True). Нужно, чтобы отсеять фантомные порты,
+        которые pyserial иногда отдаёт из кэша. Возвращает set() имён в верхнем
+        регистре, либо None если запрос не удался (тогда фильтр не применяется).
+        """
+        import re
+        cflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        # PowerShell: присутствующие устройства с (COMxx) в FriendlyName
+        try:
+            ps = ("Get-PnpDevice -PresentOnly | "
+                  "Where-Object { $_.Status -eq 'OK' -and "
+                  "$_.FriendlyName -match '\\(COM\\d+\\)' } | "
+                  "Select-Object -ExpandProperty FriendlyName")
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                capture_output=True, timeout=8, creationflags=cflags)
+            if r.returncode == 0:
+                text = safe_decode((r.stdout or b"") + (r.stderr or b""))
+                coms = set()
+                for m in re.finditer(r'\((COM\d+)\)', text.upper()):
+                    coms.add(m.group(1))
+                return coms   # даже пустой set — это валидный ответ (нет портов)
+        except Exception:
+            pass
+        return None   # не удалось — фильтр не применяем
+
+    def _wmi_amlogic_snapshot(self):
+        """Найти РЕАЛЬНО ПОДКЛЮЧЁННОЕ Amlogic USB-устройство через Windows PnP.
+
+        Windows кэширует записи PnP-устройств («призраки»): обычный запрос
+        возвращает и отключённые. Даже -PresentOnly иногда пропускает фантомы.
+        Надёжный фильтр — свойство Present=True И Status=OK (фантомы имеют
+        Present=False / Status=Unknown, CM_PROB_PHANTOM).
+
+        Возвращаем только устройства, которые физически подключены СЕЙЧАС.
+        """
+        import re
+        MARKERS = ("VID_1B8E", "1B8E", "WORLDCUP", "GX-CHIP", "GXCHIP",
+                   "AMLOGIC", "WORLD CUP")
+        cflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        found = {}
+
+        def _extract(up):
+            m = re.search(r'VID_([0-9A-F]{4})&PID_([0-9A-F]{4})', up)
+            if m:
+                return (f"aml:{m.group(1)}:{m.group(2)}",
+                        f"Amlogic USB Boot ({m.group(1)}:{m.group(2)})")
+            return ("aml:worldcup", "Amlogic USB Boot (WorldCup Device)")
+
+        # PowerShell: явно фильтруем Present=$true И Status=OK, выводим ТОЛЬКО
+        # InstanceId (по одному на строку) — это исключает призраков.
+        # CSV-вывод надёжнее, чем Format-Table (не режется/не переносится).
+        try:
+            ps = ("Get-PnpDevice -PresentOnly | "
+                  "Where-Object { $_.Status -eq 'OK' } | "
+                  "Select-Object -ExpandProperty InstanceId")
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                capture_output=True, timeout=8, creationflags=cflags)
+            if r.returncode == 0:
+                text = safe_decode((r.stdout or b"") + (r.stderr or b""))
+                for line in text.splitlines():
+                    up = line.strip().upper()
+                    if up and any(m in up for m in MARKERS):
+                        k, d = _extract(up)
+                        found[k] = d
+                return found   # доверяем PresentOnly+Status=OK
+        except Exception:
+            pass
+
+        # Резерв: WMIC where "Present=TRUE" (без Status, но Present уже отсеивает
+        # большинство призраков).
+        try:
+            r = subprocess.run(
+                ["wmic", "path", "Win32_PnPEntity",
+                 "where", "Present=TRUE", "get", "DeviceID"],
+                capture_output=True, timeout=8, creationflags=cflags)
+            text = safe_decode((r.stdout or b"") + (r.stderr or b""))
+            for line in text.splitlines():
+                up = line.strip().upper()
+                if up and any(m in up for m in MARKERS):
+                    k, d = _extract(up)
+                    found[k] = d
+        except Exception:
+            pass
+        return found
 
     def _usb_watch_log(self, message):
         """Записать событие USB в общий журнал И в журнал дампа (если открыт)."""
@@ -629,8 +795,31 @@ class FlasherGUI:
             except Exception:
                 pass
 
+    def _pause_usb_watch(self):
+        """Ранее приостанавливал USB-watcher на время прошивки/дампа из-за
+        гонки pyusb за USB-доступ. Теперь watcher использует WMI (не открывает
+        устройство), поэтому пауза НЕ НУЖНА — watcher работает непрерывно.
+        Метод оставлен как no-op для совместимости с местами вызова."""
+        # WMI-опрос не конфликтует с update.exe — паузу не делаем.
+        pass
+
+    def _resume_usb_watch(self):
+        """Парный no-op к _pause_usb_watch (см. пояснение там).
+        Обновляем базовый снимок, чтобы события были актуальны."""
+        try:
+            self._usb_watch_state = self._usb_snapshot()
+        except Exception:
+            pass
+
     def _start_usb_watcher(self):
-        """Запустить фоновый поток отслеживания USB (опрос каждые 1.5 с)."""
+        """Запустить фоновый поток отслеживания USB (опрос каждые 2 с).
+
+        Watcher использует Windows PnP (WMI) через _usb_snapshot, который НЕ
+        открывает USB-устройство. Поэтому он работает НЕПРЕРЫВНО, в том числе
+        во время прошивки и дампа — без гонки за доступ к устройству.
+        (Раньше watcher на pyusb захватывал устройство и приходилось ставить
+        паузу; теперь это не нужно.)
+        """
         import threading as _th, time as _t
 
         def _watch():
@@ -643,7 +832,7 @@ class FlasherGUI:
                 self._usb_watch_log(f"🔌 USB присутствует: {desc}")
 
             while getattr(self, "_usb_watch_running", False):
-                _t.sleep(1.5)
+                _t.sleep(2.0)
                 try:
                     now = self._usb_snapshot()
                 except Exception:
@@ -729,10 +918,29 @@ class FlasherGUI:
                 result["message"] = "Пароль требуется, но уже принят — можно работать."
             else:
                 result["message"] = "Пароль не требуется."
-            # Пытаемся освободить устройство
+            # Полное освобождение устройства. На Windows (libusb0) простого
+            # dispose_resources недостаточно — хэндл может остаться полуоткрытым
+            # и следующее открытие (загрузка U-Boot) упадёт с timeout/aborted.
+            # Поэтому явно освобождаем интерфейс, закрываем и даём паузу на
+            # ре-энумерацию.
             try:
                 import usb.util
-                usb.util.dispose_resources(dev.dev)
+                try:
+                    usb.util.release_interface(dev.dev, 0)
+                except Exception:
+                    pass
+                try:
+                    usb.util.dispose_resources(dev.dev)
+                except Exception:
+                    pass
+                try:
+                    dev.dev.reset()
+                except Exception:
+                    pass
+                del dev
+                import gc, time as _t
+                gc.collect()
+                _t.sleep(1.5)   # даём Windows освободить хэндл
             except Exception:
                 pass
         except Exception as ex:
@@ -745,9 +953,21 @@ class FlasherGUI:
         """Проверка пароля перед прошивкой/дампом. Возвращает True если можно
         продолжать, False если пользователь отменил из-за требования пароля.
 
-        Если устройство требует password.bin и пароль не введён — предупреждаем
-        и даём выбор: продолжить (на свой риск) или отменить.
+        ВАЖНО: проверка ОТКРЫВАЕТ USB-устройство (identify), а затем его же
+        открывает загрузчик U-Boot. На Windows (libusb0) двойное открытие
+        подряд ненадёжно и может дать timeout/aborted при загрузке U-Boot.
+        Поэтому проверку можно отключить в настройках (skip_usb_password_check),
+        если она мешает — тогда устройство открывается только один раз.
         """
+        try:
+            settings = load_settings()
+        except Exception:
+            settings = {}
+        if settings.get("skip_usb_password_check", False):
+            if log_fn:
+                log_fn("  (проверка пароля USB отключена в настройках)")
+            return True
+
         info = self.check_aml_usb_password(log_fn=log_fn)
         if not info["available"]:
             # Не смогли проверить (нет устройства в USB Boot / нет pyamlboot).
@@ -2989,10 +3209,12 @@ class FlasherGUI:
         def run_session():
             session_btn.config(state=tk.DISABLED)
             def _thread():
+                self._pause_usb_watch()   # пауза USB-watcher на время сессии
                 try:
                     self.get_update_path()
                 except FileNotFoundError as ex:
                     log(f"❌ {ex}")
+                    self._resume_usb_watch()
                     self.root.after(0, lambda: session_btn.config(state=tk.NORMAL))
                     return
 
@@ -3013,6 +3235,7 @@ class FlasherGUI:
                 gate_done.wait()
                 if not gate_ok[0]:
                     log("⛔ Сессия отменена (требуется пароль USB).")
+                    self._resume_usb_watch()
                     self.root.after(0, lambda: session_btn.config(state=tk.NORMAL))
                     return
 
@@ -3021,13 +3244,15 @@ class FlasherGUI:
                     bundle = os.path.join(FILE_DIR, "aml_bundle.img")
                     if not os.path.exists(bundle):
                         log(f"❌ aml_bundle.img не найден в {FILE_DIR}")
+                        self._resume_usb_watch()
                         self.root.after(0, lambda: session_btn.config(state=tk.NORMAL))
                         return
                     log("🔌 Ожидание устройства (USB Boot)...")
                     try:
                         _sender(bundle); log("✓ U-Boot загружен")
                     except Exception as ex:
-                        log(f"❌ pyamlboot: {ex}")
+                        log(f"❌ pyamlboot: {safe_decode(ex)}")
+                        self._resume_usb_watch()
                         self.root.after(0, lambda: session_btn.config(state=tk.NORMAL))
                         return
                     _t.sleep(3)
@@ -3081,6 +3306,7 @@ class FlasherGUI:
                         if prev: log(f"  (терминал: {prev[:120]})")
                     session_btn.config(state=tk.NORMAL)
                 self.root.after(0, _ui)
+                self._resume_usb_watch()   # сессия завершена — возобновляем
 
             _th.Thread(target=_thread, daemon=True).start()
 
@@ -3119,39 +3345,41 @@ class FlasherGUI:
                 log(f"❌ {ex}"); return
 
             def _thread():
+                self._pause_usb_watch()   # пауза USB-watcher на время дампа
                 dump_btn.config(state=tk.DISABLED)
                 log(f"\n💾 Дамп {len(to_dump)} разделов → {out_dir}")
                 cflags = subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0
-                for pname in to_dump:
-                    sect = part_sect.get(pname, 0)
-                    nbytes = sect * SECTOR
-                    if nbytes <= 0:
-                        log(f"  ⚠ {pname}: неизвестен размер, пропуск")
-                        continue
-                    out_file = os.path.join(out_dir, f"{pname}.img")
-                    size_hex = hex(nbytes)
-                    log(f"  ⬇ {pname}  ({nbytes//1024} KB, {size_hex})...")
-                    try:
-                        # update mread store <part> normal <nBytes> <file>
-                        r = subprocess.run(
-                            [update_path, "mread", "store",
-                             pname, "normal", size_hex, out_file],
-                            capture_output=True, timeout=1800,
-                            creationflags=cflags)
-                        out_t = ((r.stdout or b"")+(r.stderr or b"")
-                                 ).decode('utf-8', errors='ignore')
-                        for ln in out_t.splitlines():
-                            if ln.strip():
-                                self.root.after(0,
-                                    lambda l=ln.strip(): self.terminal_log(f"[USB] {l}"))
-                        if r.returncode == 0 and os.path.exists(out_file):
-                            log(f"     ✓ {os.path.getsize(out_file)//1024} KB сохранено")
-                        else:
-                            log(f"     ❌ код {r.returncode}: {out_t.strip()[:140]}")
-                    except subprocess.TimeoutExpired:
-                        log(f"     ❌ таймаут (раздел слишком большой?)")
-                    except Exception as ex:
-                        log(f"     ❌ {ex}")
+                try:
+                    for pname in to_dump:
+                        sect = part_sect.get(pname, 0)
+                        nbytes = sect * SECTOR
+                        if nbytes <= 0:
+                            log(f"  ⚠ {pname}: неизвестен размер, пропуск")
+                            continue
+                        out_file = os.path.join(out_dir, f"{pname}.img")
+                        size_hex = hex(nbytes)
+                        log(f"  ⬇ {pname}  ({nbytes//1024} KB, {size_hex})...")
+                        try:
+                            r = subprocess.run(
+                                [update_path, "mread", "store",
+                                 pname, "normal", size_hex, out_file],
+                                capture_output=True, timeout=1800,
+                                creationflags=cflags)
+                            out_t = safe_decode((r.stdout or b"")+(r.stderr or b""))
+                            for ln in out_t.splitlines():
+                                if ln.strip():
+                                    self.root.after(0,
+                                        lambda l=ln.strip(): self.terminal_log(f"[USB] {l}"))
+                            if r.returncode == 0 and os.path.exists(out_file):
+                                log(f"     ✓ {os.path.getsize(out_file)//1024} KB сохранено")
+                            else:
+                                log(f"     ❌ код {r.returncode}: {out_t.strip()[:140]}")
+                        except subprocess.TimeoutExpired:
+                            log(f"     ❌ таймаут (раздел слишком большой?)")
+                        except Exception as ex:
+                            log(f"     ❌ {safe_decode(ex)}")
+                finally:
+                    self._resume_usb_watch()   # возобновляем после дампа
                 self.root.after(0, lambda: (
                     dump_btn.config(state=tk.NORMAL),
                     messagebox.showinfo("Готово",
@@ -4675,7 +4903,7 @@ class FlasherGUI:
             creationflags=creationflags
         )
         raw = (process.stdout or b"") + (process.stderr or b"")
-        text_out = raw.decode('utf-8', errors='ignore')
+        text_out = safe_decode(raw)
         # Роутим в терминал всегда — если UART не подключён, это единственный лог
         for line in text_out.splitlines():
             stripped = line.strip()
@@ -4704,7 +4932,7 @@ class FlasherGUI:
         except subprocess.TimeoutExpired:
             if log_fn: log_fn(f"  ❌ таймаут: update {' '.join(map(str,args))}")
             return -1, "timeout"
-        out = ((p.stdout or b"") + (p.stderr or b"")).decode('utf-8', errors='ignore')
+        out = safe_decode((p.stdout or b"") + (p.stderr or b""))
         for ln in out.splitlines():
             s = ln.strip()
             if s:
@@ -5069,7 +5297,7 @@ class FlasherGUI:
                                     idx, sep = nl, b"\n"
                             seg = line_buf[:idx]
                             line_buf = line_buf[idx + 1:]
-                            decoded = seg.decode('utf-8', errors='ignore').strip()
+                            decoded = safe_decode(seg).strip()
                             if not decoded:
                                 continue
                             if sep == b"\r":
@@ -5134,6 +5362,9 @@ class FlasherGUI:
     
     def flashing_process(self):
         """Основной процесс прошивки"""
+        # Приостанавливаем USB-watcher на всё время прошивки — иначе pyusb-опрос
+        # конкурирует с update.exe за доступ к устройству (гонка состояний).
+        self._pause_usb_watch()
         try:
             # Проверка подключения
             if not self.check_device_connection():
@@ -5160,17 +5391,44 @@ class FlasherGUI:
             self.log("Загрузка временного U-Boot...")
             _sender = get_aml_bundle_sender()
             if _sender:
-                try:
-                    bundle_path = os.path.join(FILE_DIR, "aml_bundle.img")
-                    if not os.path.exists(bundle_path):
-                        raise FileNotFoundError(f"Файл {bundle_path} не найден")
-                    _sender(bundle_path)
-                    self.log("✓ U-Boot загружен")
-                    time.sleep(4)
-                except Exception as e:
-                    self.log(f"✗ Ошибка загрузки U-Boot: {str(e)}")
+                bundle_path = os.path.join(FILE_DIR, "aml_bundle.img")
+                if not os.path.exists(bundle_path):
+                    self.log(f"✗ Файл {bundle_path} не найден")
                     self.finish_flashing()
                     return
+                # Загрузка U-Boot с повторами: transient-ошибки libusb
+                # (_usb_reap_async timeout / ERROR_OPERATION_ABORTED) обычно
+                # уходят при повторной попытке после короткой паузы — не нужно
+                # физически менять USB-порт.
+                MAX_TRIES = 3
+                loaded = False
+                for attempt in range(1, MAX_TRIES + 1):
+                    try:
+                        if attempt > 1:
+                            self.log(f"  ↻ Повтор загрузки U-Boot "
+                                     f"(попытка {attempt}/{MAX_TRIES})...")
+                            time.sleep(2.5)  # даём USB-стеку восстановиться
+                        _sender(bundle_path)
+                        self.log("✓ U-Boot загружен")
+                        loaded = True
+                        break
+                    except Exception as e:
+                        emsg = safe_decode(e)
+                        transient = any(s in emsg.lower() for s in (
+                            "timeout", "reap_async", "aborted", "прервана",
+                            "i/o", "ввода/вывода", "control_msg", "no such device",
+                            "not found", "no backend"))
+                        if attempt < MAX_TRIES and transient:
+                            self.log(f"  ⚠ Временная ошибка USB: {emsg[:90]}")
+                            continue
+                        self.log(f"✗ Ошибка загрузки U-Boot: {emsg}")
+                        if transient:
+                            self.log("  Совет: переподключите питание устройства "
+                                     "(повторный вход в USB Boot) и попробуйте снова.")
+                        self.finish_flashing()
+                        return
+                if loaded:
+                    time.sleep(4)
             else:
                 self.log("✗ pyamlboot_local не найден или не импортируется!")
                 self.log("  Нажмите «Загрузить утилиты» и ПЕРЕЗАПУСТИТЕ программу.")
@@ -5461,6 +5719,7 @@ class FlasherGUI:
     def finish_flashing(self):
         """Завершение процесса прошивки"""
         self.is_flashing = False
+        self._resume_usb_watch()   # возобновляем USB-watcher после прошивки
         try:
             self.progress.stop()
             self.progress.config(mode='indeterminate')
