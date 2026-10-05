@@ -1,12 +1,23 @@
 """
 Графический инсталлятор прошивки для Yandex Station Max (Amlogic S905X2)
-Версия для Windows с автозагрузкой утилит и COM терминалом
+Кроссплатформенная версия (Windows + macOS) с автозагрузкой утилит и COM терминалом
 
 ТРЕБОВАНИЯ:
 1. Python 3.7+
 2. pip install pyusb        (обнаружение Amlogic по USB, загрузка U-Boot)
 3. pip install pyamlboot    (загрузка временного U-Boot)
 4. pip install pyserial     (для COM терминала, опционально)
+5. pip install certifi      (SSL-сертификаты; на macOS необязательно —
+                             используется системный /etc/ssl/cert.pem)
+
+macOS (дополнительно):
+- Утилиты прошивки update / aml_image_v2_packer скачиваются автоматически
+  из khadas/utils (aml-flash-tool/tools/macos) в files/macos/.
+- update требует libusb-0.1.4.dylib: скрипт сам найдёт/скачает её или
+  предложит: brew install libusb-compat
+- Для pyusb/pyamlboot (загрузка U-Boot) нужен libusb 1.0: brew install libusb
+- Консольные утилиты образов: brew install e2fsprogs simg2img
+  (MIK — Windows-бинарники, на macOS не используется)
 
 ВОЗМОЖНОСТИ:
 - Автоматическая загрузка утилит из GitHub
@@ -14,25 +25,22 @@
 - COM терминал (UART) для мониторинга в реальном времени
 - Работа с переменными окружения (ENV)
 - Детальное логирование процесса
+- Переключатель темы (системная/светлая/тёмная) — «Тема» слева вверху
 
 COM ТЕРМИНАЛ:
 - Подключите USB-UART преобразователь (CH340, CP2102, FT232 и т.д.)
 - Подключите к пинам TX/RX/GND сервисной колодки
 - Скорость: 115200 бод, 8N1
-- В программе выберите COM порт и нажмите "Подключить"
+- В программе выберите порт (/dev/cu.usbserial-* на macOS, COMx на Windows)
+  и нажмите "Подключить"
 - Вы увидите вывод U-Boot и процесс загрузки системы
 
 АВТОМАТИЧЕСКАЯ ЗАГРУЗКА:
 Программа автоматически загрузит необходимые утилиты из GitHub:
-- update.exe (утилита прошивки Amlogic)
-- aml_image_v2_packer (упаковщик образов)
+- Windows: update.exe (aml-flash-tool/tools/windows)
+- macOS:   update, aml_image_v2_packer (aml-flash-tool/tools/macos)
 
-Источник: https://github.com/khadas/utils/tree/master/aml-flash-tool/tools/windows
-
-ДОПОЛНИТЕЛЬНЫЕ БИБЛИОТЕКИ (опционально):
-Если update.exe не запустится, может потребоваться:
-- Microsoft Visual C++ 2010 Redistributable Package
-  (обычно уже установлен в Windows)
+Источник: https://github.com/khadas/utils/tree/master/aml-flash-tool
 
 НЕОБХОДИМЫЕ ФАЙЛЫ (нужно подготовить вручную):
 
@@ -64,6 +72,7 @@ import sys
 import subprocess
 import time
 import threading
+import shutil
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
@@ -72,6 +81,44 @@ import urllib.request
 import urllib.error
 import zipfile
 import tempfile
+import ssl
+
+# ── SSL: корректные CA-сертификаты на любой платформе ────────────────────────
+# На macOS сборки Python с python.org не видят системные корневые сертификаты
+# (пустые verify paths) → все HTTPS-запросы к GitHub падают с
+# CERTIFICATE_VERIFY_FAILED. Собираем контекст с явным CA-bundle:
+# certifi (если установлен) → системный /etc/ssl/cert.pem → системные пути.
+_IS_MAC = (sys.platform == "darwin")
+
+def _build_ssl_context():
+    try:
+        ctx = ssl.create_default_context()
+        if ctx.get_ca_certs():
+            return ctx   # системные сертификаты найдены — ничего не нужно
+    except Exception:
+        ctx = ssl.create_default_context()
+    for cafile in ("/etc/ssl/cert.pem", "/etc/ssl/certificates.pem"):
+        try:
+            if os.path.exists(cafile):
+                ctx.load_verify_locations(cafile)
+                break
+        except Exception:
+            continue
+    try:
+        import certifi
+        ctx.load_verify_locations(certifi.where())
+    except Exception:
+        pass
+    return ctx
+
+_SSL_CONTEXT = _build_ssl_context()
+
+_URL_OPENER = urllib.request.build_opener(
+    urllib.request.HTTPSHandler(context=_SSL_CONTEXT))
+
+def url_open(req, timeout=60):
+    """urllib.request.urlopen с корректным SSL-контекстом (см. _build_ssl_context)."""
+    return _URL_OPENER.open(req, timeout=timeout)
 
 # Импорт для работы с COM портами
 try:
@@ -115,9 +162,94 @@ def get_aml_bundle_sender():
     except Exception:
         return None
 
-ROOT_DIR = os.getcwd()
+def _resolve_root_dir():
+    """Папка рабочих данных (files/, images-bkp/, настройки).
+
+    На Windows поведение прежнее — папка запуска. Отличия нужны только
+    для macOS-сборки .app: при двойном клике cwd = '/', поэтому:
+      1) явный путь из переменной окружения YASTA_DIR;
+      2) frozen-сборка (PyInstaller) → ~/Library/Application Support/YastaFlasher;
+      3) обычный запуск из исходника → папка gui.py.
+    """
+    env_dir = os.environ.get("YASTA_DIR")
+    if env_dir:
+        return os.path.abspath(env_dir)
+    if getattr(sys, "frozen", False):
+        if _IS_MAC or sys.platform == "linux":
+            app_dir = os.path.join(os.path.expanduser("~"),
+                                   "Library", "Application Support", "YastaFlasher")
+            try:
+                os.makedirs(app_dir, exist_ok=True)
+                return app_dir
+            except Exception:
+                pass
+        return os.path.dirname(os.path.abspath(sys.executable))
+    # Запуск из исходника: папка, где лежит gui.py (а не cwd — cwd может быть
+    # любым, если скрипт запустили по абсолютному пути из другого места).
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.getcwd()
+
+ROOT_DIR = _resolve_root_dir()
 FILE_DIR = os.path.join(ROOT_DIR, "files")
 IMG_DIR = os.path.join(ROOT_DIR, "images-bkp")
+
+
+# ── pyusb на macOS: принудительный бэкенд libusb-1.0 ────────────────────────
+# Без Homebrew на маке нет libusb-1.0, и pyusb падает NoBackendError —
+# прошивальщик не видит Amlogic. Мы бандлим dylib в files/macos/lib/ и
+# подселяем её pyusb через кастомный find_library.
+_USB_BACKEND_SENTINEL = object()
+_USB_BACKEND = _USB_BACKEND_SENTINEL
+
+def _macos_libusb1_path():
+    """Путь к libusb-1.0.0.dylib: наш бандл или Homebrew."""
+    for p in (os.path.join(FILE_DIR, "macos", "lib", "libusb-1.0.0.dylib"),
+              "/opt/homebrew/opt/libusb/lib/libusb-1.0.0.dylib",
+              "/usr/local/opt/libusb/lib/libusb-1.0.0.dylib"):
+        if os.path.exists(p):
+            return p
+    return None
+
+def _get_usb_backend():
+    """pyusb-бэкенд libusb1 с нашей dylib (None — если ничего не нашлось)."""
+    global _USB_BACKEND
+    if _USB_BACKEND is not _USB_BACKEND_SENTINEL:
+        return _USB_BACKEND
+    if not _IS_MAC:
+        _USB_BACKEND = None
+        return None
+    try:
+        import usb.backend.libusb1 as _lb1
+        lib = _macos_libusb1_path()
+        _USB_BACKEND = (_lb1.get_backend(find_library=lambda x: lib)
+                        if lib else None)
+    except Exception:
+        _USB_BACKEND = None
+    return _USB_BACKEND
+
+def _patch_usb_core_find():
+    """Обернуть usb.core.find так, чтобы бэкенд подставлялся всем вызовам —
+    и в gui.py, и внутри pyamlboot_local (он зовёт usb.core.find сам)."""
+    try:
+        import usb.core
+        if getattr(usb.core, "_yasta_backend_patched", False):
+            return
+        _orig_find = usb.core.find
+
+        def _find_with_backend(*a, **kw):
+            be = _get_usb_backend()
+            if be is not None and "backend" not in kw:
+                kw["backend"] = be
+            return _orig_find(*a, **kw)
+
+        usb.core.find = _find_with_backend
+        usb.core._yasta_backend_patched = True
+    except Exception:
+        pass
+
+_patch_usb_core_find()
 
 # Файл настроек приложения (рядом с gui.py)
 SETTINGS_FILE = os.path.join(ROOT_DIR, "flasher_settings.json")
@@ -202,7 +334,7 @@ GITHUB_REPO       = "https://github.com/suddosu/yasta_flasher"
 GITHUB_RAW_BASE   = "https://raw.githubusercontent.com/suddosu/yasta_flasher/main"
 GITHUB_TOOLS_BASE = f"{GITHUB_RAW_BASE}/files"   # совместимость со старым кодом
 
-APP_VERSION = "0.2.5"
+APP_VERSION = "0.2.5.1"
 
 # --- служебные метаданные интерфейса (не изменять) ---
 # Ниже формируются части идентификатора темы окна. Значение собирается
@@ -232,6 +364,253 @@ def _validate_ui_theme():
     if sig != GITHUB_REPO.replace("http://", "https://"):
         raise SystemExit("UI theme signature mismatch: palette cannot be initialized.")
     return sig
+
+
+# ── Тема интерфейса (светлая / тёмная / системная) ──────────────────────────
+# На macOS в тёмном режиме системы часть виджетов tk.* остаётся светлой,
+# поэтому палитра задаётся ЯВНО для всех виджетов. Настройка ui_theme хранится
+# в flasher_settings.json: "system" | "light" | "dark".
+
+UI_PALETTES = {
+    "light": {
+        "bg":       "#F0F0F0",   # окна, фреймы
+        "bg_alt":   "#FAFAFA",   # Labelframe, выпадающие списки
+        "fg":       "#1A1A1A",
+        "entry_bg": "#FFFFFF",
+        "entry_fg": "#1A1A1A",
+        "log_bg":   "#FFFFFF",   # логи / терминал
+        "log_fg":   "#1A1A1A",
+    },
+    "dark": {
+        "bg":       "#232323",
+        "bg_alt":   "#2B2B2B",
+        "fg":       "#E8E8E8",
+        "entry_bg": "#1A1A1A",
+        "entry_fg": "#E8E8E8",
+        "log_bg":   "#141414",
+        "log_fg":   "#D6D6D6",
+    },
+}
+
+def _macos_system_is_dark():
+    """Тёмный ли сейчас режим системы на macOS (defaults read -g AppleInterfaceStyle)."""
+    if not _IS_MAC:
+        return False
+    try:
+        r = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"],
+                           capture_output=True, timeout=2)
+        return b"Dark" in r.stdout or b"dark" in r.stdout
+    except Exception:
+        return False
+
+
+def _norm_tk_color(color_str, widget):
+    """Нормализовать Tk-цвет ('systemButtonFace', '#f0f0f0', 'white') к rgb."""
+    if color_str is None or widget is None:
+        return None
+    try:
+        r, g, b = widget.winfo_rgb(color_str)
+        return (r >> 8, g >> 8, b >> 8)
+    except Exception:
+        return None
+
+
+def apply_theme_to_window(win, pal):
+    """Рекурсивно применить палитру pal ко всем tk.*-виджетам окна win.
+
+    Виджеты с ЯВНО заданным в коде цветом (заголовок #2C3E50, зелёные кнопки
+    и т.п.) не перекрашиваются: цвет виджета считается «явным», если он
+    отличается от системного дефолта И виджет ещё не красился темизатором.
+    ttk-виджеты (класс начинается с 'T') на aqua/win адаптируются системой
+    сами — их не трогаем.
+    """
+    if not win.winfo_exists():
+        return
+    try:
+        probe_f = tk.Frame(win)
+        probe_l = tk.Label(win)
+        probe_b = tk.Button(win)
+        probe_e = tk.Entry(win)
+        def_bg = _norm_tk_color(probe_f.cget("bg"), probe_f)      # дефолтный фон Frame/окна
+        def_fg = _norm_tk_color(probe_l.cget("fg"), probe_l)      # дефолтный цвет текста
+        def_btn_bg = _norm_tk_color(probe_b.cget("bg"), probe_b)  # дефолтный фон кнопки
+        def_entry_bg = _norm_tk_color(probe_e.cget("bg"), probe_e)
+        for p in (probe_f, probe_l, probe_b, probe_e):
+            p.destroy()
+    except Exception:
+        return
+
+    def _is_default(cur, probe):
+        if cur is None or probe is None:
+            return False
+        n = _norm_tk_color(cur, win)
+        if n is None:
+            return False   # не смогли сравнить — не трогаем (вероятно явный)
+        return n == probe
+
+    try:
+        win.configure(bg=pal["bg"])
+    except Exception:
+        pass
+
+    def walk(w):
+        for child in w.winfo_children():
+            try:
+                cls = child.winfo_class()
+            except Exception:
+                continue
+            if cls.startswith("T"):        # ttk.*
+                walk(child)
+                continue
+            cur_bg = cur_fg = None
+            try:
+                cur_bg = child.cget("bg")
+            except Exception:
+                pass
+            try:
+                cur_fg = child.cget("fg")
+            except Exception:
+                pass
+            bg_fixed = (cur_bg is not None
+                        and not _is_default(cur_bg, def_bg)
+                        and not _is_default(cur_bg, def_btn_bg)
+                        and not _is_default(cur_bg, def_entry_bg)
+                        and not getattr(child, "_themed_bg", None))
+            fg_fixed = (cur_fg is not None
+                        and not _is_default(cur_fg, def_fg)
+                        and not getattr(child, "_themed_fg", None))
+            try:
+                if cls in ("Frame", "Labelframe", "Toplevel"):
+                    if not bg_fixed:
+                        child.configure(bg=pal["bg"])
+                        child._themed_bg = pal["bg"]
+                elif cls == "Label":
+                    if not bg_fixed:
+                        child.configure(bg=pal["bg"])
+                        child._themed_bg = pal["bg"]
+                    if not fg_fixed:
+                        child.configure(fg=pal["fg"])
+                        child._themed_fg = pal["fg"]
+                elif cls == "Button":
+                    if _IS_MAC:
+                        # Aqua рисует tk.Button нативно: -background
+                        # ИГНОРИРУЕТСЯ (кнопка остаётся белой), а светлый
+                        # -foreground (тематический или явный fg="white")
+                        # даёт белый текст на белой кнопке. Поэтому на macOS
+                        # текст кнопки всегда тёмный, а highlightbackground
+                        # подгоняем под фон окна (убирает светлый ореол).
+                        try:
+                            child.configure(
+                                fg="#1A1A1A", activeforeground="#1A1A1A",
+                                highlightbackground=pal["bg"],
+                                highlightcolor=pal["bg"])
+                        except Exception:
+                            pass
+                    else:
+                        if not bg_fixed:
+                            child.configure(bg=pal["bg"],
+                                            activebackground=pal["bg_alt"])
+                            child._themed_bg = pal["bg"]
+                        if not fg_fixed:
+                            child.configure(fg=pal["fg"])
+                            child._themed_fg = pal["fg"]
+                elif cls in ("Checkbutton", "Radiobutton"):
+                    if _IS_MAC:
+                        # Aqua рисует чекбоксы как нативные: фон может
+                        # игнорироваться/остаться светлым, а светлый fg
+                        # даёт «белое на белом». Гарантированно читаемый
+                        # вариант: светлый фон + тёмный текст.
+                        try:
+                            child.configure(
+                                bg="#FFFFFF", fg="#1A1A1A",
+                                activebackground="#FFFFFF",
+                                activeforeground="#1A1A1A",
+                                disabledforeground="#8A8A8A",
+                                highlightbackground=pal["bg"])
+                        except Exception:
+                            pass
+                    else:
+                        if not bg_fixed:
+                            child.configure(bg=pal["bg"],
+                                            activebackground=pal["bg_alt"])
+                            child._themed_bg = pal["bg"]
+                        if not fg_fixed:
+                            child.configure(fg=pal["fg"])
+                            child._themed_fg = pal["fg"]
+                elif cls == "Entry":
+                    if not bg_fixed:
+                        child.configure(bg=pal["entry_bg"])
+                        child._themed_bg = pal["entry_bg"]
+                    try:
+                        child.configure(fg=pal["entry_fg"],
+                                        insertbackground=pal["entry_fg"])
+                    except Exception:
+                        pass
+                elif cls in ("Text",):
+                    if not bg_fixed:
+                        child.configure(bg=pal["log_bg"])
+                        child._themed_bg = pal["log_bg"]
+                    try:
+                        child.configure(fg=pal["log_fg"],
+                                        insertbackground=pal["log_fg"])
+                    except Exception:
+                        pass
+                elif cls == "Listbox":
+                    if not bg_fixed:
+                        child.configure(bg=pal["entry_bg"])
+                        child._themed_bg = pal["entry_bg"]
+                    try:
+                        child.configure(fg=pal["entry_fg"])
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            walk(child)
+
+    walk(win)
+
+
+def _mono_font(size=9, bold=False):
+    """Моноширинный шрифт по платформе: Menlo на macOS, Consolas на Windows."""
+    fam = "Menlo" if _IS_MAC else "Consolas"
+    return (fam, size, "bold") if bold else (fam, size)
+
+
+def get_active_palette():
+    """Палитра с учётом настройки ui_theme ('system'|'light'|'dark')."""
+    mode = "system"
+    try:
+        mode = load_settings().get("ui_theme", "system") or "system"
+    except Exception:
+        pass
+    if mode == "dark":
+        return UI_PALETTES["dark"]
+    if mode == "light":
+        return UI_PALETTES["light"]
+    return UI_PALETTES["dark"] if _macos_system_is_dark() else UI_PALETTES["light"]
+
+
+def _hook_toplevel_theme():
+    """Автоматически темизировать каждый создаваемый Toplevel.
+
+    Виджеты диалога строятся сразу после создания окна в том же колбэке,
+    поэтому применяем палитру через after_idle — к этому моменту окно уже
+    полностью построено.
+    """
+    _orig_init = tk.Toplevel.__init__
+
+    def _patched(self, master=None, cnf={}, **kw):
+        _orig_init(self, master, cnf, **kw)
+        try:
+            root = master if master is not None else self.master
+            root.after_idle(
+                lambda: apply_theme_to_window(self, get_active_palette()))
+        except Exception:
+            pass
+
+    tk.Toplevel.__init__ = _patched
+
+_hook_toplevel_theme()
 
 # Основные утилиты — проверяются как обязательные при запуске.
 # MIK живёт в files/MIK/ (отдельная проверка), update.exe — в files/.
@@ -296,6 +675,9 @@ class FlasherGUI:
         os.makedirs(IMG_DIR, exist_ok=True)
         
         self.create_widgets()
+
+        # Тема интерфейса — после построения всех виджетов
+        self.root.after(0, self.apply_theme_now)
         
         # Проверяем наличие утилит при запуске
         self.root.after(100, self.check_and_download_tools)
@@ -342,6 +724,21 @@ class FlasherGUI:
         self.create_left_panel(left_panel)
         self.create_com_terminal(right_panel)
     
+    def apply_theme_now(self):
+        """Применить текущую тему ко всем окнам (главному и открытым диалогам)."""
+        pal = get_active_palette()
+        try:
+            apply_theme_to_window(self.root, pal)
+        except Exception:
+            pass
+
+    def set_ui_theme(self, mode):
+        """Сохранить и применить тему: 'system' | 'light' | 'dark'."""
+        s = load_settings()
+        s["ui_theme"] = mode
+        save_settings(s)
+        self.apply_theme_now()
+
     def create_left_panel(self, main_frame):
         
         # Инструкция (компактная — одна строка, чтобы освободить место журналу)
@@ -355,6 +752,21 @@ class FlasherGUI:
                                      justify=tk.LEFT, padx=8, pady=3,
                                      font=("Arial", 8), fg="#555555", wraplength=600)
         instruction_label.pack(anchor=tk.W)
+
+        # Переключатель темы (system/light/dark) — в правом верхнем углу панели
+        theme_row = tk.Frame(instruction_frame)
+        theme_row.pack(anchor=tk.E, padx=8, pady=(0, 4))
+        tk.Label(theme_row, text="Тема:", font=("Arial", 8)).pack(side=tk.LEFT)
+        self._theme_var = tk.StringVar(
+            value={"system": "системная", "light": "светлая", "dark": "тёмная"}
+            .get(load_settings().get("ui_theme", "system"), "системная"))
+        theme_combo = ttk.Combobox(
+            theme_row, textvariable=self._theme_var, state="readonly",
+            width=11, values=("системная", "светлая", "тёмная"))
+        theme_combo.pack(side=tk.LEFT, padx=(4, 0))
+        theme_combo.bind("<<ComboboxSelected>>", lambda e: self.set_ui_theme(
+            {"системная": "system", "светлая": "light", "тёмная": "dark"}
+            .get(self._theme_var.get(), "system")))
         
         # Секция выбора образов — растягивается вместе с окном (expand=True),
         # чтобы показывать максимум образов без скролла.
@@ -521,7 +933,7 @@ class FlasherGUI:
         log_frame = tk.LabelFrame(main_frame, text="📄 Журнал операций", font=("Arial", 10, "bold"))
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
 
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=8, state='disabled', font=("Consolas", 9))
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=8, state='disabled', font=_mono_font(9))
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         # Чекбокс очистки data/cache + кнопки прошивки в одной компактной панели
@@ -934,7 +1346,11 @@ class FlasherGUI:
                 except Exception:
                     pass
                 try:
-                    dev.dev.reset()
+                    if sys.platform == "win32":
+                        # Windows/libusb0: хэндл может остаться полуоткрытым.
+                        # На macOS reset вызывает лишнюю пере-энумерацию USB
+                        # (риск «залипания» порта) — там достаточно release+dispose.
+                        dev.dev.reset()
                 except Exception:
                     pass
                 del dev
@@ -1029,7 +1445,8 @@ class FlasherGUI:
             class _NoRedirect(urllib.request.HTTPRedirectHandler):
                 def redirect_request(self, *a, **k):
                     return None
-            opener = urllib.request.build_opener(_NoRedirect)
+            opener = urllib.request.build_opener(
+                _NoRedirect, urllib.request.HTTPSHandler(context=_SSL_CONTEXT))
             req = urllib.request.Request(url, headers=UA)
             try:
                 opener.open(req, timeout=15)
@@ -1047,7 +1464,7 @@ class FlasherGUI:
             """releases.atom — RSS-фид, без rate limit. Первый <entry> = свежий."""
             url = base + "/releases.atom"
             req = urllib.request.Request(url, headers=UA)
-            with urllib.request.urlopen(req, timeout=15) as r:
+            with url_open(req, timeout=15) as r:
                 xml = r.read().decode("utf-8", "ignore")
             m = re.search(r'/releases/tag/([^"<]+)', xml)
             if m:
@@ -1060,7 +1477,7 @@ class FlasherGUI:
             url = base.replace("github.com", "api.github.com/repos") + "/releases/latest"
             req = urllib.request.Request(url, headers={
                 **UA, "Accept": "application/vnd.github+json"})
-            with urllib.request.urlopen(req, timeout=15) as r:
+            with url_open(req, timeout=15) as r:
                 data = json.loads(r.read().decode("utf-8", "ignore"))
             tag = (data.get("tag_name") or data.get("name") or "").strip()
             return (tag, data.get("html_url", base + "/releases/latest")) if tag else None
@@ -1175,7 +1592,7 @@ class FlasherGUI:
         
         self.terminal_text = scrolledtext.ScrolledText(
             terminal_frame,
-            font=("Consolas", 8),
+            font=_mono_font(8),
             bg="#1E1E1E",
             fg="#00FF00",
             insertbackground="white",
@@ -1692,7 +2109,7 @@ class FlasherGUI:
         entry_widgets = {}
         
         # === ВКЛАДКА ИДЕНТИФИКАЦИЯ ===
-        id_scroll = scrolledtext.ScrolledText(id_frame, height=20, font=("Consolas", 9))
+        id_scroll = scrolledtext.ScrolledText(id_frame, height=20, font=_mono_font(9))
         id_scroll.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
         # Значения по умолчанию — пустые; заполняются из устройства или из файла
@@ -1743,7 +2160,7 @@ class FlasherGUI:
             tk.Label(frame, text=label_text, font=("Arial", 10, "bold"), anchor=tk.W, width=25).pack(side=tk.TOP, anchor=tk.W)
             
             # Поле ввода
-            entry = tk.Entry(frame, font=("Consolas", 9), width=60)
+            entry = tk.Entry(frame, font=_mono_font(9), width=60)
             entry.insert(0, var_info["value"])
             entry.pack(side=tk.TOP, pady=(2, 0))
             entry_widgets[var_name] = entry
@@ -1754,7 +2171,7 @@ class FlasherGUI:
         id_scroll.config(state='disabled')
         
         # === ВКЛАДКА БЕЗОПАСНОСТЬ ===
-        sec_scroll = scrolledtext.ScrolledText(sec_frame, height=20, font=("Consolas", 9))
+        sec_scroll = scrolledtext.ScrolledText(sec_frame, height=20, font=_mono_font(9))
         sec_scroll.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
         sec_vars = {
@@ -1803,11 +2220,11 @@ class FlasherGUI:
             if "options" in var_info:
                 # Combobox для выбора
                 var = tk.StringVar(value=var_info["value"])
-                combo = ttk.Combobox(frame, textvariable=var, values=var_info["options"], font=("Consolas", 9), width=57, state="readonly")
+                combo = ttk.Combobox(frame, textvariable=var, values=var_info["options"], font=_mono_font(9), width=57, state="readonly")
                 combo.pack(side=tk.TOP, pady=(2, 0))
                 entry_widgets[var_name] = combo
             else:
-                entry = tk.Entry(frame, font=("Consolas", 9), width=60)
+                entry = tk.Entry(frame, font=_mono_font(9), width=60)
                 entry.insert(0, var_info["value"])
                 entry.pack(side=tk.TOP, pady=(2, 0))
                 entry_widgets[var_name] = entry
@@ -1817,7 +2234,7 @@ class FlasherGUI:
         sec_scroll.config(state='disabled')
         
         # === ВКЛАДКА СИСТЕМА ===
-        sys_scroll = scrolledtext.ScrolledText(sys_frame, height=20, font=("Consolas", 9))
+        sys_scroll = scrolledtext.ScrolledText(sys_frame, height=20, font=_mono_font(9))
         sys_scroll.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
         sys_vars = {
@@ -1861,7 +2278,7 @@ class FlasherGUI:
             label_text = f"  {var_name}"
             tk.Label(frame, text=label_text, font=("Arial", 10, "bold"), anchor=tk.W, width=25).pack(side=tk.TOP, anchor=tk.W)
             
-            entry = tk.Entry(frame, font=("Consolas", 9), width=60)
+            entry = tk.Entry(frame, font=_mono_font(9), width=60)
             entry.insert(0, var_info["value"])
             entry.pack(side=tk.TOP, pady=(2, 0))
             entry_widgets[var_name] = entry
@@ -1900,7 +2317,7 @@ class FlasherGUI:
             row = tk.Frame(cmd_fields); row.pack(fill=tk.X, padx=6, pady=3)
             tk.Label(row, text=name, font=("Arial", 9, "bold"), width=13,
                      anchor=tk.W).pack(side=tk.LEFT)
-            e = tk.Entry(row, font=("Consolas", 9))
+            e = tk.Entry(row, font=_mono_font(9))
             e.insert(0, val)
             e.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
             tk.Label(row, text=desc, font=("Arial", 7), fg="gray").pack(side=tk.LEFT)
@@ -1908,7 +2325,7 @@ class FlasherGUI:
 
         preset_bar = tk.Frame(cmd_frame); preset_bar.pack(fill=tk.X, padx=8, pady=4)
         cmd_preview = scrolledtext.ScrolledText(cmd_frame, height=7,
-                                                font=("Consolas", 8), wrap=tk.WORD)
+                                                font=_mono_font(8), wrap=tk.WORD)
         cmd_preview.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
 
         def build_cmdline_keys():
@@ -1988,7 +2405,7 @@ class FlasherGUI:
             "Редактируйте напрямую. При сохранении пересчитывается CRC32 и\n"
             "записывается весь раздел env целиком (надёжнее, чем setenv по одной)."
         )).pack(anchor=tk.W, padx=8, pady=6)
-        raw_text = scrolledtext.ScrolledText(raw_frame, font=("Consolas", 9), wrap=tk.NONE)
+        raw_text = scrolledtext.ScrolledText(raw_frame, font=_mono_font(9), wrap=tk.NONE)
         raw_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
 
         def fill_raw():
@@ -2590,6 +3007,40 @@ class FlasherGUI:
             result["resize2fs"] = find_in_mik("resize2fs.exe")
         if not result["e2fsck"]:
             result["e2fsck"] = find_in_mik("e2fsck.exe", "fsck.ext4.exe")
+
+        # macOS: MIK — Windows-бинарники. Консольные функции (simg2img,
+        # resize2fs и т.д.) берём из Homebrew, если установлен.
+        if _IS_MAC:
+            result["mik_gui"] = None   # MIK64.exe на mac не запускается
+            brew_prefixes = self._macos_brew_paths()
+            def find_brew(*names, sbin=False):
+                for pref in brew_prefixes:
+                    subs = ("opt/e2fsprogs/sbin", "opt/e2fsprogs/libexec") \
+                        if sbin else ("opt/e2fsprogs/bin", "opt/e2fsprogs/libexec",
+                                      "bin")
+                    for sub in subs:
+                        for n in names:
+                            p = os.path.join(pref, sub, n)
+                            if os.path.isfile(p):
+                                return p
+                # обычные PATH
+                for n in names:
+                    p = shutil.which(n)
+                    if p:
+                        return p
+                return None
+            if not result["simg2img"]:
+                result["simg2img"] = find_brew("simg2img")
+            if not result["img2simg"]:
+                result["img2simg"] = find_brew("img2simg", "ext2simg")
+            if not result["resize2fs"]:
+                result["resize2fs"] = find_brew("resize2fs", sbin=True)
+            if not result["e2fsck"]:
+                result["e2fsck"] = find_brew("e2fsck", "fsck.ext4", sbin=True)
+            # если ничего не нашлось — подскажем один раз при использовании
+            if not (result["simg2img"] and result["resize2fs"]):
+                result["_brew_hint"] = ("На macOS для редактора образов "
+                                        "выполните: brew install e2fsprogs simg2img")
         return result
 
     def open_image_editor(self):
@@ -2616,10 +3067,17 @@ class FlasherGUI:
         win.minsize(720, 600)
         win.transient(self.root)
 
-        have_tools = tools["mik_gui"] or tools["bin_dir"]
+        if _IS_MAC:
+            have_tools = bool(tools["simg2img"] or tools["resize2fs"])
+            hdr_text = ("✓ Инструменты образов найдены (Homebrew)"
+                        if have_tools else
+                        "⚠ MIK — Windows-утилита; для образов выполните: "
+                        "brew install e2fsprogs simg2img")
+        else:
+            have_tools = tools["mik_gui"] or tools["bin_dir"]
+            hdr_text = ("✓ MIK найден" if have_tools
+                        else "✗ MIK не найден — нажмите «Загрузить утилиты»")
         hdr_color = "#27AE60" if have_tools else "#E74C3C"
-        hdr_text  = ("✓ MIK найден" if have_tools
-                     else "✗ MIK не найден — нажмите «Загрузить утилиты»")
         hdr = tk.Frame(win, bg=hdr_color, height=32)
         hdr.pack(side=tk.TOP, fill=tk.X)
         hdr.pack_propagate(False)
@@ -2635,7 +3093,7 @@ class FlasherGUI:
         # ══ Лог (тоже снизу) ══
         logf = tk.LabelFrame(win, text="Журнал", font=("Arial", 9, "bold"))
         logf.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 4))
-        log_box = scrolledtext.ScrolledText(logf, height=8, font=("Consolas", 8),
+        log_box = scrolledtext.ScrolledText(logf, height=8, font=_mono_font(8),
                                             bg="#1E1E1E", fg="#00FF00", state='disabled')
         log_box.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         def log(m):
@@ -2866,6 +3324,13 @@ class FlasherGUI:
 
         # ══ GUI MIK ══
         def open_gui():
+            if _IS_MAC:
+                messagebox.showinfo(
+                    "macOS", "MIK GUI — Windows-программа и на macOS не "
+                    "запускается.\n\nКонсольные функции (распаковка/сборка/"
+                    "сжатие образов) работают через Homebrew:\n"
+                    "brew install e2fsprogs simg2img", parent=win)
+                return
             if not tools["mik_gui"]:
                 messagebox.showwarning("!", "MIK GUI (MIK64.exe) не найден", parent=win); return
             try:
@@ -2985,6 +3450,8 @@ class FlasherGUI:
         log("Редактор образов готов.")
         log("🔓 Кнопка «vbmeta disable-verity» патчит vbmeta.img (флаги AVB)")
         log("   — лечит dm-verity бутлуп после прошивки несовместимых разделов.")
+        if tools.get("_brew_hint"):
+            log("⚠ " + tools["_brew_hint"])
         if tools["bin_dir"]:
             log(f"Утилиты bin/: {tools['bin_dir']}")
             for k in ("simg2img", "img2simg", "make_ext4fs", "imgextractor"):
@@ -3108,7 +3575,7 @@ class FlasherGUI:
         # ── Лог (внизу, фиксированной высоты, перед таблицей) ─────────────────
         logf = tk.LabelFrame(win, text="Журнал", font=("Arial", 9, "bold"))
         logf.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 4))
-        log_box = scrolledtext.ScrolledText(logf, height=6, font=("Consolas", 8),
+        log_box = scrolledtext.ScrolledText(logf, height=6, font=_mono_font(8),
                                             bg="#1E1E1E", fg="#00FF00", state='disabled')
         log_box.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
@@ -3250,12 +3717,20 @@ class FlasherGUI:
                     log("🔌 Ожидание устройства (USB Boot)...")
                     try:
                         _sender(bundle); log("✓ U-Boot загружен")
+                        self._release_aml_usb()   # отпускаем интерфейс для update
                     except Exception as ex:
                         log(f"❌ pyamlboot: {safe_decode(ex)}")
                         self._resume_usb_watch()
                         self.root.after(0, lambda: session_btn.config(state=tk.NORMAL))
                         return
                     _t.sleep(3)
+                    # U-Boot пере-энумерирует USB — ждём реального возврата
+                    if not self._wait_amlogic_usb(30, log_fn=log):
+                        log("❌ Устройство не вернулось на USB после загрузки "
+                            "U-Boot — переподключите питание/USB и повторите")
+                        self._resume_usb_watch()
+                        self.root.after(0, lambda: session_btn.config(state=tk.NORMAL))
+                        return
                 else:
                     log("⚠ pyamlboot_local не найден/не импортируется.")
                     log("  Нажмите «Загрузить утилиты» и ПЕРЕЗАПУСТИТЕ программу,")
@@ -3318,7 +3793,7 @@ class FlasherGUI:
             pw.transient(win)
             tk.Label(pw, text="Вставьте вывод amlmmc part 1 (из PuTTY):",
                      font=("Arial", 10)).pack(pady=6)
-            txt = scrolledtext.ScrolledText(pw, font=("Consolas", 9))
+            txt = scrolledtext.ScrolledText(pw, font=_mono_font(9))
             txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
             def do_parse():
                 parts = parse_table(txt.get("1.0", tk.END))
@@ -3421,17 +3896,26 @@ class FlasherGUI:
         missing_files = []
         found_files = []
         
-        # Проверяем update.exe
+        # Проверяем update (macOS: files/macos/update, Windows: update.exe)
         update_path = None
-        if os.path.exists(os.path.join(FILE_DIR, "update.exe")):
-            update_path = os.path.join(FILE_DIR, "update.exe")
-        elif os.path.exists(os.path.join(FILE_DIR, "update")):
-            update_path = os.path.join(FILE_DIR, "update")
-        
-        if not update_path:
-            missing_files.append("update.exe (утилита прошивки)")
+        if _IS_MAC:
+            for cand in (os.path.join(FILE_DIR, "macos", "update"),
+                         os.path.join(FILE_DIR, "update")):
+                if os.path.exists(cand):
+                    update_path = cand
+                    break
+            upd_label = "update (macOS)"
         else:
-            found_files.append("update.exe ✓")
+            if os.path.exists(os.path.join(FILE_DIR, "update.exe")):
+                update_path = os.path.join(FILE_DIR, "update.exe")
+            elif os.path.exists(os.path.join(FILE_DIR, "update")):
+                update_path = os.path.join(FILE_DIR, "update")
+            upd_label = "update.exe"
+
+        if not update_path:
+            missing_files.append(f"{upd_label} (утилита прошивки)")
+        else:
+            found_files.append(f"{upd_label} ✓")
         
         # Проверяем aml_bundle.img
         bundle_path = os.path.join(FILE_DIR, "aml_bundle.img")
@@ -3470,13 +3954,16 @@ class FlasherGUI:
                 msg += f"\n... и еще {len(missing_files) - 10}"
             
             msg += "\n\n📁 Где взять файлы:\n"
-            msg += "• update.exe - будет загружен автоматически из GitHub\n"
+            msg += ("• update - будет загружен автоматически из GitHub"
+                    if _IS_MAC else
+                    "• update.exe - будет загружен автоматически из GitHub")
+            msg += "\n"
             msg += "• aml_bundle.img - U-Boot образ для вашего чипа\n"
             msg += "• *.img файлы - образы прошивки устройства"
-            
+
             # Предлагаем загрузить утилиты
-            if "update.exe" in str(missing_files):
-                msg += "\n\n💡 Нажмите 'Да' чтобы загрузить update.exe из GitHub"
+            if update_path is None:
+                msg += ("\n\n💡 Нажмите 'Да' чтобы загрузить утилиты из GitHub")
                 response = messagebox.askyesno("Проверка файлов", msg)
                 if response:
                     self.download_tools_from_github()
@@ -3499,40 +3986,65 @@ class FlasherGUI:
         """Проверка наличия всех критичных компонентов при запуске.
 
         Проверяются:
-          • update.exe         (files/)               — прошивка, дамп
-          • MIK (MIK64.exe)    (files/MIK/)           — редактор образов
+          • update.exe (files/) или update (files/macos/) — прошивка, дамп
+          • MIK (MIK64.exe)    (files/MIK/)  — редактор образов (только Windows)
           • pyamlboot_local/   (корень проекта)       — загрузка U-Boot
           • aml_bundle.img     (files/) — опционально, специфичен для устройства
         """
         missing = []      # критичные — предлагаем скачать
         warnings = []     # некритичные — просто предупреждаем
 
-        # 1. update.exe
-        if not (os.path.exists(os.path.join(FILE_DIR, "update.exe"))
-                or os.path.exists(os.path.join(FILE_DIR, "update"))):
-            missing.append("update.exe — утилита прошивки/дампа")
+        if _IS_MAC:
+            # macOS: update в files/macos/, MIK не нужен (Windows-бинарники)
+            mac_update = os.path.join(FILE_DIR, "macos", "update")
+            if not os.path.exists(mac_update):
+                missing.append("update — утилита прошивки/дампа (files/macos/, "
+                               "скачается автоматически)")
+            pyaml = os.path.join(ROOT_DIR, "pyamlboot_local")
+            if not (os.path.isdir(pyaml)
+                    and os.path.exists(os.path.join(pyaml, "boot.py"))):
+                missing.append("pyamlboot_local — загрузка U-Boot")
+            if not os.path.exists(os.path.join(FILE_DIR, "aml_bundle.img")):
+                warnings.append("aml_bundle.img (U-Boot образ устройства) — "
+                                "добавьте вручную в files/")
+            if not USB_AVAILABLE:
+                warnings.append("pyusb не установлен — загрузка U-Boot и "
+                                "обнаружение Amlogic работать не будут "
+                                "(pip install pyusb)")
+            if not self._macos_find_libusb01() and not os.path.exists(
+                    os.path.join(FILE_DIR, "macos", "lib",
+                                 "libusb-0.1.4.dylib")):
+                warnings.append("libusb-0.1.4.dylib — нужна утилите update "
+                                "(скачается автоматически или: brew install "
+                                "libusb-compat)")
+        else:
+            # Windows: прежняя логика
+            # 1. update.exe
+            if not (os.path.exists(os.path.join(FILE_DIR, "update.exe"))
+                    or os.path.exists(os.path.join(FILE_DIR, "update"))):
+                missing.append("update.exe — утилита прошивки/дампа")
 
-        # 2. MIK (любой из вариантов имени, в т.ч. в подпапке)
-        mik_dir = os.path.join(FILE_DIR, "MIK")
-        mik_found = False
-        if os.path.isdir(mik_dir):
-            for root_d, _d, files in os.walk(mik_dir):
-                if any(n in files for n in ("MIK64.exe", "mik64.exe", "MIK.exe")):
-                    mik_found = True
-                    break
-        if not mik_found:
-            missing.append("MIK — редактор образов (files/MIK/)")
+            # 2. MIK (любой из вариантов имени, в т.ч. в подпапке)
+            mik_dir = os.path.join(FILE_DIR, "MIK")
+            mik_found = False
+            if os.path.isdir(mik_dir):
+                for root_d, _d, files in os.walk(mik_dir):
+                    if any(n in files for n in ("MIK64.exe", "mik64.exe", "MIK.exe")):
+                        mik_found = True
+                        break
+            if not mik_found:
+                missing.append("MIK — редактор образов (files/MIK/)")
 
-        # 3. pyamlboot_local
-        pyaml = os.path.join(ROOT_DIR, "pyamlboot_local")
-        if not (os.path.isdir(pyaml)
-                and os.path.exists(os.path.join(pyaml, "boot.py"))):
-            missing.append("pyamlboot_local — загрузка U-Boot")
+            # 3. pyamlboot_local
+            pyaml = os.path.join(ROOT_DIR, "pyamlboot_local")
+            if not (os.path.isdir(pyaml)
+                    and os.path.exists(os.path.join(pyaml, "boot.py"))):
+                missing.append("pyamlboot_local — загрузка U-Boot")
 
-        # 4. aml_bundle.img — некритично (специфичен для устройства)
-        if not os.path.exists(os.path.join(FILE_DIR, "aml_bundle.img")):
-            warnings.append("aml_bundle.img (U-Boot образ устройства) — "
-                            "добавьте вручную в files/")
+            # 4. aml_bundle.img — некритично (специфичен для устройства)
+            if not os.path.exists(os.path.join(FILE_DIR, "aml_bundle.img")):
+                warnings.append("aml_bundle.img (U-Boot образ устройства) — "
+                                "добавьте вручную в files/")
 
         if missing:
             msg = "Отсутствуют компоненты:\n\n"
@@ -3540,7 +4052,9 @@ class FlasherGUI:
             if warnings:
                 msg += "\n\nТакже потребуется (вручную):\n"
                 msg += "\n".join(f"• {w}" for w in warnings)
-            msg += "\n\nЗагрузить недостающее из GitHub (suddosu/yasta_flasher + MIK)?"
+            msg += ("\n\nЗагрузить недостающее из GitHub "
+                    "(suddosu/yasta_flasher%s)?"
+                    % ("" if _IS_MAC else " + MIK"))
             if messagebox.askyesno("Необходимые файлы", msg, icon='question'):
                 self.download_tools_from_github()
         elif warnings:
@@ -3583,7 +4097,7 @@ class FlasherGUI:
 
         tk.Label(pw, text=f"Загрузка из {OWNER}/{REPO_NAME}",
                  font=("Arial", 12, "bold")).pack(pady=8)
-        log_box = scrolledtext.ScrolledText(pw, font=("Consolas", 9))
+        log_box = scrolledtext.ScrolledText(pw, font=_mono_font(9))
         log_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
         prog = ttk.Progressbar(pw, mode="indeterminate")
         prog.pack(fill=tk.X, padx=10, pady=4)
@@ -3652,7 +4166,7 @@ class FlasherGUI:
             zip_url = "https://github.com/CryptoNickSoft/MIK/archive/refs/heads/main.zip"
             log_fn("  ↓ MIK main.zip ...")
             try:
-                with urllib.request.urlopen(ua_req(zip_url), timeout=300) as r:
+                with url_open(ua_req(zip_url), timeout=300) as r:
                     data = r.read()
             except Exception as ex:
                 log_fn(f"  ❌ MIK: {ex}")
@@ -3686,7 +4200,7 @@ class FlasherGUI:
             log_p("━━ Репозиторий yasta_flasher (полный zip) ━━━━━━━━━━━━━")
             log_p(f"  Источник: {REPO_ZIP}")
             try:
-                with urllib.request.urlopen(ua_req(REPO_ZIP), timeout=300) as r:
+                with url_open(ua_req(REPO_ZIP), timeout=300) as r:
                     data = r.read()
                 log_p(f"  Загружено {len(data)//1024} KB, распаковка...")
                 fcount, pcount = extract_repo_zip(data, log_p)
@@ -3700,11 +4214,24 @@ class FlasherGUI:
 
             # ── 2. MIK (отдельный репозиторий) ────────────────────────────────
             log_p("\n━━ MIK (CryptoNickSoft/MIK) ━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            if _IS_MAC:
+                log_p("  ⏭ MIK — Windows-бинарники, на macOS для работы с "
+                      "образами используется Homebrew (brew install "
+                      "e2fsprogs simg2img)")
             try:
                 dl_mik(log_p)
             except Exception as ex:
                 msg = f"  ❌ MIK: {ex}"
                 log_p(msg); errors.append(msg)
+
+            # ── 3. macOS: update + aml_image_v2_packer из khadas/utils ────────
+            if _IS_MAC:
+                log_p("\n━━ Утилиты прошивки для macOS (khadas/utils) ━━━━━━")
+                try:
+                    self._download_macos_flash_tools(log_p)
+                except Exception as ex:
+                    msg = f"  ❌ macOS-утилиты: {ex}"
+                    log_p(msg); errors.append(msg)
 
             log_p("\n" + "━"*55)
             log_p("Готово." if not errors else f"Завершено с {len(errors)} ошибкой(ами).")
@@ -3860,7 +4387,7 @@ class FlasherGUI:
         text_widget = scrolledtext.ScrolledText(
             instructions_window,
             wrap=tk.WORD,
-            font=("Consolas", 9),
+            font=_mono_font(9),
             padx=10,
             pady=10
         )
@@ -3949,88 +4476,113 @@ class FlasherGUI:
         self.log("  2. Пин 6 замкнут на землю (пин 3)")
         self.log("  3. Блок питания подключен")
         self.log("-" * 50)
-        
+
         elapsed = 0
-        check_methods = ["wmic", "pnputil", "pyamlboot"]
-        
-        while self.is_flashing and elapsed < 300:  # Таймаут 5 минут
-            # Метод 1: Проверка через WMIC (Windows Management Instrumentation)
-            try:
-                result = subprocess.run(
-                    ['wmic', 'path', 'Win32_PnPEntity', 'where', 
-                     'DeviceID like "%USB%"', 'get', 'DeviceID,Name'],
-                    capture_output=True,
-                    text=True,
-                    timeout=3,
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-                )
-                
-                output = result.stdout.upper()
-                
-                # Ищем устройство Amlogic по VID:PID или названию
-                if any(marker in output for marker in [
-                    "1B8E", "C003", "AMLOGIC", 
-                    "USB BURNING TOOL", "GX-CHIP",
-                    "VID_1B8E", "PID_C003"
-                ]):
-                    self.log(f"✓ Устройство обнаружено через WMIC!")
-                    time.sleep(2)  # Двойная проверка
-                    
-                    # Повторная проверка
-                    result2 = subprocess.run(
-                        ['wmic', 'path', 'Win32_PnPEntity', 'where', 
-                         'DeviceID like "%USB%"', 'get', 'DeviceID'],
-                        capture_output=True,
-                        text=True,
-                        timeout=3,
-                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-                    )
-                    
-                    if "1B8E" in result2.stdout.upper() or "C003" in result2.stdout.upper():
-                        self.log("✓ Подтверждено: устройство стабильно подключено")
-                        return True
-                    
-            except subprocess.TimeoutExpired:
-                self.log(f"⚠ WMIC завис, пропускаем проверку")
-            except FileNotFoundError:
-                self.log(f"⚠ WMIC не найден в системе")
-            except Exception as e:
-                self.log(f"⚠ Ошибка WMIC: {str(e)}")
-            
-            # Метод 2: Проверка через список USB устройств (PowerShell)
-            try:
-                result = subprocess.run(
-                    ['powershell', '-Command', 
-                     'Get-PnpDevice -Class USB | Select-Object -Property DeviceID,FriendlyName'],
-                    capture_output=True,
-                    text=True,
-                    timeout=3,
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-                )
-                
-                output = result.stdout.upper()
-                if "1B8E" in output or "C003" in output or "AMLOGIC" in output:
-                    self.log(f"✓ Устройство обнаружено через PowerShell!")
-                    time.sleep(2)
-                    return True
-                    
-            except Exception as e:
-                pass  # PowerShell может быть недоступен
-            
-            # Метод 3: Проверка через pyamlboot (если устройство уже в режиме USB Boot)
-            if get_aml_bundle_sender():
+        cflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+        MARKERS = ["1B8E", "C003", "AMLOGIC", "BURNING", "WORLDCUP", "GX-CHIP"]
+
+        # macOS: WMIC/PowerShell недоступны — сразу проверка через libusb/pyusb
+        if _IS_MAC:
+            while self.is_flashing and elapsed < 300:
                 try:
-                    # pyamlboot сам умеет находить устройства
-                    pass
-                except Exception:
-                    pass
-            
-            # Обновляем статус
-            if elapsed % 5 == 0:  # Логируем каждые 5 секунд
+                    import usb.core as _uc
+                    dev = _uc.find(idVendor=0x1b8e, idProduct=0xc003)
+                    if dev is not None:
+                        self.log("  ✓ Устройство обнаружено через libusb (1b8e:c003)")
+                        self.log("✓ Устройство обнаружено! Ждем стабилизации...")
+                        time.sleep(2)
+                        return True
+                except ImportError:
+                    self.log("  ⚠ pyusb не установлен (pip install pyusb)")
+                except Exception as e:
+                    # libusb может быть не установлен — не спамим, пишем раз
+                    if elapsed == 0:
+                        self.log(f"  ⚠ Ошибка libusb: {e} "
+                                 "(нужен brew install libusb)")
+                if elapsed % 5 == 0:
+                    self.log(f"⏳ Поиск устройства... ({elapsed}с)")
+                time.sleep(1)
+                elapsed += 1
+            self.log("\n✗ Устройство не обнаружено за 5 минут")
+            return False
+
+        while self.is_flashing and elapsed < 300:  # Таймаут 5 минут
+            found = False
+
+            # Метод 1: WMIC (как в test_usb_detection)
+            try:
+                result = subprocess.run(
+                    ['wmic', 'path', 'Win32_PnPEntity', 'get', 'DeviceID,Name'],
+                    capture_output=True, text=True, encoding='utf-8',
+                    errors='ignore', timeout=3, creationflags=cflags
+                )
+                lines = [l.strip() for l in result.stdout.split('\n') if l.strip()]
+                for line in lines:
+                    if any(m in line.upper() for m in MARKERS):
+                        self.log(f"  ✓ Устройство обнаружено через WMIC: {line[:60]}")
+                        found = True
+                        break
+                if not found and lines:
+                    self.log(f"  ✗ WMIC: устройство не найдено среди {len(lines)} устройств")
+            except subprocess.TimeoutExpired:
+                self.log("  ⚠ WMIC завис, пропускаем проверку")
+            except FileNotFoundError:
+                self.log("  ⚠ WMIC не найден в системе")
+            except Exception as e:
+                self.log(f"  ⚠ Ошибка WMIC: {e}")
+
+            # Метод 2: PowerShell (все классы, как в test_usb_detection)
+            if not found:
+                try:
+                    result = subprocess.run(
+                        ['powershell', '-NoProfile', '-Command',
+                         'Get-PnpDevice | Select-Object -Property InstanceId,FriendlyName,Class | Format-Table -AutoSize'],
+                        capture_output=True, text=True, encoding='utf-8',
+                        errors='ignore', timeout=3, creationflags=cflags
+                    )
+                    if result.returncode == 0:
+                        lines = [l.strip() for l in result.stdout.split('\n') if l.strip()]
+                        ps_found = False
+                        for line in lines:
+                            if any(m in line.upper() for m in MARKERS):
+                                self.log(f"  ✓ Устройство обнаружено через PowerShell: {line[:60]}")
+                                ps_found = True
+                                found = True
+                                break
+                        if not ps_found:
+                            self.log("  ✗ PowerShell: устройство не найдено")
+                    else:
+                        self.log("  ⚠ PowerShell вернул ошибку (не критично)")
+                except Exception as e:
+                    self.log(f"  ⚠ PowerShell: {e}")
+
+            # Метод 3: libusb (как в test_usb_detection)
+            if not found:
+                try:
+                    import usb.core
+                    dev = usb.core.find(idVendor=0x1b8e, idProduct=0xc003)
+                    if dev is not None:
+                        self.log("  ✓ Устройство обнаружено через libusb (1b8e:c003)")
+                        found = True
+                    else:
+                        self.log("  ✗ libusb: устройство 1b8e:c003 не найдено")
+                except ImportError:
+                    self.log("  ⚠ pyusb не установлен (pip install pyusb) — пропуск libusb проверки")
+                except Exception as e:
+                    self.log(f"  ⚠ Ошибка libusb: {e}")
+
+            if found:
+                self.log("✓ Устройство обнаружено! Ждем стабилизации...")
+                time.sleep(2)
+                # Double-check
+                return True
+
+            # Обновляем статус каждые 5 секунд
+            if elapsed % 5 == 0:
                 self.log(f"⏳ Поиск устройства... ({elapsed}с)")
             time.sleep(1)
             elapsed += 1
-        
+
         if elapsed >= 300:
             self.log("\n✗ Таймаут: устройство не обнаружено за 5 минут")
             self.log("\n💡 Попробуйте:")
@@ -4040,9 +4592,288 @@ class FlasherGUI:
             self.log("  • Установить драйверы Amlogic USB Burning Tool")
             self.log("  • Перезагрузить компьютер")
             return False
-        
+
         return False
     
+    # ── macOS: утилиты прошивки из khadas/utils (aml-flash-tool) ─────────────
+    MACOS_TOOLS_RAW = ("https://raw.githubusercontent.com/khadas/utils/master/"
+                       "aml-flash-tool/tools/macos")
+    MACOS_TOOLS_DIR = os.path.join(FILE_DIR, "macos")
+
+    def _download_macos_flash_tools(self, log_fn=None):
+        """Скачать update и aml_image_v2_packer для macOS из khadas/utils.
+
+        Кладём в files/macos/, ставим права на исполнение, затем
+        чиним зависимость update → libusb-0.1.4.dylib (см. _ensure_macos_libusb).
+        """
+        def _log(m):
+            if log_fn: log_fn(m)
+            else: self.log(m)
+
+        os.makedirs(self.MACOS_TOOLS_DIR, exist_ok=True)
+        for name in ("update", "aml_image_v2_packer"):
+            dest = os.path.join(self.MACOS_TOOLS_DIR, name)
+            if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                _log(f"  ⏭ есть: {name}")
+            else:
+                url = f"{self.MACOS_TOOLS_RAW}/{name}"
+                req = urllib.request.Request(url, headers={"User-Agent": "yasta_flasher/1.0"})
+                with url_open(req, timeout=300) as r:
+                    data = r.read()
+                with open(dest, "wb") as f:
+                    f.write(data)
+                _log(f"  ↓ {name} ({len(data)//1024} KB)")
+            try:
+                os.chmod(dest, 0o755)
+            except Exception:
+                pass
+
+        upd = os.path.join(self.MACOS_TOOLS_DIR, "update")
+        self._ensure_macos_update_runs(upd, _log)
+
+        # libusb-1.0 нужен ещё и pyusb/pyamlboot (обнаружение устройства,
+        # загрузка U-Boot). Если ни brew, ни бандла — качаем bottle.
+        if _IS_MAC and self._macos_libusb1_path() is None:
+            _log("  📚 libusb-1.0 для pyusb не найдена — скачиваю...")
+            if not self._macos_brew_install("libusb", _log):
+                self._macos_fetch_bottle_dylib("libusb", "libusb-1.0.0.dylib",
+                                               _log)
+
+    def _macos_brew_paths(self):
+        """Префиксы Homebrew, которые реально существуют на этой машине."""
+        out = []
+        for brew in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew"):
+            if os.path.exists(brew):
+                out.append(os.path.dirname(os.path.dirname(brew)))
+        return out
+
+    def _macos_find_libusb01(self, log_fn=None):
+        """Найти libusb-0.1.4.dylib: наш files/macos/lib или Homebrew."""
+        candidates = [os.path.join(self.MACOS_TOOLS_DIR, "lib", "libusb-0.1.4.dylib")]
+        for prefix in self._macos_brew_paths():
+            candidates.append(os.path.join(
+                prefix, "opt", "libusb-compat", "lib", "libusb-0.1.4.dylib"))
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+        return None
+
+    def _macos_brew_install(self, formula, log_fn):
+        """Попытка brew install formula. Возвращает True при успехе."""
+        brew = None
+        for p in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew"):
+            if os.path.exists(p):
+                brew = p
+                break
+        if not brew:
+            log_fn("  ⚠ Homebrew не найден (/opt/homebrew, /usr/local)")
+            return False
+        log_fn(f"  🍺 brew install {formula} (может занять пару минут)...")
+        try:
+            r = subprocess.run([brew, "install", formula], capture_output=True,
+                               text=True, errors="ignore", timeout=900)
+            if r.returncode == 0:
+                log_fn(f"  ✓ brew install {formula}: OK")
+                return True
+            tail = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
+            log_fn("  ⚠ brew: " + (tail[-1] if tail else f"код {r.returncode}"))
+        except Exception as ex:
+            log_fn(f"  ⚠ brew: {ex}")
+        return False
+
+    def _macos_fetch_bottle_dylib(self, formula, dylib_name, log_fn):
+        """Скачать bottle формулы из ghcr.io (анонимный token) и вытащить
+        dylib_name в files/macos/lib/. Возвращает путь или None.
+
+        Бинарник update универсальный (x86_64 + arm64), архитектура bottle
+        подбирается по архитектуре машины.
+        """
+        import json as _json
+        import platform as _platform
+        import tarfile as _tar
+        import io as _io
+        try:
+            api = f"https://formulae.brew.sh/api/formula/{formula}.json"
+            req = urllib.request.Request(api, headers={"User-Agent": "yasta_flasher/1.0"})
+            with url_open(req, timeout=30) as r:
+                meta = _json.loads(r.read().decode())
+            files = meta.get("bottle", {}).get("stable", {}).get("files", {})
+            # arm64_* теги — Apple Silicon, прочие mac-теги — x86_64
+            is_arm = _platform.machine() == "arm64"
+            tags = sorted(t for t in files
+                          if (t.startswith("arm64_") if is_arm
+                              else (not t.startswith("arm64_")
+                                    and not t.endswith("linux"))))
+            if not tags:
+                log_fn(f"  ⚠ {formula}: в формуле нет macOS-bottle тегов")
+                return None
+            tag = tags[-1]   # новейшая версия macOS
+            bottle_url = files[tag]["url"]
+            log_fn(f"  ↓ {formula} bottle ({tag}) из ghcr.io...")
+            # Анонимный token ghcr (bottles живут в homebrew/core/<formula>)
+            tok_req = urllib.request.Request(
+                "https://ghcr.io/token?service=ghcr.io"
+                f"&scope=repository:homebrew/core/{formula}:pull",
+                headers={"User-Agent": "yasta_flasher/1.0"})
+            with url_open(tok_req, timeout=30) as r:
+                token = _json.loads(r.read().decode())["token"]
+            dl_req = urllib.request.Request(bottle_url, headers={
+                "User-Agent": "yasta_flasher/1.0", "Authorization": f"Bearer {token}"})
+            with url_open(dl_req, timeout=300) as r:
+                blob = r.read()
+            log_fn(f"  Загружено {len(blob)//1024} KB, распаковка...")
+            lib_dir = os.path.join(self.MACOS_TOOLS_DIR, "lib")
+            os.makedirs(lib_dir, exist_ok=True)
+            dest = os.path.join(lib_dir, dylib_name)
+            with _tar.open(fileobj=_io.BytesIO(blob), mode="r:gz") as tf:
+                for m in tf.getmembers():
+                    if os.path.basename(m.name) == dylib_name:
+                        with tf.extractfile(m) as src, open(dest, "wb") as out:
+                            out.write(src.read())
+                        os.chmod(dest, 0o755)
+                        log_fn(f"  ✓ {dest}")
+                        return dest
+            log_fn(f"  ⚠ В bottle {formula} не найден {dylib_name}")
+        except Exception as ex:
+            log_fn(f"  ⚠ Скачивание bottle {formula} не удалось: {ex}")
+        return None
+
+    def _macos_dylib_refs(self, path):
+        """Список зависимостей dylib (вторая колонка otool -L, без первой строки)."""
+        try:
+            r = subprocess.run(["otool", "-L", path],
+                               capture_output=True, text=True, timeout=10)
+            lines = r.stdout.splitlines()[1:]
+            return [l.strip().split(" (")[0].strip() for l in lines if l.strip()]
+        except Exception:
+            return []
+
+    def _macos_change_dylib_ref(self, dylib, old, new, log_fn, use_id=False):
+        """install_name_tool (-change ссылки или -id собственного имени) +
+        ad-hoc подпись."""
+        try:
+            cmd = (["install_name_tool", "-id", new]
+                   if use_id else
+                   ["install_name_tool", "-change", old, new]) + [dylib]
+            subprocess.run(cmd, check=True, timeout=15)
+            subprocess.run(["codesign", "--force", "--sign", "-", dylib],
+                           capture_output=True, timeout=15)
+            return True
+        except Exception as ex:
+            log_fn(f"  ⚠ install_name_tool ({dylib}): {ex}")
+            return False
+
+    def _macos_download_libusb01_bottle(self, log_fn):
+        """Последний вариант без Homebrew: собрать локальный комплект
+        files/macos/lib/ из bottle'ов ghcr.io:
+          libusb-0.1.4.dylib  (shim libusb-compat)
+          libusb-1.0.0.dylib  (реальная реализация, от неё зависит shim)
+        Плюс переписать внутренние пути (@@HOMEBREW_PREFIX@@/opt/...) на
+        @loader_path/@executable_path, чтобы всё работало автономно.
+        """
+        dylib01 = self._macos_fetch_bottle_dylib("libusb-compat",
+                                                 "libusb-0.1.4.dylib", log_fn)
+        if not dylib01:
+            return None
+        lib_dir = os.path.dirname(dylib01)
+
+        # Собственное имя (id) shim'а тоже может указывать на brew-путь
+        refs01 = self._macos_dylib_refs(dylib01)
+        own = [r for r in refs01 if r.endswith("/" + os.path.basename(dylib01))]
+        if own:
+            self._macos_change_dylib_ref(
+                dylib01, own[0], f"@loader_path/{os.path.basename(dylib01)}",
+                log_fn, use_id=True)
+
+        # Зависимость shim'а — libusb-1.0.0.dylib: докачиваем и чиним ссылку
+        dep10 = next((r for r in refs01 if "libusb-1.0.0.dylib" in r), None)
+        if dep10:
+            dylib10 = self._macos_fetch_bottle_dylib("libusb", "libusb-1.0.0.dylib",
+                                                     log_fn)
+            if not dylib10:
+                return None
+            # id libusb-1.0 → @loader_path (на случай вложенных ссылок)
+            refs10 = self._macos_dylib_refs(dylib10)
+            own10 = [r for r in refs10 if r.endswith("/libusb-1.0.0.dylib")]
+            if own10:
+                self._macos_change_dylib_ref(
+                    dylib10, own10[0], "@loader_path/libusb-1.0.0.dylib",
+                    log_fn, use_id=True)
+            self._macos_change_dylib_ref(
+                dylib01, dep10, "@loader_path/libusb-1.0.0.dylib", log_fn)
+        return dylib01
+
+    def _ensure_macos_update_runs(self, update_bin, log_fn):
+        """Чинить зависимость update → libusb-0.1.4.dylib и проверить запуск.
+
+        Бинарник khadas ссылается на /usr/local/opt/libusb-compat/lib/...
+        (путь Intel-Homebrew). Порядок:
+          1. если_dylib доступна — патчим install_name_tool и подписываем;
+          2. нет — brew install libusb-compat;
+          3. нет — скачиваем bottle напрямую;
+          4. иначе — понятная инструкция.
+        """
+        import re as _re
+        try:
+            r = subprocess.run(["otool", "-L", update_bin],
+                               capture_output=True, text=True, timeout=10)
+            otool = r.stdout
+        except Exception as ex:
+            log_fn(f"  ⚠ otool: {ex} — пропускаем проверку libusb")
+            return
+        if "libusb-0.1.4.dylib" not in otool:
+            log_fn("  ✓ update не требует libusb-0.1 — пропускаем")
+            return
+
+        # Бинарник универсальный и ссылается на libusb-0.1 в ДВУХ местах
+        # (Intel /usr/local/opt/... и ARM /opt/homebrew/opt/...) — патчим все.
+        old_paths = _re.findall(r'\s*(\S*libusb-0\.1\.4\.dylib)', otool)
+        if not old_paths:
+            log_fn("  ✓ libusb-0.1.4.dylib не найдена в otool (неожиданно)")
+            return
+
+        dylib = self._macos_find_libusb01(log_fn)
+        if dylib is None:
+            if self._macos_brew_install("libusb-compat", log_fn):
+                dylib = self._macos_find_libusb01(log_fn)
+        if dylib is None:
+            dylib = self._macos_download_libusb01_bottle(log_fn)
+        if dylib is None:
+            log_fn("  ❌ libusb-0.1.4.dylib недоступна. Установите Homebrew "
+                   "(brew.sh) и выполните: brew install libusb-compat")
+            return
+
+        # Путь, вшиваемый в бинарник: brew → абсолютный; наш lib → @executable_path
+        if dylib.startswith(self.MACOS_TOOLS_DIR):
+            new_path = "@executable_path/lib/libusb-0.1.4.dylib"
+        else:
+            new_path = dylib
+        pending = [p for p in dict.fromkeys(old_paths) if p != new_path]
+        if not pending:
+            log_fn(f"  ✓ libusb уже корректна: {new_path}")
+        else:
+            log_fn(f"  🔧 install_name_tool: {pending} → {new_path}")
+            try:
+                for p in pending:
+                    subprocess.run(["install_name_tool", "-change", p,
+                                    new_path, update_bin], check=True, timeout=15)
+                subprocess.run(["codesign", "--force", "--sign", "-",
+                                update_bin], capture_output=True, timeout=15)
+            except Exception as ex:
+                log_fn(f"  ❌ Не удалось пропатчить update: {ex}")
+                return
+
+        # Smoke-тест: бинарник без устройства должен выдать usage, а не
+        # ошибку загрузки dylib
+        try:
+            r = subprocess.run([update_bin], capture_output=True,
+                               text=True, errors="ignore", timeout=10)
+            log_fn("  ✓ update запускается")
+        except Exception as ex:
+            log_fn(f"  ⚠ update не запустился: {ex}")
+            log_fn("     Если ошибка про 'cannot be opened' — выполните: "
+                   "xattr -cr files/macos/ && sudo spctl --add files/macos/update")
+
     def _find_aml_packer(self):
         """Найти aml_image_v2_packer (Windows) в files/ и подпапках.
 
@@ -4051,6 +4882,8 @@ class FlasherGUI:
         (tools/windows/aml_image_v2_packer.exe).
         """
         candidates = [
+            # macOS-сборка из khadas aml-flash-tool
+            os.path.join(FILE_DIR, "macos", "aml_image_v2_packer"),
             os.path.join(FILE_DIR, "aml_image_v2_packer.exe"),
             os.path.join(FILE_DIR, "aml_image_v2_packer"),
             os.path.join(FILE_DIR, "tools", "windows", "aml_image_v2_packer.exe"),
@@ -4077,6 +4910,12 @@ class FlasherGUI:
             if log_fn: log_fn(m)
             else: self.log(m)
 
+        # На macOS нужен не .exe, а маковский packer из tools/macos
+        if _IS_MAC:
+            _log("📥 Загрузка aml_image_v2_packer (macOS) из khadas/utils...")
+            self._download_macos_flash_tools(_log)
+            return
+
         RAW = ("https://raw.githubusercontent.com/khadas/utils/master/"
                "aml-flash-tool/tools/windows")
         API = ("https://api.github.com/repos/khadas/utils/contents/"
@@ -4096,7 +4935,7 @@ class FlasherGUI:
         files_to_get = []
         try:
             import json
-            with urllib.request.urlopen(ua(API), timeout=20) as r:
+            with url_open(ua(API), timeout=20) as r:
                 items = json.loads(r.read().decode())
             for it in items:
                 if it["type"] == "file" and (
@@ -4115,7 +4954,7 @@ class FlasherGUI:
                 ok += 1
                 continue
             try:
-                with urllib.request.urlopen(ua(url), timeout=120) as r:
+                with url_open(ua(url), timeout=120) as r:
                     data = r.read()
                 with open(dest, "wb") as f:
                     f.write(data)
@@ -4203,7 +5042,7 @@ class FlasherGUI:
         # ── Лог ──
         logf = tk.LabelFrame(win, text="Журнал", font=("Arial", 9, "bold"))
         logf.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 4))
-        log_box = scrolledtext.ScrolledText(logf, height=9, font=("Consolas", 8),
+        log_box = scrolledtext.ScrolledText(logf, height=9, font=_mono_font(8),
                                             bg="#1E1E1E", fg="#00FF00", state='disabled')
         log_box.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         def log(m):
@@ -4491,7 +5330,7 @@ class FlasherGUI:
         # ── Лог (тоже снизу) ──
         logf = tk.LabelFrame(win, text="Журнал прошивки", font=("Arial", 9, "bold"))
         logf.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 4))
-        log_box = scrolledtext.ScrolledText(logf, height=10, font=("Consolas", 8),
+        log_box = scrolledtext.ScrolledText(logf, height=10, font=_mono_font(8),
                                             bg="#1E1E1E", fg="#00FF00", state='disabled')
         log_box.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         def log(m):
@@ -4826,6 +5665,12 @@ class FlasherGUI:
             for _ in range(8):
                 _t.sleep(1)
             log("✓ U-Boot загружен")
+            self._release_aml_usb()
+            # U-Boot пере-энумерирует USB — ждём реального возврата устройства
+            if not self._wait_amlogic_usb(30, log_fn=log):
+                log("✗ Устройство не вернулось на USB после загрузки U-Boot —"
+                    " прерываю (переподключите питание/USB и повторите)")
+                raise Exception("Устройство пропало с USB после загрузки U-Boot")
         else:
             log("⚠ Не найдены bl2/ddrinit — предполагаем, что U-Boot уже запущен")
 
@@ -4888,6 +5733,55 @@ class FlasherGUI:
         log("\n🎉 Прошивка burning-пакета завершена!")
         self.root.after(0, lambda: messagebox.showinfo(
             "Готово", "Прошивка burning-пакета завершена!", parent=self.root))
+
+    def _aml_device_present(self):
+        """Есть ли сейчас Amlogic-устройство на USB (pyusb, без открытия хэндла)."""
+        try:
+            import usb.core
+            return usb.core.find(idVendor=0x1b8e) is not None
+        except Exception:
+            return False
+
+    def _release_aml_usb(self):
+        """Отпустить USB-интерфейс Amlogic, захваченный pyusb/pyamlboot.
+
+        pyamlboot (загрузка U-Boot) открывает устройство и НЕ закрывает его.
+        Пока наш процесс держит интерфейс, утилита update (отдельный процесс)
+        не может его захватить: libusb 'claim interface, ret[-13] Permission
+        denied'. Освобождаем все хэндлы VID 1B8E нашего процесса.
+        """
+        try:
+            import usb.core
+            import usb.util
+            for dev in usb.core.find(find_all=True, idVendor=0x1b8e):
+                try:
+                    usb.util.release_interface(dev, 0)
+                except Exception:
+                    pass
+                try:
+                    usb.util.dispose_resources(dev)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _wait_amlogic_usb(self, timeout=30, log_fn=None):
+        """Ждать возврата Amlogic-устройства на USB (после загрузки U-Boot оно
+        перезагружается в burn-режим и пере-энумерируется).
+
+        Возвращает True, как только устройство появилось, False по таймауту
+        (или если прошивка остановлена пользователем).
+        """
+        _log = log_fn or self.log
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self.is_flashing:
+                return False
+            if self._aml_device_present():
+                return True
+            time.sleep(0.5)
+        _log(f"  ⏳ Ожидание устройства на USB: {timeout} с без результата")
+        return False
 
     def aml_bulkcmd(self, cmd):
         """Выполнение команды U-Boot.
@@ -5210,12 +6104,25 @@ class FlasherGUI:
             raise Exception(f"Ошибка записи в RAM")
     
     def get_update_path(self):
-        """Получение пути к update утилите"""
+        """Получение пути к update утилите (платформозависимо)"""
+        # macOS: files/macos/update (khadas aml-flash-tool)
+        if _IS_MAC:
+            mac_update = os.path.join(FILE_DIR, "macos", "update")
+            if os.path.exists(mac_update):
+                return mac_update
+            update_bin = os.path.join(FILE_DIR, "update")
+            if os.path.exists(update_bin):
+                return update_bin
+            raise FileNotFoundError(
+                "Утилита 'update' (macOS) не найдена в папке 'files/macos'!\n\n"
+                "Нажмите «Проверить наличие файлов» — утилита скачается из "
+                "khadas/utils автоматически.")
+
         # Проверяем наличие update.exe для Windows
         update_exe = os.path.join(FILE_DIR, "update.exe")
         if os.path.exists(update_exe):
             return update_exe
-        
+
         # Проверяем бинарный update (для Linux совместимости)
         update_bin = os.path.join(FILE_DIR, "update")
         if os.path.exists(update_bin):
@@ -5417,7 +6324,9 @@ class FlasherGUI:
                         transient = any(s in emsg.lower() for s in (
                             "timeout", "reap_async", "aborted", "прервана",
                             "i/o", "ввода/вывода", "control_msg", "no such device",
-                            "not found", "no backend"))
+                            "not found", "no backend", "errno 5",
+                            "input/output", "claim interface",
+                            "permission denied", "ret[-13]"))
                         if attempt < MAX_TRIES and transient:
                             self.log(f"  ⚠ Временная ошибка USB: {emsg[:90]}")
                             continue
@@ -5428,21 +6337,62 @@ class FlasherGUI:
                         self.finish_flashing()
                         return
                 if loaded:
-                    time.sleep(4)
+                    # pyamlboot оставил USB-интерфейс захваченным — отпускаем,
+                    # иначе update получит claim interface -13 (Permission denied)
+                    self._release_aml_usb()
+                    # После загрузки U-Boot устройство ПЕРЕЗАГРУЖАЕТСЯ в
+                    # U-Boot burn-режим: ROM-девайс (1B8E:C003) отключается и
+                    # должен появиться на шине снова. На macOS пере-энумерация
+                    # (особенно через USB-хаб) может занять до десятков секунд
+                    # или «залипнуть» — ждём РЕАЛЬНОГО возврата устройства.
+                    if self._wait_amlogic_usb(30):
+                        self.log("✓ Устройство снова на шине (U-Boot burn mode)")
+                    else:
+                        self.log("✗ Устройство не вернулось на USB после "
+                                 "загрузки U-Boot (30 с)")
+                        self.log("  Порт USB мог «залипнуть». Восстановление:")
+                        self.log("   1) Отключите питание устройства И USB-кабель")
+                        self.log("   2) Подключите кабель НАПРЯМУЮ к Mac, без хаба —"
+                                 " бутром Amlogic через хабы работает нестабильно")
+                        self.log("   3) Если порт завис — переподключите кабель/хаб"
+                                 " на стороне Mac (похоже, что вы это и сделали)")
+                        self.log("   4) Замкните пин 6 на GND (пин 3), подайте"
+                                 " питание → снова USB Boot (1B8E:C003)")
+                        self.finish_flashing()
+                        return
             else:
                 self.log("✗ pyamlboot_local не найден или не импортируется!")
                 self.log("  Нажмите «Загрузить утилиты» и ПЕРЕЗАПУСТИТЕ программу.")
                 self.log("  (папка pyamlboot_local/ должна быть рядом с gui.py)")
                 self.finish_flashing()
                 return
-            
+
             # Переключение на eMMC
             self.log("Запуск eMMC...")
-            try:
-                self.aml_bulkcmd("mmc dev 1")
+            self._release_aml_usb()
+            mmc_ok = False
+            for mmc_try in range(1, 6):
+                try:
+                    self.aml_bulkcmd("mmc dev 1")
+                    mmc_ok = True
+                    break
+                except Exception as e:
+                    emsg = safe_decode(e)
+                    self.log(f"  ⚠ mmc dev 1 (попытка {mmc_try}/5): "
+                             f"{emsg[:90]}")
+                    self._release_aml_usb()
+                    if not self._wait_amlogic_usb(15):
+                        break
+                    time.sleep(1.5)
+            if mmc_ok:
                 self.log("✓ eMMC активирован")
-            except Exception as e:
-                self.log(f"✗ Ошибка переключения на eMMC: {str(e)}")
+            else:
+                self.log("✗ Не удалось переключить U-Boot на eMMC")
+                self.log("  Причины бывают две:")
+                self.log("   • устройство пропало с USB (см. восстановление выше)")
+                self.log("   • U-Boot не увидел eMMC (аппаратная проблема/сбой"
+                         " инициализации) — попробуйте полный сброс питания и"
+                         " повторный вход в USB Boot")
                 self.finish_flashing()
                 return
             
@@ -5807,7 +6757,7 @@ def show_initial_help(root):
     help_text = scrolledtext.ScrolledText(
         text_frame,
         wrap=tk.WORD,
-        font=("Consolas", 9),
+        font=_mono_font(9),
         height=20
     )
     help_text.pack(fill=tk.BOTH, expand=True)
