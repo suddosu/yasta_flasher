@@ -275,6 +275,30 @@ def save_settings(data):
         pass
 
 
+# ── Запоминание последних папок для диалогов выбора файлов ──────────────────
+def remember_last_dir(key, path):
+    """Запомнить папку path под ключом key (в flasher_settings.json)."""
+    try:
+        p = os.path.dirname(path) if os.path.isfile(path) else path
+        if not p:
+            return
+        s = load_settings()
+        ld = s.setdefault("last_dirs", {})
+        if ld.get(key) != p:
+            ld[key] = p
+            save_settings(s)
+    except Exception:
+        pass
+
+
+def last_dir(key, default=None):
+    """Последняя папка, запомненная под ключом key (или default)."""
+    try:
+        return load_settings().get("last_dirs", {}).get(key) or default
+    except Exception:
+        return default
+
+
 def safe_decode(data):
     """Универсальное декодирование байтов в строку.
 
@@ -667,6 +691,9 @@ class FlasherGUI:
         # Кастомные разделы
         self.custom_partitions = []
 
+        # Папка образов разделов (переопределяется кнопкой «📁 Папка образов»)
+        self.images_dir = load_settings().get("images_dir") or IMG_DIR
+
         # Буфер захвата вывода терминала (для дампа разделов)
         self._terminal_capture_buf = None
         
@@ -846,8 +873,8 @@ class FlasherGUI:
             path_label.pack(side=tk.RIGHT, padx=5)
             self.image_path_labels[img["name"]] = path_label
 
-            # Проверяем наличие файла
-            default_path = os.path.join(IMG_DIR, img["file"])
+            # Проверяем наличие файла (в папке образов или images-bkp)
+            default_path = os.path.join(self.images_dir, img["file"])
             if os.path.exists(default_path):
                 self.selected_images[img["name"]] = default_path
                 path_label.config(text=f"✓ {img['file']}", fg="green")
@@ -869,6 +896,12 @@ class FlasherGUI:
             text="🔍 Проверить файлы",
             command=self.check_all_files,
             width=18
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(
+            files_bar,
+            text="📁 Папка образов…",
+            command=self.choose_images_dir,
+            width=16
         ).pack(side=tk.LEFT, padx=(0, 8))
         self.files_status_label = tk.Label(
             files_bar,
@@ -1905,12 +1938,14 @@ class FlasherGUI:
     def save_terminal_log(self):
         """Сохранение лога терминала в файл"""
         filename = filedialog.asksaveasfilename(
+            initialdir=last_dir("log_save", ROOT_DIR),
             defaultextension=".txt",
             filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
             initialfile=f"uart_log_{time.strftime('%Y%m%d_%H%M%S')}.txt"
         )
         
         if filename:
+            remember_last_dir("log_save", filename)
             try:
                 with open(filename, 'w', encoding='utf-8') as f:
                     content = self.terminal_text.get(1.0, tk.END)
@@ -1947,9 +1982,11 @@ class FlasherGUI:
         def browse_file():
             fn = filedialog.askopenfilename(
                 title="Выберите образ раздела",
+                initialdir=last_dir("partition_image", IMG_DIR),
                 filetypes=[("Image files", "*.img"), ("All files", "*.*")]
             )
             if fn:
+                remember_last_dir("partition_image", fn)
                 file_var.set(fn)
 
         tk.Button(file_frame, text="Обзор...", command=browse_file, width=10).pack(side=tk.LEFT)
@@ -2554,10 +2591,12 @@ class FlasherGUI:
             """Загрузить ENV из файла"""
             filename = filedialog.askopenfilename(
                 title="Выберите файл ENV",
+                initialdir=last_dir("env_file", ROOT_DIR),
                 filetypes=[("ENV files", "env_user.bin"), ("All files", "*.*")],
                 parent=editor
             )
             if filename:
+                remember_last_dir("env_file", filename)
                 try:
                     # Читаем файл
                     with open(filename, 'rb') as f:
@@ -3149,8 +3188,10 @@ class FlasherGUI:
         def pick_img():
             fn = filedialog.askopenfilename(
                 title="Выберите образ", parent=win,
+                initialdir=last_dir("edit_image", IMG_DIR),
                 filetypes=[("Image", "*.img *.PARTITION *.fex"), ("All", "*.*")])
             if fn:
+                remember_last_dir("edit_image", fn)
                 img_var.set(fn)
                 work_var.set(os.path.splitext(fn)[0] + "_unpacked")
                 out_var.set(os.path.splitext(fn)[0] + "-modified.img")
@@ -3172,7 +3213,10 @@ class FlasherGUI:
                  ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         tk.Button(r2, text="Обзор…",
                   command=lambda: work_var.set(
-                      filedialog.askdirectory(parent=win) or work_var.get()),
+                      filedialog.askdirectory(parent=win,
+                          initialdir=last_dir("edit_workdir",
+                                              os.path.dirname(img_var.get() or IMG_DIR)))
+                      or work_var.get()),
                   width=9).pack(side=tk.LEFT)
 
         # — выходной образ —
@@ -3184,7 +3228,8 @@ class FlasherGUI:
                  ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         tk.Button(r3, text="Обзор…",
                   command=lambda: out_var.set(
-                      filedialog.asksaveasfilename(parent=win, defaultextension=".img")
+                      filedialog.asksaveasfilename(parent=win, defaultextension=".img",
+                          initialdir=last_dir("edit_save", IMG_DIR))
                       or out_var.get()),
                   width=9).pack(side=tk.LEFT)
 
@@ -3569,7 +3614,8 @@ class FlasherGUI:
                  ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         tk.Button(orow, text="Обзор…",
                   command=lambda: out_var.set(
-                      filedialog.askdirectory(title="Папка дампов", parent=win)
+                      filedialog.askdirectory(title="Папка дампов", parent=win,
+                          initialdir=last_dir("dump_dir", ROOT_DIR))
                       or out_var.get()), width=8).pack(side=tk.LEFT)
 
         # ── Лог (внизу, фиксированной высоты, перед таблицей) ─────────────────
@@ -3870,12 +3916,52 @@ class FlasherGUI:
         log("Стандартная таблица Yandex Station Max загружена (21 раздел).")
         log("Размеры известны — дамп доступен сразу, даже без UART.")
 
+    def rescan_images_dir(self):
+        """Пересканировать self.images_dir и обновить пути встроенных разделов.
+        Возвращает число найденных образов."""
+        found = 0
+        for img in PART_IMAGES:
+            p = os.path.join(self.images_dir, img["file"])
+            lbl = self.image_path_labels.get(img["name"])
+            if os.path.exists(p):
+                self.selected_images[img["name"]] = p
+                if lbl:
+                    lbl.config(text=f"✓ {img['file']}", fg="green")
+                found += 1
+            else:
+                self.selected_images.pop(img["name"], None)
+                if lbl:
+                    lbl.config(text="✗ Не найден", fg="red")
+        return found
+
+    def choose_images_dir(self):
+        """Выбрать папку образов разделов: переопределяет images-bkp для
+        основного окна. Папка сохраняется в настройках и используется
+        при следующих запусках."""
+        d = filedialog.askdirectory(
+            title="Папка с образами разделов (boot.img, system-bkp.img, ...)",
+            initialdir=self.images_dir or IMG_DIR, parent=self.root)
+        if not d:
+            return
+        self.images_dir = d
+        s = load_settings()
+        s["images_dir"] = d
+        save_settings(s)
+        found = self.rescan_images_dir()
+        self.log(f"📁 Папка образов: {d} — найдено {found}/{len(PART_IMAGES)}")
+        self.files_status_label.config(
+            text=f"Папка образов: {d} (найдено {found}/{len(PART_IMAGES)})",
+            fg="#27AE60" if found == len(PART_IMAGES) else "#E67E22")
+
     def browse_image(self, img):
         filename = filedialog.askopenfilename(
             title=f"Выберите образ {img['display']}",
+            initialdir=last_dir("partition_image",
+                                os.path.dirname(self.selected_images.get(img["name"], "")) or self.images_dir),
             filetypes=[("Image files", "*.img"), ("All files", "*.*")]
         )
         if filename:
+            remember_last_dir("partition_image", filename)
             self.selected_images[img["name"]] = filename
             self.image_path_labels[img["name"]].config(
                 text=f"✓ {os.path.basename(filename)}",
@@ -3926,7 +4012,7 @@ class FlasherGUI:
         
         # Проверяем образы разделов
         for img in PART_IMAGES:
-            default_path = os.path.join(IMG_DIR, img["file"])
+            default_path = os.path.join(self.images_dir, img["file"])
             if os.path.exists(default_path):
                 found_files.append(f"{img['file']} ✓")
                 if img["name"] not in self.selected_images:
@@ -4600,6 +4686,107 @@ class FlasherGUI:
                        "aml-flash-tool/tools/macos")
     MACOS_TOOLS_DIR = os.path.join(FILE_DIR, "macos")
 
+    # Параметры запуска bl2 для burning-пакетов (крошечные blobs, платформо-
+    # независимы; без них невозможна инициализация DDR и запуск U-Boot)
+    BURN_RUNPARA_FILES = {
+        "usbbl2runpara_ddrinit.bin":
+            "https://raw.githubusercontent.com/khadas/utils/master/"
+            "aml-flash-tool/tools/datas/usbbl2runpara_ddrinit.bin",
+        "usbbl2runpara_runfipimg.bin":
+            "https://raw.githubusercontent.com/khadas/utils/master/"
+            "aml-flash-tool/tools/datas/usbbl2runpara_runfipimg.bin",
+    }
+
+    def _ensure_burn_runpara(self, log_fn=None):
+        """Скачать usbbl2runpara_*.bin в files/, если их там нет."""
+        def _log(m):
+            if log_fn: log_fn(m)
+            else: self.log(m)
+        for name, url in self.BURN_RUNPARA_FILES.items():
+            dest = os.path.join(FILE_DIR, name)
+            if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                continue
+            try:
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": "yasta_flasher/1.0"})
+                with url_open(req, timeout=60) as r:
+                    data = r.read()
+                with open(dest, "wb") as fh:
+                    fh.write(data)
+                _log(f"  ↓ {name} ({len(data)} B)")
+            except Exception as ex:
+                _log(f"  ⚠ {name}: {ex}")
+
+    FLASH_TOOL_URL = ("https://raw.githubusercontent.com/khadas/utils/master/"
+                      "aml-flash-tool/flash-tool")
+
+    def _ensure_khadas_flashtool(self, log_fn=None):
+        """Подготовить каноничный khadas flash-tool для запуска на macOS.
+
+        ВАЖНО: flash-tool собирает команды через eval БЕЗ кавычек, поэтому
+        путь с пробелом ('Application Support') ломает вызов update. Ставим
+        раскладку в ~/.yasta_flasher_ft (без пробелов):
+          flash-tool, tools/macos/{update,aml_image_v2_packer}, tools/macos/lib,
+          tools/datas/usbbl2runpara_*.bin
+        update/libusb копируем из files/macos (уже пропатчены под наш бандл).
+        Возвращает путь к flash-tool или None.
+        """
+        def _log(m):
+            if log_fn: log_fn(m)
+            else: self.log(m)
+        ft_dir = os.path.expanduser("~/.yasta_flasher_ft")
+        tools_macos = os.path.join(ft_dir, "tools", "macos")
+        tools_datas = os.path.join(ft_dir, "tools", "datas")
+        ft = os.path.join(ft_dir, "flash-tool")
+        try:
+            os.makedirs(tools_macos, exist_ok=True)
+            os.makedirs(tools_datas, exist_ok=True)
+        except Exception as ex:
+            _log(f"  ❌ {ft_dir}: {ex}")
+            return None
+        if not (os.path.exists(ft) and os.path.getsize(ft) > 1000):
+            try:
+                req = urllib.request.Request(
+                    self.FLASH_TOOL_URL, headers={"User-Agent": "yasta_flasher/1.0"})
+                with url_open(req, timeout=60) as r:
+                    data = r.read()
+                with open(ft, "wb") as fh:
+                    fh.write(data)
+                _log(f"  ↓ flash-tool ({len(data)//1024} KB)")
+            except Exception as ex:
+                _log(f"  ❌ flash-tool: {ex}")
+                return None
+        try:
+            os.chmod(ft, 0o755)
+        except Exception:
+            pass
+        try:
+            # update всегда свежей (пропатченной) версией
+            for src_name in ("update", "aml_image_v2_packer"):
+                src = os.path.join(FILE_DIR, "macos", src_name)
+                dst = os.path.join(tools_macos, src_name)
+                if os.path.exists(src):
+                    shutil.copy2(src, dst)
+                    os.chmod(dst, 0o755)
+            # libusb-бандл рядом с update (@executable_path/lib/...)
+            src_lib = os.path.join(FILE_DIR, "macos", "lib")
+            dst_lib = os.path.join(tools_macos, "lib")
+            if os.path.isdir(src_lib):
+                if os.path.isdir(dst_lib):
+                    shutil.rmtree(dst_lib)
+                shutil.copytree(src_lib, dst_lib)
+            for name in self.BURN_RUNPARA_FILES:
+                src = os.path.join(FILE_DIR, name)
+                dst = os.path.join(tools_datas, name)
+                if os.path.exists(src):
+                    shutil.copy2(src, dst)
+        except Exception as ex:
+            _log(f"  ⚠ Раскладка tools/: {ex}")
+        upd = os.path.join(tools_macos, "update")
+        if os.path.exists(upd):
+            self._ensure_macos_update_runs(upd, _log)
+        return ft if os.path.exists(ft) else None
+
     def _download_macos_flash_tools(self, log_fn=None):
         """Скачать update и aml_image_v2_packer для macOS из khadas/utils.
 
@@ -5064,13 +5251,19 @@ class FlasherGUI:
 
         def pick_tpl_dir():
             d = filedialog.askdirectory(
-                title="Папка распакованного пакета (с image.cfg)", parent=win)
-            if d: tpl_var.set(d)
+                title="Папка распакованного пакета (с image.cfg)",
+                initialdir=last_dir("burn_unpacked", ROOT_DIR), parent=win)
+            if d:
+                remember_last_dir("burn_unpacked", d)
+                tpl_var.set(d)
         def pick_tpl_img():
             fn = filedialog.askopenfilename(
                 title="Шаблонный aml_upgrade_package.img", parent=win,
+                initialdir=last_dir("burn_pkg", ROOT_DIR),
                 filetypes=[("Amlogic image", "*.img"), ("All", "*.*")])
-            if fn: tpl_var.set(fn)
+            if fn:
+                remember_last_dir("burn_pkg", fn)
+                tpl_var.set(fn)
 
         tk.Button(r1, text="Папка…", command=pick_tpl_dir, width=8).pack(side=tk.LEFT)
         tk.Button(r1, text=".img…", command=pick_tpl_img, width=7).pack(side=tk.LEFT, padx=(3,0))
@@ -5106,8 +5299,10 @@ class FlasherGUI:
             name = tree.set(row, "name")
             fn = filedialog.askopenfilename(
                 title=f"Файл для раздела {name}", parent=win,
+                initialdir=last_dir("partition_image", IMG_DIR),
                 filetypes=[("Image", "*.img *.PARTITION *.bin"), ("All", "*.*")])
             if fn:
+                remember_last_dir("partition_image", fn)
                 state["overrides"][name] = fn
                 tree.set(row, "src", fn)
                 log(f"  ↪ {name} ← {os.path.basename(fn)}")
@@ -5360,8 +5555,10 @@ class FlasherGUI:
         def pick_pkg():
             fn = filedialog.askopenfilename(
                 title="Выберите aml_upgrade_package.img", parent=win,
+                initialdir=last_dir("burn_pkg", ROOT_DIR),
                 filetypes=[("Amlogic burning image", "*.img"), ("All", "*.*")])
             if fn:
+                remember_last_dir("burn_pkg", fn)
                 pkg_var.set(fn)
 
         tk.Button(r1, text="Обзор…", command=pick_pkg, width=9).pack(side=tk.LEFT)
@@ -5388,6 +5585,60 @@ class FlasherGUI:
             tk.Button(pk_row, text="📥 Скачать packer", command=dl_packer,
                       font=("Arial", 8), bg="#9B59B6", fg="white"
                       ).pack(side=tk.LEFT, padx=(8, 0))
+
+        # Повторное использование уже распакованной папки — без повторной
+        # распаковки (полезно при повторных попытках прошивки)
+        def load_unpacked(out_dir):
+            """Прочитать image.cfg/platform.conf из готовой папки распаковки.
+            Возвращает True при успехе; вызывается из UI-потока."""
+            cfg = os.path.join(out_dir, "image.cfg")
+            if not os.path.exists(cfg):
+                log(f"❌ В {out_dir} нет image.cfg — это не распакованный пакет")
+                return False
+            parts, svc = parse_image_cfg(cfg)
+            parts_info.clear(); parts_info.extend(parts)
+            plat_name = svc.get("platform", "platform.conf")
+            plat_path = os.path.join(out_dir, plat_name)
+            if os.path.exists(plat_path):
+                platform_cfg.clear()
+                platform_cfg.update(parse_platform_conf(plat_path))
+                platform_cfg["_svc"] = svc
+            unpack_dir[0] = out_dir
+            log(f"✓ Пакет прочитан из {out_dir}. Разделов: {len(parts)}")
+            def _fill():
+                for row in tree.get_children(): tree.delete(row)
+                psel.clear()
+                for p in parts:
+                    psel[p["name"]] = True
+                    tree.insert("", tk.END,
+                        values=("✓", p["name"], p["file"], p["type"]))
+            self.root.after(0, _fill)
+            return True
+
+        ur = tk.Frame(f1); ur.pack(fill=tk.X, padx=6, pady=(0, 4))
+        tk.Label(ur, text="…или папка уже распакованного пакета (_pkg_unpack):",
+                 font=("Arial", 8)).pack(side=tk.LEFT)
+        unpacked_dir_var = tk.StringVar()
+
+        def pick_unpacked():
+            d = filedialog.askdirectory(
+                title="Папка распакованного пакета (где лежит image.cfg)",
+                initialdir=last_dir("burn_unpacked",
+                                    os.path.dirname(pkg_var.get() or ROOT_DIR)),
+                parent=win)
+            if not d:
+                return
+            remember_last_dir("burn_unpacked", d)
+            if not load_unpacked(d):
+                messagebox.showwarning("!",
+                    "В выбранной папке нет image.cfg.\nУкажите папку "
+                    "_pkg_unpack, созданную распаковкой пакета.", parent=win)
+                return
+            unpacked_dir_var.set(d)
+
+        tk.Entry(ur, textvariable=unpacked_dir_var, font=("Arial", 8)
+                 ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        tk.Button(ur, text="Обзор…", command=pick_unpacked, width=9).pack(side=tk.LEFT)
 
         # Опции
         f2 = tk.LabelFrame(top, text="2. Опции прошивки", font=("Arial", 9, "bold"))
@@ -5437,6 +5688,77 @@ class FlasherGUI:
 
         prog = ttk.Progressbar(top, mode="indeterminate")
         prog.pack(fill=tk.X, pady=(4, 0))
+
+        # ── Альтернатива: каноничный khadas flash-tool (только macOS) ──
+        # Эталонная последовательность прошивки со всеми вариантами протоколов
+        # (включая новый USB-протокол «8» и bl2_boot для g12a).
+        if _IS_MAC:
+            ft_row = tk.Frame(top)
+            ft_row.pack(fill=tk.X, pady=(0, 2))
+            tk.Label(ft_row, text="Альтернатива — каноничный khadas flash-tool, SoC:",
+                     font=("Arial", 8)).pack(side=tk.LEFT)
+            ft_soc = tk.StringVar(value="gxl")
+            ttk.Combobox(ft_row, textvariable=ft_soc, state="readonly",
+                         width=6, values=("gxl", "g12a")).pack(side=tk.LEFT, padx=4)
+
+            def do_flash_tool():
+                pkg = pkg_var.get()
+                if not pkg or not os.path.exists(pkg):
+                    pkg = filedialog.askopenfilename(
+                        title="Выберите aml_upgrade_package.img "
+                              "(flash-tool распаковывает сам)",
+                        parent=win,
+                        initialdir=last_dir("burn_pkg", ROOT_DIR),
+                        filetypes=[("Amlogic burning image", "*.img"),
+                                   ("All", "*.*")])
+                    if not pkg:
+                        messagebox.showwarning(
+                            "!", "flash-tool нужен исходный .img пакета",
+                            parent=win)
+                        return
+                    pkg_var.set(pkg)
+                if not messagebox.askyesno(
+                        "Подтверждение",
+                        "Прошивка каноничным khadas flash-tool.\n\n"
+                        "НЕ ОТКЛЮЧАЙТЕ устройство во время процесса!\n\n"
+                        "Продолжить?", icon='warning', parent=win):
+                    return
+
+                def _t():
+                    prog.start(10)
+                    try:
+                        log("⚡ Подготовка flash-tool...")
+                        ft = self._ensure_khadas_flashtool(log_fn=log)
+                        if not ft:
+                            log("❌ flash-tool недоступен")
+                            return
+                        cmd = ["bash", ft, f"--img={pkg}", "--parts=all",
+                               "--reset=" + ("y" if reset_var.get() else "n"),
+                               "--soc=" + ft_soc.get(), "--debug"]
+                        if wipe_var.get():
+                            cmd.append("--wipe")
+                        log("⚡ Запуск: " + " ".join(cmd))
+                        p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                             stderr=subprocess.STDOUT,
+                                             text=True, errors="ignore",
+                                             bufsize=1)
+                        for line in p.stdout:
+                            s = line.rstrip()
+                            if s:
+                                log("  " + s)
+                        p.wait()
+                        log(f"⚡ flash-tool завершён, код {p.returncode}")
+                    except Exception as ex:
+                        log(f"❌ flash-tool: {ex}")
+                    finally:
+                        self.root.after(0, prog.stop)
+
+                _th.Thread(target=_t, daemon=True).start()
+
+            tk.Button(ft_row, text="⚡ Прошить через flash-tool",
+                      command=do_flash_tool, bg="#8E44AD", fg="white",
+                      font=("Arial", 10, "bold"), height=1
+                      ).pack(side=tk.LEFT, padx=(8, 0))
 
         # ── Распаковка и разбор пакета ──
         def parse_image_cfg(cfg_path):
@@ -5502,19 +5824,32 @@ class FlasherGUI:
             def _t():
                 prog.start(10)
                 try:
+                    # Распаковываем РЯДОМ С ОБРАЗОМ (<папка образа>/_pkg_unpack).
+                    # Таймаут большой: 2+ ГБ (особенно на сетевой том) может
+                    # распаковываться заметно дольше пяти минут.
                     out_dir = os.path.join(os.path.dirname(pkg), "_pkg_unpack")
                     os.makedirs(out_dir, exist_ok=True)
                     unpack_dir[0] = out_dir
+                    # Уже распакован ранее? (повторный запуск прошивки)
+                    if os.path.exists(os.path.join(out_dir, "image.cfg")):
+                        log(f"✓ Уже распаковано: {out_dir} — использую без "
+                            "повторной распаковки")
+                        self.root.after(0, lambda: load_unpacked(out_dir))
+                        return
+                    remember_last_dir("burn_pkg", pkg)
                     log(f"📦 Распаковка через {os.path.basename(cur_packer)}...")
+                    log(f"  → {out_dir}")
                     cflags = subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0
                     # Khadas-синтаксис: aml_image_v2_packer -d <img> <outdir>
                     # Успех определяется по строке "Image unpack OK!"
+                    # Таймаут большой: 2+ ГБ на медленный/сетевой диск может
+                    # распаковываться заметно дольше пяти минут.
                     ok = False
                     o = ""
                     for flag in ("-d", "-unpack"):
                         try:
                             r = subprocess.run([cur_packer, flag, pkg, out_dir],
-                                               capture_output=True, timeout=300,
+                                               capture_output=True, timeout=1800,
                                                creationflags=cflags)
                         except Exception as ex:
                             log(f"  ⚠ {flag}: {ex}")
@@ -5533,23 +5868,8 @@ class FlasherGUI:
                         log("  Проверьте, что packer — Windows-версия из khadas/utils,")
                         log("  и что пакет действительно формата Amlogic V2.")
                         return
-                    parts, svc = parse_image_cfg(cfg)
-                    parts_info.clear(); parts_info.extend(parts)
-                    plat_name = svc.get("platform", "platform.conf")
-                    plat_path = os.path.join(out_dir, plat_name)
-                    if os.path.exists(plat_path):
-                        platform_cfg.clear()
-                        platform_cfg.update(parse_platform_conf(plat_path))
-                        platform_cfg["_svc"] = svc
-                    log(f"✓ Распаковано. Разделов в пакете: {len(parts)}")
-                    def _fill():
-                        for row in tree.get_children(): tree.delete(row)
-                        psel.clear()
-                        for p in parts:
-                            psel[p["name"]] = True
-                            tree.insert("", tk.END,
-                                values=("✓", p["name"], p["file"], p["type"]))
-                    self.root.after(0, _fill)
+                    unpack_dir[0] = out_dir
+                    self.root.after(0, lambda: load_unpacked(out_dir))
                 except Exception as ex:
                     log(f"❌ Распаковка: {ex}")
                 finally:
@@ -5574,9 +5894,15 @@ class FlasherGUI:
             def _t():
                 prog.start(10)
                 try:
-                    self._burn_package_sequence(
-                        wd, parts_info, to_flash, platform_cfg,
-                        wipe, do_reset, log)
+                    if _IS_MAC:
+                        # macOS: ROM/bl2-режимы ненадёжны для bulk-записи —
+                        # прошиваем разделы через U-Boot из aml_bundle
+                        self._burn_package_partitions_via_uboot(
+                            wd, to_flash, wipe, do_reset, log)
+                    else:
+                        self._burn_package_sequence(
+                            wd, parts_info, to_flash, platform_cfg,
+                            wipe, do_reset, log)
                 except Exception as ex:
                     log(f"\n❌ ОШИБКА: {ex}")
                 finally:
@@ -5601,6 +5927,123 @@ class FlasherGUI:
             log("  (из khadas/utils). В USB Burning Tool v2 его НЕТ — там")
             log("  только AmlImagePack.dll, которая из консоли не вызывается.")
         log("1) Выберите пакет → 2) Распакуйте → 3) Прошейте.")
+        log("💡 Если пакет уже распакован — укажите папку _pkg_unpack в поле "
+            "«папка уже распакованного пакета» и сразу прошивайте.")
+
+    def _burn_package_partitions_via_uboot(self, wd, to_flash,
+                                           wipe, do_reset, log):
+        """Прошивка разделов распакованного burning-пакета через U-Boot из
+        files/aml_bundle.img (pyamlboot) + update partition.
+
+        НА macOS это ОСНОВНОЙ рабочий путь (проверено 2026-10-06): ROM- и
+        bl2-режимы устройства на macOS ненадёжны для bulk-записи (cwr →
+        I/O error в конце записи, bl2-burn → usbWriteFile -60 timeout),
+        а в U-Boot burn-режиме update-команды работают стабильно — им и
+        прошиваются все разделы пакета, включая _aml_dtb/bootloader.
+        Последовательность повторяет khadas flash-tool: mmc dev 1 →
+        disk_initial → _aml_dtb → bootloader → остальные → setenv/save → reset.
+        """
+        import time as _t
+
+        bundle = os.path.join(FILE_DIR, "aml_bundle.img")
+        if not os.path.exists(bundle):
+            raise Exception(
+                "files/aml_bundle.img не найден — положите U-Boot образ "
+                "устройства в files/ (он используется вместо DDR.USB пакета)")
+
+        # 1. U-Boot уже в памяти с прошлой попытки?
+        rc, out = self.aml_update_raw(["bulkcmd", "echo 12345"], timeout=10)
+        uboot_alive = (rc == 0)
+        if not uboot_alive:
+            log("🔌 Загрузка U-Boot (aml_bundle) через pyamlboot...")
+            sender = get_aml_bundle_sender()
+            if not sender:
+                raise Exception("pyamlboot_local недоступен — нажмите "
+                                "«Загрузить утилиты» и перезапустите")
+            last = None
+            for i in range(1, 4):
+                try:
+                    sender(bundle)
+                    log("✓ U-Boot загружен")
+                    break
+                except Exception as e:
+                    last = e
+                    log(f"  ⚠ попытка {i}/3: {safe_decode(e)[:90]}")
+                    self._release_aml_usb()
+                    self._wait_amlogic_usb(15, log_fn=log)
+                    _t.sleep(2)
+            else:
+                raise Exception(f"Не удалось загрузить U-Boot: {last}")
+            self._release_aml_usb()
+            if not self._wait_amlogic_usb(30, log_fn=log):
+                raise Exception("Устройство не вернулось на USB после "
+                                "загрузки U-Boot (переподключите питание/USB)")
+            _t.sleep(2)
+        else:
+            log("✓ U-Boot уже запущен (burn mode активен)")
+
+        # 2. Переключение на eMMC
+        ok = False
+        for i in range(1, 6):
+            try:
+                self.aml_bulkcmd("mmc dev 1")
+                ok = True
+                break
+            except Exception as e:
+                log(f"  ⚠ mmc dev 1 ({i}/5): {safe_decode(e)[:90]}")
+                self._release_aml_usb()
+                self._wait_amlogic_usb(15, log_fn=log)
+                _t.sleep(1.5)
+        if not ok:
+            raise Exception("Не удалось переключить U-Boot на eMMC "
+                            "(mmc dev 1)")
+        log("✓ eMMC активирован")
+
+        # 3. Таблица разделов
+        log(f"🗂 Создание разделов (disk_initial {'1' if wipe else '0'})...")
+        try:
+            self.aml_bulkcmd(f"disk_initial {'1' if wipe else '0'}")
+        except Exception as e:
+            log(f"  ⚠ disk_initial: {safe_decode(e)[:120]} — продолжаем")
+
+        # 4. Разделы: _aml_dtb и bootloader первыми (как в khadas flash-tool)
+        def f(name):
+            return os.path.join(wd, name) if name else None
+
+        order = sorted(
+            to_flash,
+            key=lambda p: 0 if p["name"] in ("_aml_dtb", "dtb")
+            else (1 if p["name"] == "bootloader" else 2))
+        fails = []
+        for p in order:
+            pf = f(p.get("file"))
+            if not pf or not os.path.exists(pf):
+                log(f"  ⚠ {p['name']}: файл {p.get('file')} не найден — пропуск")
+                continue
+            log(f"  ⬇ {p['name']} ({p.get('file')})...")
+            rc, out = self._aml_update_retry(
+                ["partition", p["name"], pf],
+                tries=2, timeout=1800, log_fn=log)
+            if rc == 0:
+                log(f"     ✓ {p['name']}")
+            else:
+                log(f"     ❌ {p['name']}")
+                fails.append(p["name"])
+        if fails:
+            raise Exception("Ошибка прошивки разделов: " + ", ".join(fails))
+
+        # 5. env и перезагрузка
+        for c in ("setenv upgrade_step 1", "save"):
+            try:
+                self.aml_bulkcmd(c)
+            except Exception:
+                pass
+        if do_reset:
+            log("🔄 Перезагрузка устройства...")
+            try:
+                self.aml_bulkcmd("reset")
+            except Exception:
+                pass
 
     def _burn_package_sequence(self, wd, all_parts, to_flash,
                                 platform_cfg, wipe, do_reset, log):
@@ -5624,6 +6067,9 @@ class FlasherGUI:
             _t.sleep(2)
         else:
             raise Exception("Amlogic устройство не найдено (USB Boot режим?)")
+        # Устройству нужно время стабилизироваться после re-enumeration:
+        # сразу следующий `update write` может зависнуть
+        _t.sleep(2.5)
 
         # Адреса из platform.conf
         ddr_load  = platform_cfg.get("DDRLoad", "0xfffa0000")
@@ -5639,6 +6085,13 @@ class FlasherGUI:
         bl2_name = svc.get("DDR")
         tpl_name = svc.get("UBOOT_COMP") or svc.get("UBOOT")
         bl2 = f(bl2_name); tpl = f(tpl_name)
+        if not (tpl and os.path.exists(tpl)):
+            # [USB, UBOOT] может быть backup-элементом пакера (не распакован
+            # в отдельный файл) и по определению равен DDR.USB — используем bl2
+            if bl2 and os.path.exists(bl2):
+                log(f"  ℹ {tpl_name or 'UBOOT.USB'} не распакован "
+                    "(backup-элемент = DDR.USB) — использую DDR.USB как tpl")
+                tpl = bl2
 
         # bootloader/dtb разделы из списка
         boot_part = next((p for p in all_parts if p["name"] == "bootloader"), None)
@@ -5646,22 +6099,63 @@ class FlasherGUI:
         dtb_meson1 = svc.get("meson1")
 
         # ── Инициализация DDR (gxl) ──
-        if bl2 and os.path.exists(bl2) and os.path.exists(ddr_init):
+        if bl2 and os.path.exists(bl2):
+            if not os.path.exists(ddr_init):
+                log("📥 usbbl2runpara_*.bin не найдены — скачиваю (параметры "
+                    "запуска bl2 из khadas/utils)...")
+                self._ensure_burn_runpara(log_fn=log)
+            if not os.path.exists(ddr_init):
+                raise Exception(
+                    f"Не хватает {os.path.basename(ddr_init)} (и второй части) "
+                    f"в {FILE_DIR} — без них нельзя инициализировать DDR и "
+                    "запустить U-Boot из пакета. Скачайте вручную: "
+                    "github.com/khadas/utils → aml-flash-tool/tools/datas/")
             log("⚙ Инициализация DDR...")
-            self.aml_update_raw(["cwr", bl2, ddr_load], timeout=30, log_fn=log)
-            self.aml_update_raw(["write", ddr_init, bl2_para], timeout=30, log_fn=log)
-            self.aml_update_raw(["run", ddr_run], timeout=30, log_fn=log)
+            self._aml_update_retry(["cwr", bl2, ddr_load], timeout=60, log_fn=log)
+            self._aml_update_retry(["write", ddr_init, bl2_para],
+                                   timeout=60, log_fn=log)
+            self._aml_update_retry(["run", ddr_run], timeout=60, log_fn=log)
             for _ in range(8):
                 _t.sleep(1)
-            rc, out = self.aml_update_raw(["identify", "7"], timeout=10, log_fn=log)
-            # ── Запуск U-Boot ──
+            rc, out = self.aml_update_raw(["identify", "7"], timeout=10,
+                                          log_fn=log)
+            if "firmware" not in out.lower():
+                raise Exception("После DDR init устройство не ответило на "
+                                "identify — повторите вход в USB Boot")
+            # Новый USB-протокол: 4-е поле версии firmware == '8'
+            # ("This firmware version is 0-0-1-8-0-1-0"). В этом случае
+            # bl2 требует `run <bl2ParaAddr>`, иначе все дальнейшие записи
+            # падают по таймауту (usbWriteFile -60). См. flash-tool (khadas):
+            #   if [[ $usb_protocol == "8" ]]; then run_update_assert run $bl2_params
+            ver = out.lower().split("firmware version is")[-1].strip()
+            fields = ver.split("-")
+            usb_protocol = fields[3] if len(fields) > 3 else "0"
+            log(f"  🔌 USB-протокол устройства: {usb_protocol} "
+                f"(firmware {ver})")
+            if usb_protocol == "8":
+                self._aml_update_retry(["run", bl2_para],
+                                       timeout=60, log_fn=log)
+                for _ in range(4):
+                    _t.sleep(1)
+            # ── Запуск U-Boot (порядок как в khadas flash-tool, gxl) ──
             log("⚙ Запуск U-Boot...")
-            self.aml_update_raw(["write", bl2, ddr_load], timeout=30, log_fn=log)
-            if os.path.exists(fip_run):
-                self.aml_update_raw(["write", fip_run, bl2_para], timeout=30, log_fn=log)
+            self._aml_update_retry(["write", bl2, ddr_load],
+                                   timeout=60, log_fn=log)
+            # runfipimg: «tell bl2 to jump to tpl, aka u-boot»
+            self._aml_update_retry(["write", fip_run, bl2_para],
+                                   timeout=60, log_fn=log)
             if tpl and os.path.exists(tpl):
-                self.aml_update_raw(["write", tpl, uboot_load], timeout=60, log_fn=log)
-            self.aml_update_raw(["run", uboot_run], timeout=30, log_fn=log)
+                self._aml_update_retry(["write", tpl, uboot_load],
+                                       timeout=90, log_fn=log)
+            else:
+                log("  ⚠ tpl (UBOOT) не найден в пакете — пропускаю запись")
+            # Для нового протокола запуск через bl2_params, а не UbootRun
+            if usb_protocol == "8":
+                self._aml_update_retry(["run", bl2_para],
+                                       timeout=60, log_fn=log)
+            else:
+                self._aml_update_retry(["run", uboot_run],
+                                       timeout=60, log_fn=log)
             for _ in range(8):
                 _t.sleep(1)
             log("✓ U-Boot загружен")
@@ -5671,8 +6165,16 @@ class FlasherGUI:
                 log("✗ Устройство не вернулось на USB после загрузки U-Boot —"
                     " прерываю (переподключите питание/USB и повторите)")
                 raise Exception("Устройство пропало с USB после загрузки U-Boot")
+            # Синхронизация после reset (khadas: «avoid to loose 4 bytes
+            # of commands after reset»)
+            try:
+                self.aml_bulkcmd("echo 12345")
+            except Exception:
+                pass
         else:
-            log("⚠ Не найдены bl2/ddrinit — предполагаем, что U-Boot уже запущен")
+            log("⚠ В пакете нет DDR.USB (bl2) — предполагаем, что U-Boot "
+                "уже запущен (иначе: полное отключение питания → замкнуть "
+                "пин 6 на GND → подать питание → USB Boot)")
 
         # ── DTB в память ──
         if dtb_meson1 and os.path.exists(f(dtb_meson1)):
@@ -5836,6 +6338,28 @@ class FlasherGUI:
         if "ERR" in out.upper():
             rc = 1
         return rc, out
+
+    def _aml_update_retry(self, args, tries=3, timeout=60, log_fn=None):
+        """aml_update_raw с ретраями при rc != 0 (включая таймаут).
+
+        После пере-энумерации USB (DDR init / запуск U-Boot) одиночный запуск
+        update может зависнуть в ожидании устройства или не найти его —
+        повторный запуск после паузы решает.
+        """
+        label = "update " + " ".join(str(a) for a in args[:2])
+        last_rc, last_out = -1, ""
+        for i in range(1, tries + 1):
+            rc, out = self.aml_update_raw(args, timeout=timeout, log_fn=log_fn)
+            if rc == 0:
+                return rc, out
+            last_rc, last_out = rc, out
+            if log_fn:
+                log_fn(f"  ⚠ {label} — попытка {i}/{tries} не удалась"
+                       + (" (таймаут)" if out == "timeout" else ""))
+            self._release_aml_usb()
+            self._wait_amlogic_usb(20, log_fn=log_fn)
+            time.sleep(1.5)
+        return last_rc, last_out
     
     def _apply_unlock_minimum(self):
         """Применить необходимый минимум разблокировки в ЖИВОМ U-Boot.
