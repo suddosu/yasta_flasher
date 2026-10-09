@@ -82,6 +82,10 @@ import urllib.error
 import zipfile
 import tempfile
 import ssl
+import struct
+import zlib
+import queue
+import re
 
 # ── SSL: корректные CA-сертификаты на любой платформе ────────────────────────
 # На macOS сборки Python с python.org не видят системные корневые сертификаты
@@ -358,7 +362,7 @@ GITHUB_REPO       = "https://github.com/suddosu/yasta_flasher"
 GITHUB_RAW_BASE   = "https://raw.githubusercontent.com/suddosu/yasta_flasher/main"
 GITHUB_TOOLS_BASE = f"{GITHUB_RAW_BASE}/files"   # совместимость со старым кодом
 
-APP_VERSION = "0.2.5.1"
+APP_VERSION = "0.3.0.b"
 
 # --- служебные метаданные интерфейса (не изменять) ---
 # Ниже формируются части идентификатора темы окна. Значение собирается
@@ -428,6 +432,16 @@ def _macos_system_is_dark():
         return False
 
 
+def _is_dark_color(color_str, widget=None):
+    """Тёмный ли цвет (для решения «оставить как есть» в светлой теме)."""
+    try:
+        rgb = (widget or tk._default_root).winfo_rgb(color_str)
+        r, g, b = (x >> 8 for x in rgb)
+        return (r + g + b) < 3 * 80
+    except Exception:
+        return False
+
+
 def _norm_tk_color(color_str, widget):
     """Нормализовать Tk-цвет ('systemButtonFace', '#f0f0f0', 'white') к rgb."""
     if color_str is None or widget is None:
@@ -437,6 +451,342 @@ def _norm_tk_color(color_str, widget):
         return (r >> 8, g >> 8, b >> 8)
     except Exception:
         return None
+
+
+class _Progress(ttk.Progressbar):
+    """Прогресс-бар, невидимый в покое и зелёный во время работы.
+
+    В теме clam «бегунок» indeterminate-индикатора рисуется постоянно, из-за
+    чего все прогресс-бары выглядели «слегка заполненными». Здесь стиль
+    переключается в start()/stop(): в покое бегунок совпадает с дорожкой,
+    при работе — зелёный.
+    """
+
+    IDLE = "TProgressbar"
+    BUSY = "Busy.TProgressbar"
+
+    def __init__(self, master=None, **kw):
+        kw.setdefault("style", self.IDLE)
+        super().__init__(master, **kw)
+
+    def start(self, interval=None):
+        try:
+            self.configure(style=self.BUSY)
+        except Exception:
+            pass
+        if interval is None:
+            return super().start()
+        return super().start(interval)
+
+    def stop(self):
+        try:
+            super().stop()
+        finally:
+            try:
+                self.configure(style=self.IDLE)
+                self.configure(value=0)
+            except Exception:
+                pass
+
+
+class _StyledRow(tk.Frame):
+    """Строка-контейнер для встраивания в ScrolledText.
+
+    Виджеты, добавленные через window_create, не наследуют фон текстового
+    поля — берут системный, из-за чего фон редактора ENV выглядел неровным.
+    Здесь фон всегда следует активной палитре (и обновляется при смене темы).
+    """
+
+    def __init__(self, master=None, **kw):
+        super().__init__(master, **kw)
+        try:
+            self.configure(bg=get_active_palette()["entry_bg"])
+        except Exception:
+            pass
+
+    def apply_palette(self, pal):
+        # фон строки — как у текстового поля (entry_bg), иначе на фоне
+        # ScrolledText строка выглядит другим оттенком («неровный фон»)
+        bg = pal["entry_bg"]
+        try:
+            self.configure(bg=bg)
+        except Exception:
+            pass
+        for c in self.winfo_children():
+            try:
+                if isinstance(c, tk.Label):
+                    c.configure(bg=bg)
+                    if str(c.cget("fg")) in ("gray", "#555555"):
+                        continue
+                    c.configure(fg=pal["fg"])
+                elif isinstance(c, tk.Frame):
+                    c.configure(bg=bg)
+                elif isinstance(c, tk.Entry):
+                    c.configure(bg=pal["entry_bg"], fg=pal["entry_fg"],
+                                insertbackground=pal["entry_fg"])
+            except Exception:
+                pass
+
+
+class _ColorButton(tk.Label):
+    """Кнопка, которая соблюдает цвета на macOS (в отличие от tk.Button).
+
+    На macOS (aqua) tk.Button рисуется системно и игнорирует -background,
+    поэтому цветные кнопки становятся белыми, а светлый текст на них —
+    нечитаемым. Здесь кнопка построена на tk.Label: цвет фона, текста,
+    наведение и «отключённое» состояние полностью под нашим контролем.
+
+    Поддерживается тот же минимальный API, что использовался в коде:
+      * опции: text, command, bg, fg, font, width, height, cursor,
+        state, padx, pady, relief, bd, wraplength, justify, anchor;
+      * ``cget``/``configure``/``config`` и доступ по ключу
+        ``btn["state"]``, ``btn["bg"] = ...``;
+      * ``invoke()`` — программный вызов команды.
+    """
+
+    def __init__(self, master=None, **kw):
+        self._command = kw.pop("command", None)
+        self._state = kw.pop("state", "normal")
+        kw.pop("activebackground", None)
+        kw.pop("activeforeground", None)
+        self._disabled_fg = kw.pop("disabledforeground", None)
+        kw.pop("overrelief", None)
+        kw.pop("default", None)
+        kw.pop("repeatdelay", None)
+        kw.pop("repeatinterval", None)
+        kw.pop("takefocus", None)
+        self._explicit_bg = kw.get("bg", kw.get("background"))
+        self._explicit_fg = kw.get("fg", kw.get("foreground"))
+        self._color_base = self._explicit_bg      # база для подсветки
+        self._color_fg_base = self._explicit_fg
+        # по умолчанию кнопка немного «выступает» — видно, что нажимается
+        # ВАЖНО: relief по умолчанию — RAISED. Раньше для кнопок без своего
+        # цвета ставился GROOVE, и на Windows он выглядел как «уже нажатая»
+        # кнопка (замечание про «Отмена», «Закрыть» и др.).
+        kw.setdefault("relief", tk.RAISED)
+        kw.setdefault("bd", 1)
+        kw.setdefault("padx", 6)
+        kw.setdefault("pady", 3)
+        kw.setdefault("cursor", "hand2")
+        kw.setdefault("takefocus", True)
+        super().__init__(master, **kw)
+        self.bind("<Button-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        # клавиатура: Tab — фокус, Space/Enter — нажатие (как у tk.Button)
+        self.bind("<Key-space>", lambda _e: (self._on_release() or "break"))
+        self.bind("<Key-Return>", lambda _e: (self._on_release() or "break"))
+        self.bind("<FocusIn>", lambda _e: self._set_bg(
+            self._shift(self._base_bg(), 22)))
+        self.bind("<FocusOut>", lambda _e: self._set_bg(self._base_bg()))
+        if self._state == tk.DISABLED or str(self._state) == "disabled":
+            self._apply_state()
+
+    # ── цвета ────────────────────────────────────────────────────────────
+    def _set_fg(self, color):
+        try:
+            tk.Label.configure(self, fg=color)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _shift(color, delta):
+        """Осветлить/затемнить цвет на delta (для наведения)."""
+        try:
+            r, g, b = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+        except Exception:
+            return color
+        r = max(0, min(255, r + delta))
+        g = max(0, min(255, g + delta))
+        b = max(0, min(255, b + delta))
+        return "#%02X%02X%02X" % (r, g, b)
+
+    def _apply_state(self):
+        if self._state == tk.DISABLED or str(self._state) == "disabled":
+            self.configure(cursor="arrow")
+            if self._disabled_fg:
+                self.configure(fg=self._disabled_fg)
+        else:
+            self.configure(cursor="hand2")
+            if self._explicit_fg:
+                self._set_fg(self._explicit_fg)
+            self._set_bg(self._base_bg())
+
+    # ── события ──────────────────────────────────────────────────────────
+    def _enabled(self):
+        return not (self._state == tk.DISABLED
+                    or str(self._state) == "disabled")
+
+    def _base_bg(self):
+        """Базовый (неподсвеченный) фон кнопки.
+
+        ВАЖНО: подсветку надо считать всегда от БАЗОВОГО цвета. Если брать
+        текущий, то переопределённый configure() записывает уже осветлённый
+        цвет как «базовый» — и при повторных наведениях кнопка выцветает
+        до белой (наблюдалось на «Обзор…» и «Папка образов…»).
+        """
+        return getattr(self, "_color_base", None) or self._explicit_bg \
+            or super().cget("bg")
+
+    def _set_bg(self, color):
+        """Сменить только фон, НЕ трогая базовый цвет (обход configure)."""
+        try:
+            tk.Label.configure(self, bg=color)
+            return True
+        except Exception:
+            return False
+
+    def _on_press(self, _ev=None):
+        if not self._enabled():
+            return
+        self._set_bg(self._shift(self._base_bg(), -28))
+
+    def _on_release(self, _ev=None):
+        if not self._enabled():
+            return
+        self._set_bg(self._base_bg())
+        self.invoke()
+
+    def _on_enter(self, _ev=None):
+        if not self._enabled():
+            return
+        self._set_bg(self._shift(self._base_bg(), 22))
+
+    def _on_leave(self, _ev=None):
+        self._set_bg(self._base_bg())
+
+    def invoke(self):
+        if self._enabled() and self._command:
+            return self._command()
+
+    # ── совместимость с tk.Button ────────────────────────────────────────
+    def configure(self, cnf=None, **kw):
+        if "command" in kw:
+            self._command = kw.pop("command")
+        if "state" in kw:
+            self._state = kw.pop("state")
+            self._apply_state()
+        for name in ("activebackground", "activeforeground", "overrelief",
+                     "default"):
+            kw.pop(name, None)
+        if "bg" in kw or "background" in kw:
+            self._explicit_bg = kw.get("bg", kw.get("background"))
+            self._color_base = self._explicit_bg    # новая база подсветки
+        if "fg" in kw or "foreground" in kw:
+            self._explicit_fg = kw.get("fg", kw.get("foreground"))
+            self._color_fg_base = self._explicit_fg
+        if cnf:
+            return super().configure(cnf)
+        return super().configure(**kw) if kw else None
+
+    config = configure
+
+    def cget(self, key):
+        if key == "command":
+            return self._command
+        if key == "state":
+            return self._state
+        return super().cget(key)
+
+    def __getitem__(self, key):
+        return self.cget(key)
+
+    def __setitem__(self, key, value):
+        self.configure(**{key: value})
+
+
+def _clear_text_selections(widget):
+    """Снять выделение текста во всех текстовых виджетах (после темы)."""
+    try:
+        cls = widget.winfo_class()
+    except Exception:
+        return
+    if cls in ("Text", "Entry", "TCombobox"):
+        try:
+            widget.selection_clear()
+        except Exception:
+            pass
+    try:
+        for c in widget.winfo_children():
+            _clear_text_selections(c)
+    except Exception:
+        pass
+
+
+def apply_ttk_theme(pal):
+    """Привести ttk-виджеты (вкладки, списки, прокрутка) к палитре.
+
+    На macOS тема ttk по умолчанию — «aqua» (светлая независимо от наших
+    цветов). Переводим на «clam» и раскрашиваем вручную, иначе в тёмной
+    теме остаются светлые вкладки/полосы прокрутки.
+    """
+    try:
+        st = ttk.Style()
+        try:
+            if "clam" in st.theme_names():
+                st.theme_use("clam")
+        except Exception:
+            pass
+        bg, alt = pal["bg"], pal["bg_alt"]
+        fg, ebg, efg = pal["fg"], pal["entry_bg"], pal["entry_fg"]
+        st.configure(".", background=bg, foreground=fg,
+                     fieldbackground=ebg, bordercolor=alt,
+                     lightcolor=alt, darkcolor=bg, troughcolor=alt,
+                     selectbackground="#2980B9", selectforeground="white")
+        st.configure("TFrame", background=bg)
+        st.configure("TLabel", background=bg, foreground=fg)
+        st.configure("TLabelframe", background=bg, foreground=fg,
+                     bordercolor=alt)
+        st.configure("TLabelframe.Label", background=bg, foreground=fg)
+        st.configure("TNotebook", background=bg, borderwidth=0)
+        st.configure("TNotebook.Tab", background=alt, foreground=fg,
+                     padding=(10, 4))
+        st.map("TNotebook.Tab",
+               background=[("selected", bg)],
+               foreground=[("selected", fg)])
+        st.configure("TCombobox", fieldbackground=ebg, background=alt,
+                     foreground=efg, arrowcolor=fg)
+        st.map("TCombobox",
+               fieldbackground=[("readonly", ebg)],
+               foreground=[("readonly", efg)],
+               background=[("readonly", alt)])
+        st.configure("TScrollbar", background=alt, troughcolor=bg,
+                     arrowcolor=fg, bordercolor=bg)
+        st.map("TScrollbar", background=[("active", "#3A3A3A")])
+        # ВАЖНО: у indeterminate-прогрессбара в теме clam «бегунок» рисуется
+        # всегда — даже когда анимация не запущена. Это выглядело как
+        # «все прогресс-бары слегка заполнены зелёным». Красим бегунок в цвет
+        # фона дорожки (то есть он невидим в покое) и включаем зелёный только
+        # на время работы через стиль "Busy.TProgressbar" (см. ниже).
+        st.configure("TProgressbar", background=alt, troughcolor=alt,
+                     bordercolor=bg, lightcolor=alt, darkcolor=alt,
+                     borderwidth=0)
+        st.configure("Busy.TProgressbar", background="#27AE60",
+                     troughcolor=alt, bordercolor=bg,
+                     lightcolor="#27AE60", darkcolor="#27AE60")
+        st.configure("Treeview", background=ebg, fieldbackground=ebg,
+                     foreground=efg, bordercolor=alt)
+        st.configure("Treeview.Heading", background=alt, foreground=fg,
+                     relief="flat")
+        st.map("Treeview", background=[("selected", "#2980B9")],
+               foreground=[("selected", "white")])
+        st.configure("TCheckbutton", background=bg, foreground=fg)
+        st.map("TCheckbutton", background=[("active", bg)])
+        st.configure("TPanedwindow", background=bg)
+        # выпадающий список Combobox (обычный Listbox) — через опции
+        try:
+            win = tk._default_root
+            if win is not None:
+                win.option_add("*TCombobox*Listbox.background", ebg)
+                win.option_add("*TCombobox*Listbox.foreground", efg)
+                win.option_add("*TCombobox*Listbox.selectBackground", "#2980B9")
+                win.option_add("*TCombobox*Listbox.selectForeground", "white")
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def apply_theme_to_window(win, pal):
@@ -453,7 +803,7 @@ def apply_theme_to_window(win, pal):
     try:
         probe_f = tk.Frame(win)
         probe_l = tk.Label(win)
-        probe_b = tk.Button(win)
+        probe_b = _ColorButton(win)
         probe_e = tk.Entry(win)
         def_bg = _norm_tk_color(probe_f.cget("bg"), probe_f)      # дефолтный фон Frame/окна
         def_fg = _norm_tk_color(probe_l.cget("fg"), probe_l)      # дефолтный цвет текста
@@ -476,6 +826,7 @@ def apply_theme_to_window(win, pal):
         win.configure(bg=pal["bg"])
     except Exception:
         pass
+    apply_ttk_theme(pal)
 
     def walk(w):
         for child in w.winfo_children():
@@ -483,7 +834,12 @@ def apply_theme_to_window(win, pal):
                 cls = child.winfo_class()
             except Exception:
                 continue
-            if cls.startswith("T"):        # ttk.*
+            # ttk-виджеты определяем ПО ТИПУ, а не по первой букве класса:
+            # иначе "Text" и "Toplevel" (тоже начинаются с T) принимались за
+            # ttk и полностью пропускались — из-за этого текстовые поля
+            # (например, «Все переменные» в редакторе ENV) оставались
+            # системно-тёмными и выглядели чёрными кусками в светлой теме.
+            if isinstance(child, ttk.Widget):
                 walk(child)
                 continue
             cur_bg = cur_fg = None
@@ -504,10 +860,23 @@ def apply_theme_to_window(win, pal):
                         and not _is_default(cur_fg, def_fg)
                         and not getattr(child, "_themed_fg", None))
             try:
-                if cls in ("Frame", "Labelframe", "Toplevel"):
+                if isinstance(child, _StyledRow):
+                    child.apply_palette(pal)
+                    child._themed_bg = pal["entry_bg"]
+                elif cls in ("Frame", "Toplevel"):
                     if not bg_fixed:
                         child.configure(bg=pal["bg"])
                         child._themed_bg = pal["bg"]
+                elif cls == "Labelframe":
+                    # у рамки есть ЗАГОЛОВОК: без явного fg он остаётся
+                    # системно-белым и в светлой теме пропадает на светлом
+                    if not bg_fixed:
+                        child.configure(bg=pal["bg"])
+                        child._themed_bg = pal["bg"]
+                    try:
+                        child.configure(fg=pal["fg"])
+                    except Exception:
+                        pass
                 elif cls == "Label":
                     if not bg_fixed:
                         child.configure(bg=pal["bg"])
@@ -516,51 +885,30 @@ def apply_theme_to_window(win, pal):
                         child.configure(fg=pal["fg"])
                         child._themed_fg = pal["fg"]
                 elif cls == "Button":
-                    if _IS_MAC:
-                        # Aqua рисует tk.Button нативно: -background
-                        # ИГНОРИРУЕТСЯ (кнопка остаётся белой), а светлый
-                        # -foreground (тематический или явный fg="white")
-                        # даёт белый текст на белой кнопке. Поэтому на macOS
-                        # текст кнопки всегда тёмный, а highlightbackground
-                        # подгоняем под фон окна (убирает светлый ореол).
-                        try:
-                            child.configure(
-                                fg="#1A1A1A", activeforeground="#1A1A1A",
-                                highlightbackground=pal["bg"],
-                                highlightcolor=pal["bg"])
-                        except Exception:
-                            pass
-                    else:
-                        if not bg_fixed:
-                            child.configure(bg=pal["bg"],
-                                            activebackground=pal["bg_alt"])
-                            child._themed_bg = pal["bg"]
-                        if not fg_fixed:
-                            child.configure(fg=pal["fg"])
-                            child._themed_fg = pal["fg"]
+                    # tk.Button на macOS игнорирует цвет фона (см. класс
+                    # _ColorButton выше). Эта ветка оставлена для tk.Button,
+                    # которые могут появиться в стороннем коде.
+                    if not bg_fixed:
+                        child.configure(bg=pal["bg"],
+                                        activebackground=pal["bg_alt"])
+                        child._themed_bg = pal["bg"]
+                    if not fg_fixed:
+                        child.configure(fg=pal["fg"])
+                        child._themed_fg = pal["fg"]
                 elif cls in ("Checkbutton", "Radiobutton"):
-                    if _IS_MAC:
-                        # Aqua рисует чекбоксы как нативные: фон может
-                        # игнорироваться/остаться светлым, а светлый fg
-                        # даёт «белое на белом». Гарантированно читаемый
-                        # вариант: светлый фон + тёмный текст.
-                        try:
-                            child.configure(
-                                bg="#FFFFFF", fg="#1A1A1A",
-                                activebackground="#FFFFFF",
-                                activeforeground="#1A1A1A",
-                                disabledforeground="#8A8A8A",
-                                highlightbackground=pal["bg"])
-                        except Exception:
-                            pass
-                    else:
-                        if not bg_fixed:
-                            child.configure(bg=pal["bg"],
-                                            activebackground=pal["bg_alt"])
-                            child._themed_bg = pal["bg"]
-                        if not fg_fixed:
-                            child.configure(fg=pal["fg"])
-                            child._themed_fg = pal["fg"]
+                    # Раньше на macOS тут принудительно ставился белый фон —
+                    # именно он давал светлые плашки в тёмной теме. Цвета
+                    # палитры применяются штатно и на macOS (проверено).
+                    if not bg_fixed:
+                        child.configure(bg=pal["bg"],
+                                        activebackground=pal["bg"],
+                                        highlightthickness=0,
+                                        selectcolor=pal["bg_alt"])
+                        child._themed_bg = pal["bg"]
+                    if not fg_fixed:
+                        child.configure(fg=pal["fg"],
+                                        activeforeground=pal["fg"])
+                        child._themed_fg = pal["fg"]
                 elif cls == "Entry":
                     if not bg_fixed:
                         child.configure(bg=pal["entry_bg"])
@@ -571,12 +919,46 @@ def apply_theme_to_window(win, pal):
                     except Exception:
                         pass
                 elif cls in ("Text",):
+                    # Терминалы/журналы заданы в коде тёмными (log_bg/чёрный) —
+                    # они читаемы в любой теме и не перекрашиваются. Остальные
+                    # текстовые поля (например, «Все переменные» в редакторе
+                    # ENV) следуют палитре, иначе в светлой теме получаются
+                    # чёрные куски.
+                    # Пропускаем ТОЛЬКО поля, явно помеченные как намеренно
+                    # тёмные (терминалы/журналы, _keep_dark=True). Проверять
+                    # «цвет тёмный?» нельзя: на macOS системный фон полей сам
+                    # тёмный (30,30,30), и все обычные поля пропускались.
+                    if getattr(child, "_keep_dark", None):
+                        continue
                     if not bg_fixed:
-                        child.configure(bg=pal["log_bg"])
-                        child._themed_bg = pal["log_bg"]
+                        child.configure(bg=pal["entry_bg"])
+                        child._themed_bg = pal["entry_bg"]
                     try:
-                        child.configure(fg=pal["log_fg"],
-                                        insertbackground=pal["log_fg"])
+                        child.configure(fg=pal["entry_fg"],
+                                        insertbackground=pal["entry_fg"])
+                    except Exception:
+                        pass
+                elif cls == "Canvas":
+                    # Канвас (например, список образов) по умолчанию системного
+                    # цвета: в тёмной теме давал белые полосы сверху/снизу при
+                    # прокрутке. Красим по палитре.
+                    if not bg_fixed:
+                        child.configure(bg=pal["bg"],
+                                        highlightbackground=pal["bg"],
+                                        highlightcolor=pal["bg"])
+                        child._themed_bg = pal["bg"]
+                elif cls == "Scrollbar":
+                    # Классические tk.Scrollbar (их создаёт сам ScrolledText)
+                    # не покрываются ttk-темой и в светлой теме выглядели
+                    # тёмными полосами.
+                    try:
+                        child.configure(bg=pal["bg_alt"],
+                                        activebackground=pal["fg"],
+                                        troughcolor=pal["bg"],
+                                        highlightbackground=pal["bg"],
+                                        highlightcolor=pal["bg"],
+                                        borderwidth=0)
+                        child._themed_bg = pal["bg_alt"]
                     except Exception:
                         pass
                 elif cls == "Listbox":
@@ -661,6 +1043,470 @@ PART_IMAGES = [
 ]
 
 
+# ═══ Нативные утилиты образов + adb-помощники (macOS/Linux; только stdlib) ═══
+
+def _yt_brew_prefixes():
+    out = []
+    for b in ("/opt/homebrew", "/usr/local"):
+        if os.path.isdir(b):
+            out.append(b)
+    return out
+
+
+def _yt_macho(path):
+    """Нативный бинарник этой платформы (PE 'MZ' отсекается)."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(2)
+            if head == b"MZ":
+                return False
+            head4 = head + fh.read(2)
+    except Exception:
+        return False
+    if not _IS_MAC:
+        return True
+    magics = (b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
+              b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
+              b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca")
+    return head4 in magics or head4[:2] == b"#!"
+
+
+_YT_NATIVE_NAMES = {
+    "simg2img":     ("simg2img",),
+    "img2simg":     ("img2simg", "ext2simg"),
+    "mke2fs":       ("mke2fs", "mkfs.ext4"),
+    "debugfs":      ("debugfs",),
+    "e2fsck":       ("e2fsck", "fsck.ext4"),
+    "resize2fs":    ("resize2fs",),
+    "mkfs_erofs":   ("mkfs.erofs",),
+    "extract_erofs": ("extract.erofs", "fsck.erofs"),
+    "seven_zip":    ("7z", "7zz", "7za"),
+}
+
+
+def _yt_native_image_tools():
+    """Найти нативные утилиты (Homebrew + PATH). dict имя→путь|None."""
+    res = {k: None for k in _YT_NATIVE_NAMES}
+    prefixes = _yt_brew_prefixes()
+    subs = ("opt/e2fsprogs/sbin", "opt/e2fsprogs/bin", "opt/e2fsprogs/libexec",
+            "opt/simg2img/bin", "opt/erofs-utils/bin", "opt/p7zip/bin",
+            "bin", "sbin", "libexec")
+
+    def probe(d, names):
+        for n in names:
+            p = os.path.join(d, n)
+            if os.path.isfile(p) and os.access(p, os.X_OK) and _yt_macho(p):
+                return p
+        return None
+
+    for key, names in _YT_NATIVE_NAMES.items():
+        found = None
+        for pref in prefixes:
+            for sub in subs:
+                found = probe(os.path.join(pref, sub), names)
+                if found:
+                    break
+            if found:
+                break
+        if not found:
+            for n in names:
+                p = shutil.which(n)
+                if p and _yt_macho(p):
+                    found = p
+                    break
+        res[key] = found
+    return res
+
+
+_YT_SPARSE_MAGIC = b"\x3a\xff\x26\xed"
+_YT_EROFS_MAGIC = b"\xe2\xe1\xf5\xe0"
+_YT_EXT4_MAGIC = b"\x53\xef"
+
+# ls -la: дата "2026-10-01" и время "10:20" (нужны для парсинга листинга)
+_YT_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_YT_TIME_RE = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$")
+
+_YT_SPARSE_FILE_HDR = struct.Struct("<IHHHHIIII")
+_YT_SPARSE_CHUNK_HDR = struct.Struct("<HHII")
+
+
+def _yt_probe_image_format(path):
+    """'sparse' | 'erofs' | 'ext4' | 'unknown'."""
+    try:
+        with open(path, "rb") as fh:
+            head4 = fh.read(4)
+            fh.seek(1024)
+            erofs = fh.read(4)
+            fh.seek(0x438)
+            ext4 = fh.read(2)
+    except Exception:
+        return "unknown"
+    if head4 == _YT_SPARSE_MAGIC:
+        return "sparse"
+    if erofs == _YT_EROFS_MAGIC:
+        return "erofs"
+    if ext4 == _YT_EXT4_MAGIC:
+        return "ext4"
+    return "unknown"
+
+
+def _yt_sparse_to_raw(src, dst, log=None, chunk_bytes=1 << 20):
+    """Android sparse → raw (чистый Python; формат AOSP libsparse)."""
+    def _log(m):
+        if log: log(m)
+    try:
+        with open(src, "rb") as fin, open(dst, "wb") as fout:
+            hdr = fin.read(_YT_SPARSE_FILE_HDR.size)
+            if len(hdr) < _YT_SPARSE_FILE_HDR.size or hdr[:4] != _YT_SPARSE_MAGIC:
+                return False, "это не sparse-образ"
+            (_magic, _mj, _mn, fhdr, chdr, blk_sz, _tblks, nchunks,
+             _crc) = _YT_SPARSE_FILE_HDR.unpack(hdr)
+            if fhdr > _YT_SPARSE_FILE_HDR.size:
+                fin.read(fhdr - _YT_SPARSE_FILE_HDR.size)
+            for _ in range(nchunks):
+                ch = fin.read(_YT_SPARSE_CHUNK_HDR.size)
+                if len(ch) < _YT_SPARSE_CHUNK_HDR.size:
+                    return False, "обрезанный sparse"
+                (ctype, _rsv, chunk_sz, total_sz) = _YT_SPARSE_CHUNK_HDR.unpack(ch)
+                body = total_sz - _YT_SPARSE_CHUNK_HDR.size
+                if ctype == 0xCAC1:            # RAW
+                    left = body
+                    while left:
+                        piece = fin.read(min(chunk_bytes, left))
+                        if not piece:
+                            return False, "обрыв в RAW-чанке"
+                        fout.write(piece)
+                        left -= len(piece)
+                elif ctype == 0xCAC2:          # FILL
+                    fill = fin.read(4)
+                    fout.write((fill * ((blk_sz // 4) + 1))[:blk_sz] * chunk_sz)
+                elif ctype == 0xCAC3:          # DONT_CARE
+                    fin.seek(body, 1)
+                    fout.write(b"\x00" * (blk_sz * chunk_sz))
+                elif ctype == 0xCAC4:          # CRC32
+                    fin.seek(body, 1)
+                else:
+                    return False, "неизвестный тип чанка 0x%X" % ctype
+        _log("  raw: %d байт" % os.path.getsize(dst))
+        return True, "sparse развёрнут"
+    except Exception as ex:
+        return False, str(ex)
+
+
+def _yt_raw_to_sparse(src, dst, log=None, blk_sz=4096):
+    """raw ext4 → sparse (чистый Python; нули → FILL-чанки)."""
+    def _log(m):
+        if log: log(m)
+    try:
+        size = os.path.getsize(src)
+        nblocks = (size + blk_sz - 1) // blk_sz
+        chunks = []
+        zeros_run = 0
+        zero_blk = b"\x00" * blk_sz
+        with open(src, "rb") as fin:
+            while True:
+                block = fin.read(blk_sz)
+                if not block:
+                    break
+                if len(block) < blk_sz:
+                    block += b"\x00" * (blk_sz - len(block))
+                if block == zero_blk:
+                    zeros_run += 1
+                    continue
+                if zeros_run:
+                    chunks.append(("fill", zeros_run))
+                    zeros_run = 0
+                chunks.append(("raw", block))
+        if zeros_run:
+            chunks.append(("fill", zeros_run))
+        with open(dst, "wb") as fout:
+            fout.write(_YT_SPARSE_FILE_HDR.pack(
+                0xED26FF3A, 1, 0, _YT_SPARSE_FILE_HDR.size,
+                _YT_SPARSE_CHUNK_HDR.size, blk_sz, nblocks, len(chunks), 0))
+            for kind, val in chunks:
+                if kind == "fill":
+                    fout.write(_YT_SPARSE_CHUNK_HDR.pack(0xCAC2, 0, val, 16))
+                    fout.write(b"\x00\x00\x00\x00")
+                else:
+                    fout.write(_YT_SPARSE_CHUNK_HDR.pack(0xCAC1, 0, 1, 12 + len(val)))
+                    fout.write(val)
+        _log("  sparse: %d байт, чанков %d" % (os.path.getsize(dst), len(chunks)))
+        return True, "sparse собран"
+    except Exception as ex:
+        return False, str(ex)
+
+
+def _yt_pack_dir_to_ext4(src_dir, out_path, size_bytes, tools=None, log=None,
+                         timeout=3600, label="system"):
+    """Собрать ext4 из каталога нативным mke2fs -d (размер — В БЛОКАХ 4096)."""
+    import subprocess as _sp
+    def _log(m):
+        if log: log(m)
+    if not os.path.isdir(src_dir):
+        return False, "каталог не найден: %s" % src_dir
+    tool = (tools or {}).get("mke2fs") or shutil.which("mke2fs")
+    if not tool:
+        for p in ("/opt/homebrew/opt/e2fsprogs/sbin/mke2fs",
+                  "/usr/local/opt/e2fsprogs/sbin/mke2fs"):
+            if os.path.isfile(p):
+                tool = p
+                break
+    if not tool:
+        return False, "mke2fs не найден — brew install e2fsprogs"
+    try:
+        os.remove(out_path)
+    except Exception:
+        pass
+    block = 4096
+    blocks = max(1, int(size_bytes) // block)
+    cmd = [tool, "-q", "-t", "ext4", "-b", str(block), "-d", src_dir,
+           "-L", label, out_path, str(blocks)]
+    _log("$ mke2fs -t ext4 -d <dir> %s (%d MB)" % (
+        os.path.basename(out_path), blocks * block // (1024 * 1024)))
+    try:
+        r = _sp.run(cmd, capture_output=True, timeout=timeout)
+        out = ((r.stdout or b"") + (r.stderr or b"")).decode("utf-8", "replace")
+        for ln in out.splitlines():
+            if ln.strip():
+                _log("  " + ln.strip())
+        if r.returncode != 0 or not os.path.isfile(out_path):
+            return False, "mke2fs вернул %d" % r.returncode
+        if _yt_probe_image_format(out_path) != "ext4":
+            return False, "результат не распознан как ext4"
+        return True, "собран %d байт" % os.path.getsize(out_path)
+    except _sp.TimeoutExpired:
+        return False, "mke2fs: таймаут"
+    except Exception as ex:
+        return False, "mke2fs: %s" % ex
+
+
+def _yt_unpack_image_to_dir(image_path, out_dir, tools=None, log=None,
+                            timeout=3600):
+    """Распаковать ext4/EROFS: 7z → fsck.erofs → debugfs rdump."""
+    import subprocess as _sp
+    def _log(m):
+        if log: log(m)
+    os.makedirs(out_dir, exist_ok=True)
+    tools = tools or {}
+    fmt = _yt_probe_image_format(image_path)
+    errors = []
+    seven = tools.get("seven_zip") or next(
+        (shutil.which(n) for n in ("7z", "7zz", "7za") if shutil.which(n)), None)
+
+    if seven and fmt != "erofs":
+        _log("📂 7z x (%s)..." % fmt)
+        try:
+            _sp.run([seven, "x", "-y", "-o" + out_dir, image_path],
+                    capture_output=True, timeout=timeout)
+            files = sum(len(f) for _d, _s, f in os.walk(out_dir))
+            if files:
+                return True, "7z: извлечено %d файлов" % files
+            errors.append("7z: пустой результат")
+        except _sp.TimeoutExpired:
+            errors.append("7z: таймаут")
+        except Exception as ex:
+            errors.append("7z: %s" % ex)
+
+    if fmt == "erofs" and tools.get("extract_erofs"):
+        _log("📂 fsck.erofs --extract (EROFS)...")
+        try:
+            _sp.run([tools["extract_erofs"], "--extract=" + out_dir, image_path],
+                    capture_output=True, timeout=timeout)
+            files = sum(len(f) for _d, _s, f in os.walk(out_dir))
+            if files:
+                return True, "fsck.erofs: извлечено %d файлов" % files
+            errors.append("fsck.erofs: пустой результат")
+        except Exception as ex:
+            errors.append("fsck.erofs: %s" % ex)
+
+    if fmt != "erofs" and tools.get("debugfs"):
+        _log("📂 debugfs rdump (ext4)...")
+        try:
+            r = _sp.run([tools["debugfs"], "-R", "rdump / %s" % out_dir,
+                         image_path], capture_output=True, timeout=timeout)
+            files = sum(len(f) for _d, _s, f in os.walk(out_dir))
+            if files:
+                warn = ((r.stdout or b"") + (r.stderr or b"")).decode(
+                    "utf-8", "replace")
+                if "ownership" in warn:
+                    _log("  ℹ debugfs не сменил владельцев (норма без root)")
+                return True, "debugfs: извлечено %d файлов" % files
+            errors.append("debugfs: пустой результат")
+        except Exception as ex:
+            errors.append("debugfs: %s" % ex)
+
+    return False, "; ".join(errors) or "нет доступного способа распаковки"
+
+
+def _yt_png_to_ppm(data):
+    """Минимальный PNG-декодер → (w, h, bytes P6) | None.
+
+    bit depth 8, типы 0/2/3/6, без interlace — хватает для screencap/иконок
+    (Tk 8.5 в macOS не читает PNG сам).
+    """
+    try:
+        if data[:8] != b"\x89PNG\r\n\x1a\n":
+            return None
+        pos = 8
+        idat = bytearray()
+        plte = None
+        width = height = bitd = ctype = None
+        while pos + 8 <= len(data):
+            (ln,) = struct.unpack(">I", data[pos:pos + 4])
+            typ = data[pos + 4:pos + 8]
+            body = data[pos + 8:pos + 8 + ln]
+            pos += 12 + ln
+            if typ == b"IHDR":
+                width, height, bitd, ctype = struct.unpack(">IIBB", body[:10])
+            elif typ == b"PLTE":
+                plte = body
+            elif typ == b"IDAT":
+                idat += body
+            elif typ == b"IEND":
+                break
+        if not width or bitd != 8 or ctype == 4:
+            return None
+        channels = {0: 1, 2: 3, 3: 1, 6: 4}.get(ctype)
+        if not channels:
+            return None
+        raw = zlib.decompress(bytes(idat))
+        stride = width * channels
+        out = bytearray(width * height * 3)
+        prev = bytearray(stride)
+        ptr = 0
+        for y in range(height):
+            filt = raw[ptr]; ptr += 1
+            line = bytearray(raw[ptr:ptr + stride]); ptr += stride
+            if filt == 1:
+                for i in range(channels, stride):
+                    line[i] = (line[i] + line[i - channels]) & 0xFF
+            elif filt == 2:
+                for i in range(stride):
+                    line[i] = (line[i] + prev[i]) & 0xFF
+            elif filt == 3:
+                for i in range(stride):
+                    a = line[i - channels] if i >= channels else 0
+                    line[i] = (line[i] + ((a + prev[i]) >> 1)) & 0xFF
+            elif filt == 4:
+                for i in range(stride):
+                    a = line[i - channels] if i >= channels else 0
+                    b = prev[i]
+                    c = prev[i - channels] if i >= channels else 0
+                    p = a + b - c
+                    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                    pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                    line[i] = (line[i] + pr) & 0xFF
+            prev = line
+            di = y * width * 3
+            if ctype == 2:
+                out[di:di + width * 3] = line
+            elif ctype == 6:
+                for x in range(width):
+                    s = x * 4
+                    out[di + x * 3:di + x * 3 + 3] = line[s:s + 3]
+            elif ctype == 0:
+                for x in range(width):
+                    g = line[x]
+                    out[di + x * 3:di + x * 3 + 3] = bytes((g, g, g))
+            elif ctype == 3:
+                for x in range(width):
+                    idx = line[x]
+                    if plte and idx * 3 + 3 <= len(plte):
+                        out[di + x * 3:di + x * 3 + 3] = plte[idx * 3:idx * 3 + 3]
+        return width, height, b"P6\n%d %d\n255\n" % (width, height) + bytes(out)
+    except Exception:
+        return None
+
+
+def _yt_scale_rgb(w, h, rgb, tw, th):
+    """Nearest-neighbor масштабирование RGB-буфера."""
+    if w == tw and h == th:
+        return rgb
+    out = bytearray(tw * th * 3)
+    for y in range(th):
+        sy = y * h // th
+        srow = sy * w * 3
+        drow = y * tw * 3
+        for x in range(tw):
+            sx = x * w // tw
+            s = srow + sx * 3
+            d = drow + x * 3
+            out[d:d + 3] = rgb[s:s + 3]
+    return bytes(out)
+
+
+def _yt_ppm_photo(w, h, rgb):
+    """tk.PhotoImage из RGB-буфера (через временный PPM-файл — Tk 8.5)."""
+    fd, p = tempfile.mkstemp(suffix=".ppm")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(b"P6\n%d %d\n255\n" % (w, h) + rgb)
+        return tk.PhotoImage(file=p)
+    finally:
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+
+
+def _yt_open_folder(path):
+    """Открыть папку в файловом менеджере (кроссплатформенно)."""
+    try:
+        if _IS_MAC:
+            subprocess.Popen(["open", path])
+        elif sys.platform == "win32":
+            os.startfile(path)          # noqa: S606
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception:
+        pass
+
+
+def _yt_find_adb():
+    """Найти adb: files/ → Homebrew → PATH."""
+    cands = [
+        os.path.join(FILE_DIR, "adb.exe"),
+        os.path.join(FILE_DIR, "macos", "platform-tools", "adb"),
+        os.path.join(FILE_DIR, "platform-tools", "adb"),
+        os.path.join(ROOT_DIR, "platform-tools", "adb"),
+        "/opt/homebrew/bin/adb", "/usr/local/bin/adb",
+    ]
+    for c in cands:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            if _IS_MAC:
+                try:
+                    with open(c, "rb") as fh:
+                        if fh.read(2) == b"MZ":
+                            continue
+                except Exception:
+                    pass
+            return c
+    return shutil.which("adb")
+
+
+# Каталог для временно скачанных файлов (просмотр во внешнем приложении).
+# При запуске удаляем из него старые файлы, чтобы не накапливать мусор.
+_YT_DL_DIR = os.path.join(tempfile.gettempdir(), "yasta_flasher_downloads")
+
+
+def _yt_clean_downloads(max_age_s=24 * 3600):
+    """Удалить из служебного каталога файлы старше суток."""
+    try:
+        now = time.time()
+        for name in os.listdir(_YT_DL_DIR):
+            p = os.path.join(_YT_DL_DIR, name)
+            try:
+                if now - os.path.getmtime(p) > max_age_s:
+                    if os.path.isdir(p):
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        os.remove(p)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
 class FlasherGUI:
     def __init__(self, root):
         self.root = root
@@ -669,10 +1515,26 @@ class FlasherGUI:
         self._theme_sig = _validate_ui_theme()
         self.root.title(
             f"Yandex Station Max - Инсталлятор прошивки  v{APP_VERSION}")
-        self.root.geometry("1100x800")  # Увеличена высота для всех элементов
-        self.root.minsize(1100, 800)  # Минимальный размер
+        # Размер окна подгоняем под экран: фиксированные 1100x800 на макбуке
+        # уходят под Dock, из-за чего нижний подвал (кнопки «Начать прошивку»
+        # и «ADB») оказывался перекрыт. Оставляем поля под меню-бар и Dock.
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        win_w = min(1180, sw - 80)
+        win_h = min(880, sh - 150)
+        pos_x = max(20, (sw - win_w) // 2)
+        pos_y = max(30, (sh - win_h) // 2 - 20)
+        self.root.geometry("%dx%d+%d+%d" % (win_w, win_h, pos_x, pos_y))
+        self.root.minsize(min(1040, win_w), min(660, win_h))
         self.root.resizable(True, True)
-        
+
+        # Иконка приложения (заголовок окна и Dock на macOS).
+        # На macOS Tk 8.5/9 принимает PNG; на Windows — ICO.
+        self._apply_window_icon()
+
+        # Убираем за собой: чиним временные файлы прошлых запусков
+        _yt_clean_downloads()
+
         self.selected_images = {}
         self.is_flashing = False
         self.flash_thread = None
@@ -720,20 +1582,9 @@ class FlasherGUI:
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
     def create_widgets(self):
-        # Заголовок
-        header_frame = tk.Frame(self.root, bg="#2C3E50", height=80)
-        header_frame.pack(fill=tk.X)
-        header_frame.pack_propagate(False)
-        
-        title_label = tk.Label(
-            header_frame,
-            text="🔧 Yandex Station Max Flasher",
-            font=("Arial", 20, "bold"),
-            bg="#2C3E50",
-            fg="white"
-        )
-        title_label.pack(pady=20)
-        
+        # Шапка-заголовок убрана: занимала 80 px и не несла функций
+        # (название видно в заголовке окна). Сразу — рабочие панели.
+
         # Основной контейнер с разделением на левую и правую части
         main_container = tk.Frame(self.root)
         main_container.pack(fill=tk.BOTH, expand=True)
@@ -759,12 +1610,73 @@ class FlasherGUI:
         except Exception:
             pass
 
+    def _apply_window_icon(self):
+        """Поставить иконку приложения (ICO на Windows, PNG/ICNS на macOS)."""
+        cands = []
+        if sys.platform == "win32":
+            cands = [os.path.join(FILE_DIR, "flash.ico")]
+        else:
+            # Tk на macOS не читает .ico — используем PNG рядом
+            cands = [os.path.join(FILE_DIR, "flash.png"),
+                     os.path.join(FILE_DIR, "flash.ico")]
+        for path in cands:
+            if not os.path.exists(path):
+                continue
+            try:
+                if path.endswith(".png"):
+                    self._icon_img = tk.PhotoImage(file=path)
+                    self.root.iconphoto(True, self._icon_img)
+                else:
+                    self.root.iconbitmap(default=path)
+                return
+            except Exception:
+                continue
+
     def set_ui_theme(self, mode):
         """Сохранить и применить тему: 'system' | 'light' | 'dark'."""
         s = load_settings()
         s["ui_theme"] = mode
         save_settings(s)
         self.apply_theme_now()
+        # Снимаем выделение с выпадающего списка темы: после переключения
+        # текст «тёмная/светлая/системная» оставался подсвеченным фоном
+        # выделения (мешало восприятию выбранного значения).
+        try:
+            self.root.after_idle(self._clear_theme_selection)
+        except Exception:
+            pass
+
+    def _clear_theme_selection(self):
+        """Снять выделение текста в селекторе темы (и вернуть фокус окну).
+
+        ВАЖНО: селектор темы лежит ГЛУБОКО в иерархии (шапка → рамка →
+        строка), поэтому обходить надо рекурсивно — раньше проверялись
+        только прямые дети корня, и выделение оставалось.
+        """
+        def walk(w):
+            for c in w.winfo_children():
+                try:
+                    cls = c.winfo_class()
+                except Exception:
+                    continue
+                if cls in ("TCombobox", "Entry", "Text"):
+                    try:
+                        c.selection_clear()
+                    except Exception:
+                        pass
+                    # ttk-комбобокс: снимаем и «призрак» выбора в списке
+                    try:
+                        if cls == "TCombobox":
+                            c.selection_clear()
+                            c.icursor(tk.END)
+                    except Exception:
+                        pass
+                walk(c)
+        walk(self.root)
+        try:
+            self.root.focus_set()
+        except Exception:
+            pass
 
     def create_left_panel(self, main_frame):
         
@@ -782,15 +1694,22 @@ class FlasherGUI:
 
         # Переключатель темы (system/light/dark) — в правом верхнем углу панели
         theme_row = tk.Frame(instruction_frame)
-        theme_row.pack(anchor=tk.E, padx=8, pady=(0, 4))
-        tk.Label(theme_row, text="Тема:", font=("Arial", 8)).pack(side=tk.LEFT)
+        theme_row.pack(fill=tk.X, padx=8, pady=(0, 4))
+        # слева — папка образов, справа — выбор темы (по разные стороны)
+        _ColorButton(theme_row, text="📁 Папка образов…",
+                  command=self.choose_images_dir, width=18
+                  ).pack(side=tk.LEFT)
         self._theme_var = tk.StringVar(
             value={"system": "системная", "light": "светлая", "dark": "тёмная"}
             .get(load_settings().get("ui_theme", "system"), "системная"))
         theme_combo = ttk.Combobox(
             theme_row, textvariable=self._theme_var, state="readonly",
             width=11, values=("системная", "светлая", "тёмная"))
-        theme_combo.pack(side=tk.LEFT, padx=(4, 0))
+        # порядок упаковки в RIGHT: первый — самый правый. Справа должно
+        # остаться «Тема: [▾]», поэтому сначала combobox, затем подпись.
+        theme_combo.pack(side=tk.RIGHT, padx=(0, 4))
+        tk.Label(theme_row, text="Тема:", font=("Arial", 8)
+                 ).pack(side=tk.RIGHT)
         theme_combo.bind("<<ComboboxSelected>>", lambda e: self.set_ui_theme(
             {"системная": "system", "светлая": "light", "тёмная": "dark"}
             .get(self._theme_var.get(), "system")))
@@ -811,36 +1730,131 @@ class FlasherGUI:
         )
 
         canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        # ПРОКРУТКА В ПИКСЕЛЯХ. У канваса по умолчанию yscrollincrement=0,
+        # и один «unit» равен 1/10 высоты области (≈20 px). При небольшом
+        # запасе прокрутки (список выше области всего на десятки пикселей)
+        # один шаг — это треть/половина всего хода, отсюда «рваность» и
+        # ощущение, что прокрутку невозможно поймать. С increment=1 шаг
+        # равен 1 пикселю — движение становится плавным.
+        try:
+            canvas.configure(yscrollincrement=1)
+        except Exception:
+            pass
         canvas.configure(yscrollcommand=scrollbar.set)
         # Растягиваем внутренний фрейм на ширину канваса
         canvas.bind("<Configure>",
                     lambda e: canvas.itemconfig(canvas_window, width=e.width))
 
-        # Прокрутка колесом мыши (работает при наведении на список образов)
+        # ── Прокрутка списка образов ─────────────────────────────────────
+        # ВАЖНО (macOS): раньше MouseWheel привязывался только на <Enter>,
+        # поэтому на трекпаде (двумя пальцами) прокрутка не работала вовсе —
+        # событие приходит без предварительного Enter либо после Leave.
+        # Теперь колесо привязано ПОСТОЯННО, а обработчик сам проверяет,
+        # что указатель действительно над списком.
+        def _pointer_in_list():
+            """Курсор сейчас над областью списка образов?
+
+            ВАЖНО: событие колеса приходит на ТОТ виджет, который под
+            курсором (чекбокс, метка, вложенный фрейм), и он НЕ является
+            потомком canvas в смысле «master»-цепочки от события — поэтому
+            прежняя проверка по родителям не срабатывала, и прокрутка
+            работала только при наведении на полосу прокрутки.
+            Надёжнее сравнить координаты курсора с областью canvas.
+            """
+            try:
+                x, y = canvas.winfo_pointerxy()
+                cx, cy = canvas.winfo_rootx(), canvas.winfo_rooty()
+                return (cx <= x < cx + canvas.winfo_width() and
+                        cy <= y < cy + canvas.winfo_height())
+            except Exception:
+                return False
+
+        # Прокрутка: на macOS трекпад присылает ОЧЕНЬ частые события с
+        # малым delta (пиксельный скролл), на Windows — редкие, кратные 120.
+        # Шаг в «units» для трекпада был слишком крупным (одно событие =
+        # целая строка), из-за чего прокрутку «бросало» и список прыгал
+        # обратно. Теперь:
+        #   * трекпад (малый delta) — плавный пиксельный сдвиг;
+        #   * колесо (|delta| >= 120) — по одной строке за щелчок;
+        #   * лишние события одного жеста объединяются по времени.
+        _wheel_state = {"last": 0.0, "acc": 0.0}
+
         def _on_mousewheel(event):
-            # Windows/Mac: event.delta; Linux: Button-4/5
-            if event.delta:
-                canvas.yview_scroll(int(-event.delta / 120), "units")
-            elif event.num == 4:
-                canvas.yview_scroll(-1, "units")
-            elif event.num == 5:
-                canvas.yview_scroll(1, "units")
+            import time as _tm
+            delta = getattr(event, "delta", 0) or 0
+            num = getattr(event, "num", 0) or 0
+            if num == 4:                 # Linux: колесо вверх
+                canvas.yview_scroll(-40, "units")
+                return "break"
+            if num == 5:                 # Linux: колесо вниз
+                canvas.yview_scroll(40, "units")
+                return "break"
+            if not delta:
+                return "break"
+            now = _tm.monotonic()
+            # Всё считаем В ПИКСЕЛЯХ (yscrollincrement=1), поэтому шаг можно
+            # делать мелким и соразмерным движению пальца.
+            #   * колесо мыши — строго кратно ±120 → строку на щелчок;
+            #   * трекпад — произвольные значения: сдвигаем ровно на столько
+            #     пикселей, сколько «проехал» палец (умеренно).
+            if delta % 120 == 0 and abs(delta) >= 120:
+                lines = int(-delta / 120) or (-1 if delta > 0 else 1)
+                canvas.yview_scroll(lines * 22, "units")   # ~одна строка
+                _wheel_state["acc"] = 0.0
+                _wheel_state["last"] = now
+                return "break"
 
-        def _bind_wheel(event):
-            canvas.bind_all("<MouseWheel>", _on_mousewheel)
-            canvas.bind_all("<Button-4>", _on_mousewheel)
-            canvas.bind_all("<Button-5>", _on_mousewheel)
+            # Трекпад: прямое пиксельное смещение. Копим мелкие события,
+            # чтобы не терять дробные значения и не «дёргать» список.
+            if now - _wheel_state["last"] > 0.25:
+                _wheel_state["acc"] = 0.0      # новый жест
+            _wheel_state["last"] = now
+            _wheel_state["acc"] += -delta      # вниз = увеличение y
+            px = int(_wheel_state["acc"])
+            if px:
+                # ограничение на одно событие, чтобы быстрый жест не
+                # проскакивал весь список одним прыжком
+                px = max(-60, min(60, px))
+                _wheel_state["acc"] -= px
+                canvas.yview_scroll(px, "units")
+            return "break"
 
-        def _unbind_wheel(event):
-            canvas.unbind_all("<MouseWheel>")
-            canvas.unbind_all("<Button-4>")
-            canvas.unbind_all("<Button-5>")
+        # ВАЖНО (найдено инструментальной проверкой): на macOS трекпад
+        # присылает событие <TouchpadScroll>, а НЕ <MouseWheel>. Раньше этот
+        # тип не слушался вовсе, поэтому прокрутка двумя пальцами не работала,
+        # хотя обычное колесо и полоса прокрутки действовали.
+        _WHEEL_SEQS = ("<MouseWheel>", "<TouchpadScroll>", "<Button-4>",
+                       "<Button-5>", "<Shift-MouseWheel>")
+        for seq in _WHEEL_SEQS:
+            try:
+                canvas.bind(seq, _on_mousewheel)
+                canvas.bind_all(seq, _on_mousewheel)
+            except Exception:
+                pass
+        # то же — для виджетов внутри списка (чекбоксы, метки, кнопки):
+        # событие трекпада приходит именно им, а не канвасу.
+        def _bind_wheel_deep(widget):
+            for seq in _WHEEL_SEQS:
+                try:
+                    widget.bind(seq, _on_mousewheel)
+                except Exception:
+                    pass
+            for ch in widget.winfo_children():
+                _bind_wheel_deep(ch)
+        def _rebind_later(_e=None):
+            _bind_wheel_deep(scrollable_frame)
+        scrollable_frame.bind("<Map>", _rebind_later)
+        canvas.bind("<Map>", _rebind_later)
+        _rebind_later()
 
-        # Привязываем колесо только когда мышь над списком образов
-        canvas.bind("<Enter>", _bind_wheel)
-        canvas.bind("<Leave>", _unbind_wheel)
-        scrollable_frame.bind("<Enter>", _bind_wheel)
-        scrollable_frame.bind("<Leave>", _unbind_wheel)
+        # область прокрутки пересчитываем и при изменении содержимого
+        def _on_scroll_area(_e=None):
+            try:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except Exception:
+                pass
+        scrollable_frame.bind("<Configure>", _on_scroll_area)
+        canvas.bind("<Configure>", _on_scroll_area)
         
         # Создаем чекбоксы для каждого образа
         self.image_vars = {}
@@ -861,7 +1875,7 @@ class FlasherGUI:
             )
             cb.pack(side=tk.LEFT)
 
-            btn = tk.Button(
+            btn = _ColorButton(
                 frame,
                 text="Обзор...",
                 command=lambda i=img: self.browse_image(i),
@@ -889,20 +1903,10 @@ class FlasherGUI:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         # Строка статуса файлов + кнопка проверки — ПОД списком (не в скролле)
+        # Строка статуса файлов (кнопки «Проверить файлы» и «Папка образов»
+        # перенесены: первая — в общий блок кнопок, вторая — в шапку).
         files_bar = tk.Frame(main_frame)
         files_bar.pack(fill=tk.X, pady=(0, 6))
-        tk.Button(
-            files_bar,
-            text="🔍 Проверить файлы",
-            command=self.check_all_files,
-            width=18
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        tk.Button(
-            files_bar,
-            text="📁 Папка образов…",
-            command=self.choose_images_dir,
-            width=16
-        ).pack(side=tk.LEFT, padx=(0, 8))
         self.files_status_label = tk.Label(
             files_bar,
             text="Статус файлов будет показан здесь",
@@ -917,8 +1921,8 @@ class FlasherGUI:
         select_frame.pack(fill=tk.X, pady=(0, 10))
 
         btns = [
-            ("✓ Выбрать все",      self.select_all,            None,      None),
-            ("✗ Снять все",        self.deselect_all,          None,      None),
+            ("☑ Все образы",       self.toggle_all_images,     None,      None),
+            ("🔍 Проверить файлы",  self.check_all_files,       None,      None),
             ("🔍 Диагностика USB",  self.test_usb_detection,    "#3498DB", "white"),
             ("💾 Дамп разделов",    self.dump_partitions,       "#C0392B", "white"),
             ("📦 Burning-пакет",    self.flash_burning_package, "#D35400", "white"),
@@ -928,13 +1932,13 @@ class FlasherGUI:
             ("📝 Редактор образов", self.open_image_editor,     "#8E44AD", "white"),
             ("⚙️ Редактор ENV",     self.open_env_editor,       "#E67E22", "white"),
         ]
-        # Раскладываем в 2 строки, по 5 колонок, все одинаковой ширины
+        # Раскладываем в 2 строки по 5 колонок (10 кнопок — ровная сетка 2×5)
         cols = 5
         for i, (text, cmd, bg, fg) in enumerate(btns):
             kw = {"width": 18}
             if bg: kw["bg"] = bg
             if fg: kw["fg"] = fg
-            b = tk.Button(select_frame, text=text, command=cmd, **kw)
+            b = _ColorButton(select_frame, text=text, command=cmd, **kw)
             b.grid(row=i // cols, column=i % cols, padx=3, pady=3, sticky="ew")
         for c in range(cols):
             select_frame.columnconfigure(c, weight=1)
@@ -943,14 +1947,14 @@ class FlasherGUI:
         # потом — растягивающийся лог.
 
         # 1. Кнопки управления — в самый низ (компактные)
-        button_frame = tk.Frame(main_frame, bg="#ECF0F1", relief=tk.RIDGE, bd=2)
+        button_frame = tk.Frame(main_frame, relief=tk.RIDGE, bd=2)
         button_frame.pack(fill=tk.X, pady=(4, 0), side=tk.BOTTOM, expand=False)
 
         # 2. Компактная строка: прогресс-бар + статус в одну линию
         status_frame = tk.Frame(main_frame)
         status_frame.pack(fill=tk.X, pady=(4, 4), side=tk.BOTTOM)
 
-        self.progress = ttk.Progressbar(status_frame, mode='indeterminate')
+        self.progress = _Progress(status_frame, mode='indeterminate')
         self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
 
         self.status_label = tk.Label(
@@ -967,24 +1971,26 @@ class FlasherGUI:
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
 
         self.log_text = scrolledtext.ScrolledText(log_frame, height=8, state='disabled', font=_mono_font(9))
+        self.log_text._keep_dark = True
+
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         # Чекбокс очистки data/cache + кнопки прошивки в одной компактной панели
-        ctrl_top = tk.Frame(button_frame, bg="#ECF0F1")
+        ctrl_top = tk.Frame(button_frame)
         ctrl_top.pack(fill=tk.X, padx=10, pady=(6, 0))
         self.wipe_data_var = tk.BooleanVar(value=False)
         tk.Checkbutton(
             ctrl_top,
             text="🧹 Очистить data и cache (сброс к заводским)",
             variable=self.wipe_data_var,
-            bg="#ECF0F1", font=("Arial", 9)
+            font=("Arial", 9)
         ).pack(side=tk.LEFT)
 
         # Кнопки прошивки — компактные (height=1, меньше шрифт)
-        inner_button_frame = tk.Frame(button_frame, bg="#ECF0F1")
+        inner_button_frame = tk.Frame(button_frame)
         inner_button_frame.pack(fill=tk.X, padx=10, pady=(4, 8))
 
-        self.flash_button = tk.Button(
+        self.flash_button = _ColorButton(
             inner_button_frame,
             text="🚀 Начать прошивку",
             command=self.start_flashing,
@@ -998,6 +2004,21 @@ class FlasherGUI:
         )
         self.flash_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
 
+        self.adb_button = _ColorButton(
+            inner_button_frame,
+            text="📱 ADB",
+            command=self.open_adb_window,
+            bg="#2980B9",          # читается в обеих темах (был #2C3E50)
+            fg="white",
+            font=("Arial", 11, "bold"),
+            height=1,
+            cursor="hand2",
+            relief=tk.RAISED,
+            bd=2,
+            width=9
+        )
+        self.adb_button.pack(side=tk.LEFT, fill=tk.X, expand=False, padx=(0, 5))
+
         def on_enter_flash(e):
             if self.flash_button['state'] == tk.NORMAL:
                 self.flash_button['bg'] = '#229954'
@@ -1007,7 +2028,7 @@ class FlasherGUI:
         self.flash_button.bind("<Enter>", on_enter_flash)
         self.flash_button.bind("<Leave>", on_leave_flash)
 
-        self.stop_button = tk.Button(
+        self.stop_button = _ColorButton(
             inner_button_frame,
             text="⏹ Остановить",
             command=self.stop_flashing,
@@ -1055,7 +2076,7 @@ class FlasherGUI:
         self._update_lbl = tk.Label(footer, text="", font=("Arial", 8),
                                     fg="#27AE60")
         self._update_lbl.pack(side=tk.RIGHT, padx=4)
-        tk.Button(footer, text="Проверить обновления", font=("Arial", 8),
+        _ColorButton(footer, text="Проверить обновления", font=("Arial", 8),
                   command=self.check_for_updates
                   ).pack(side=tk.RIGHT, padx=4)
 
@@ -1063,8 +2084,8 @@ class FlasherGUI:
         self.log(f"  Версия {APP_VERSION} · {proj_url}")
         # Статус зависимостей — сразу видно, чего не хватает
         deps = []
-        deps.append("pyusb ✓" if USB_AVAILABLE else "pyusb ✗ (pip install pyusb)")
-        deps.append("pyserial ✓" if SERIAL_AVAILABLE else "pyserial ✗ (pip install pyserial)")
+        deps.append("pyusb ✓" if USB_AVAILABLE else "pyusb ✗ (нужен только для USB-прошивки)")
+        deps.append("pyserial ✓" if SERIAL_AVAILABLE else "pyserial ✗ (нужен только для UART-терминала)")
         self.log("  Зависимости: " + " · ".join(deps))
         if not USB_AVAILABLE:
             self.log("  ⚠ без pyusb невозможны обнаружение Amlogic и загрузка U-Boot")
@@ -1592,14 +2613,14 @@ class FlasherGUI:
         )
         self.com_port_combo.pack(side=tk.LEFT, padx=(0, 5))
         
-        tk.Button(
+        _ColorButton(
             com_control_frame,
             text="🔄",
             command=self.refresh_com_ports,
             width=3
         ).pack(side=tk.LEFT, padx=(0, 5))
         
-        self.com_connect_btn = tk.Button(
+        self.com_connect_btn = _ColorButton(
             com_control_frame,
             text="Подключить",
             command=self.toggle_com_connection,
@@ -1630,15 +2651,16 @@ class FlasherGUI:
             fg="#00FF00",
             insertbackground="white",
             state='disabled',
-            wrap=tk.WORD
-        )
+            wrap=tk.WORD)
+        self.terminal_text._keep_dark = True
+
         self.terminal_text.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
         
         # Кнопки управления терминалом
         terminal_btn_frame = tk.Frame(parent)
         terminal_btn_frame.pack(fill=tk.X)
         
-        tk.Button(
+        _ColorButton(
             terminal_btn_frame,
             text="Очистить",
             command=self.clear_terminal,
@@ -1646,7 +2668,7 @@ class FlasherGUI:
             font=("Arial", 8)
         ).pack(side=tk.LEFT, padx=(0, 5))
         
-        tk.Button(
+        _ColorButton(
             terminal_btn_frame,
             text="Сохранить лог",
             command=self.save_terminal_log,
@@ -1989,7 +3011,7 @@ class FlasherGUI:
                 remember_last_dir("partition_image", fn)
                 file_var.set(fn)
 
-        tk.Button(file_frame, text="Обзор...", command=browse_file, width=10).pack(side=tk.LEFT)
+        _ColorButton(file_frame, text="Обзор...", command=browse_file, width=10).pack(side=tk.LEFT)
 
         btn_frame = tk.Frame(dialog)
         btn_frame.pack(pady=15)
@@ -2027,9 +3049,9 @@ class FlasherGUI:
             messagebox.showinfo("Успех", f"Раздел '{name}' добавлен", parent=dialog)
             dialog.destroy()
 
-        tk.Button(btn_frame, text="Добавить", command=add_partition,
+        _ColorButton(btn_frame, text="Добавить", command=add_partition,
                   bg="#27AE60", fg="white", width=12).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Отмена", command=dialog.destroy, width=12).pack(side=tk.LEFT)
+        _ColorButton(btn_frame, text="Отмена", command=dialog.destroy, width=12).pack(side=tk.LEFT)
 
     def add_partition_checkbox(self, img, file_path=None):
         """Добавить строку раздела в прокручиваемый список"""
@@ -2048,7 +3070,7 @@ class FlasherGUI:
         )
         cb.pack(side=tk.LEFT)
 
-        btn = tk.Button(
+        btn = _ColorButton(
             frame, text="Обзор...",
             command=lambda i=img: self.browse_image(i),
             width=10
@@ -2116,7 +3138,7 @@ class FlasherGUI:
         tk.Label(info_frame, text=info_text, justify=tk.LEFT, font=("Arial", 9), pady=5).pack(padx=10)
         
         # Контейнер кнопок ВНИЗУ — пакуем до notebook чтобы не исчезал
-        env_bottom = tk.Frame(editor, bg="#ECF0F1", relief=tk.RIDGE, bd=2)
+        env_bottom = tk.Frame(editor, relief=tk.RIDGE, bd=2)
         env_bottom.pack(side=tk.BOTTOM, fill=tk.X)
 
         # Notebook с вкладками
@@ -2188,7 +3210,10 @@ class FlasherGUI:
                 id_vars[k]["value"] = self._env_display[k]
         
         for var_name, var_info in id_vars.items():
-            frame = tk.Frame(id_scroll)
+            # Фрейм живёт внутри ScrolledText (window_create) и не наследует
+            # цвет родителя — задаём фон палитры, иначе в светлой теме
+            # получалась «полосатая» подложка (замечание про неровный фон).
+            frame = _StyledRow(id_scroll)
             id_scroll.window_create(tk.END, window=frame)
             id_scroll.insert(tk.END, "\n")
             
@@ -2247,7 +3272,8 @@ class FlasherGUI:
         }
         
         for var_name, var_info in sec_vars.items():
-            frame = tk.Frame(sec_scroll)
+            # фон строки — из палитры (см. _StyledRow), иначе «полосатый» фон
+            frame = _StyledRow(sec_scroll)
             sec_scroll.window_create(tk.END, window=frame)
             sec_scroll.insert(tk.END, "\n")
             
@@ -2308,7 +3334,7 @@ class FlasherGUI:
         }
         
         for var_name, var_info in sys_vars.items():
-            frame = tk.Frame(sys_scroll)
+            frame = _StyledRow(sys_scroll)
             sys_scroll.window_create(tk.END, window=frame)
             sys_scroll.insert(tk.END, "\n")
             
@@ -2419,9 +3445,9 @@ class FlasherGUI:
                 "Нажмите «Сохранить изменения» чтобы записать env с CRC.",
                 parent=editor)
 
-        tk.Button(preset_bar, text="🔄 Предпросмотр", command=refresh_preview,
+        _ColorButton(preset_bar, text="🔄 Предпросмотр", command=refresh_preview,
                   font=("Arial", 9)).pack(side=tk.LEFT, padx=3)
-        tk.Button(preset_bar, text="✓ Применить cmdline_keys",
+        _ColorButton(preset_bar, text="✓ Применить cmdline_keys",
                   command=apply_cmdline_keys, bg="#27AE60", fg="white",
                   font=("Arial", 9)).pack(side=tk.LEFT, padx=3)
 
@@ -2432,7 +3458,7 @@ class FlasherGUI:
             cmd_preview.insert("1.0",
                 "cmdline_keys и aml_serial удалены из переопределений — вернётся\n"
                 "штатное чтение serial/deviceid из keystore (keyman) при загрузке.")
-        tk.Button(preset_bar, text="↺ Вернуть штатный", command=preset_restore_stock,
+        _ColorButton(preset_bar, text="↺ Вернуть штатный", command=preset_restore_stock,
                   font=("Arial", 9)).pack(side=tk.LEFT, padx=3)
         refresh_preview()
 
@@ -2451,7 +3477,7 @@ class FlasherGUI:
                 raw_text.insert(tk.END, f"{k}={v}\n")
 
         raw_bar = tk.Frame(raw_frame); raw_bar.pack(fill=tk.X, padx=8, pady=(0, 6))
-        tk.Button(raw_bar, text="🔄 Обновить из текущего набора", command=fill_raw,
+        _ColorButton(raw_bar, text="🔄 Обновить из текущего набора", command=fill_raw,
                   font=("Arial", 9)).pack(side=tk.LEFT, padx=3)
         tk.Label(raw_bar, font=("Arial", 8), fg="gray",
                  text="(изменения здесь применяются при «Сохранить изменения»)"
@@ -2460,7 +3486,7 @@ class FlasherGUI:
         editor._raw_text = raw_text
 
         # Кнопки (внутри зафиксированного снизу env_bottom)
-        btn_frame = tk.Frame(env_bottom, bg="#ECF0F1")
+        btn_frame = tk.Frame(env_bottom)
         btn_frame.pack(fill=tk.X, padx=10, pady=10)
         
         def save_env():
@@ -2639,7 +3665,7 @@ class FlasherGUI:
                 except Exception as e:
                     messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{str(e)}", parent=editor)
         
-        tk.Button(
+        _ColorButton(
             btn_frame,
             text="📁 Загрузить из файла",
             command=load_from_file,
@@ -2649,7 +3675,7 @@ class FlasherGUI:
             width=18
         ).pack(side=tk.LEFT, padx=5)
         
-        tk.Button(
+        _ColorButton(
             btn_frame,
             text="💾 Сохранить изменения",
             command=save_env,
@@ -2659,7 +3685,7 @@ class FlasherGUI:
             width=18
         ).pack(side=tk.LEFT, padx=5)
 
-        tk.Button(
+        _ColorButton(
             btn_frame,
             text="📤 Записать env на устройство",
             command=write_env_to_device,
@@ -2677,7 +3703,7 @@ class FlasherGUI:
             self._env_editor_saved = False
             editor.destroy()
 
-        tk.Button(
+        _ColorButton(
             btn_frame,
             text="Отмена",
             command=cancel_editor,
@@ -2984,6 +4010,8 @@ class FlasherGUI:
                   "mkfs_erofs": None, "resize2fs": None, "e2fsck": None,
                   "dir": mik_dir}
         if not os.path.isdir(mik_dir):
+            if _IS_MAC:
+                return self._fill_macos_native_tools(result)
             return result
 
         # GUI (MIK64.exe / mik64.exe / MIK.exe)
@@ -3047,39 +4075,27 @@ class FlasherGUI:
         if not result["e2fsck"]:
             result["e2fsck"] = find_in_mik("e2fsck.exe", "fsck.ext4.exe")
 
-        # macOS: MIK — Windows-бинарники. Консольные функции (simg2img,
-        # resize2fs и т.д.) берём из Homebrew, если установлен.
         if _IS_MAC:
-            result["mik_gui"] = None   # MIK64.exe на mac не запускается
-            brew_prefixes = self._macos_brew_paths()
-            def find_brew(*names, sbin=False):
-                for pref in brew_prefixes:
-                    subs = ("opt/e2fsprogs/sbin", "opt/e2fsprogs/libexec") \
-                        if sbin else ("opt/e2fsprogs/bin", "opt/e2fsprogs/libexec",
-                                      "bin")
-                    for sub in subs:
-                        for n in names:
-                            p = os.path.join(pref, sub, n)
-                            if os.path.isfile(p):
-                                return p
-                # обычные PATH
-                for n in names:
-                    p = shutil.which(n)
-                    if p:
-                        return p
-                return None
-            if not result["simg2img"]:
-                result["simg2img"] = find_brew("simg2img")
-            if not result["img2simg"]:
-                result["img2simg"] = find_brew("img2simg", "ext2simg")
-            if not result["resize2fs"]:
-                result["resize2fs"] = find_brew("resize2fs", sbin=True)
-            if not result["e2fsck"]:
-                result["e2fsck"] = find_brew("e2fsck", "fsck.ext4", sbin=True)
-            # если ничего не нашлось — подскажем один раз при использовании
-            if not (result["simg2img"] and result["resize2fs"]):
-                result["_brew_hint"] = ("На macOS для редактора образов "
-                                        "выполните: brew install e2fsprogs simg2img")
+            return self._fill_macos_native_tools(result)
+        return result
+
+    def _fill_macos_native_tools(self, result):
+        """macOS: .exe MIK не запускаются — нативные утилиты или Python."""
+        result["mik_gui"] = None
+        result["bin_dir"] = None
+        native = _yt_native_image_tools()
+        result["native"] = native
+        result["simg2img"]     = native.get("simg2img")
+        result["img2simg"]     = native.get("img2simg")
+        result["make_ext4fs"]  = native.get("mke2fs")   # сборка: mke2fs -d
+        result["imgextractor"] = native.get("debugfs") or \
+            native.get("seven_zip")
+        result["mkfs_erofs"]   = native.get("mkfs_erofs")
+        result["resize2fs"]    = native.get("resize2fs")
+        result["e2fsck"]       = native.get("e2fsck")
+        if not (result["simg2img"] or result["make_ext4fs"]):
+            result["_brew_hint"] = ("На macOS для редактора образов выполните: "
+                                    "brew install e2fsprogs simg2img erofs-utils p7zip")
         return result
 
     def open_image_editor(self):
@@ -3107,11 +4123,11 @@ class FlasherGUI:
         win.transient(self.root)
 
         if _IS_MAC:
-            have_tools = bool(tools["simg2img"] or tools["resize2fs"])
-            hdr_text = ("✓ Инструменты образов найдены (Homebrew)"
+            have_tools = bool(tools["simg2img"] or tools.get("make_ext4fs"))
+            hdr_text = ("✓ Нативные инструменты образов найдены"
                         if have_tools else
-                        "⚠ MIK — Windows-утилита; для образов выполните: "
-                        "brew install e2fsprogs simg2img")
+                        "⚠ Нет утилит образов — выполните: "
+                        "brew install e2fsprogs simg2img erofs-utils p7zip")
         else:
             have_tools = tools["mik_gui"] or tools["bin_dir"]
             hdr_text = ("✓ MIK найден" if have_tools
@@ -3124,9 +4140,9 @@ class FlasherGUI:
                  bg=hdr_color, fg="white").pack(side=tk.LEFT, padx=10, pady=6)
 
         # ══ Низ: кнопки ══
-        bottom = tk.Frame(win, bg="#ECF0F1", relief=tk.RIDGE, bd=2)
+        bottom = tk.Frame(win, relief=tk.RIDGE, bd=2)
         bottom.pack(side=tk.BOTTOM, fill=tk.X)
-        btn_row = tk.Frame(bottom, bg="#ECF0F1")
+        btn_row = tk.Frame(bottom)
         btn_row.pack(fill=tk.X, padx=10, pady=8)
 
         # ══ Лог (тоже снизу) ══
@@ -3134,6 +4150,7 @@ class FlasherGUI:
         logf.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 4))
         log_box = scrolledtext.ScrolledText(logf, height=8, font=_mono_font(8),
                                             bg="#1E1E1E", fg="#00FF00", state='disabled')
+        log_box._keep_dark = True
         log_box.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         def log(m):
             log_box.config(state='normal')
@@ -3196,7 +4213,7 @@ class FlasherGUI:
                 work_var.set(os.path.splitext(fn)[0] + "_unpacked")
                 out_var.set(os.path.splitext(fn)[0] + "-modified.img")
                 analyze(fn)
-        tk.Button(r1, text="Обзор…", command=pick_img, width=9).pack(side=tk.LEFT)
+        _ColorButton(r1, text="Обзор…", command=pick_img, width=9).pack(side=tk.LEFT)
         tk.Label(f1, textvariable=info_var, font=("Arial", 8), fg="#8E44AD"
                  ).pack(anchor=tk.W, padx=6, pady=(0, 4))
 
@@ -3211,7 +4228,7 @@ class FlasherGUI:
         r2 = tk.Frame(f2); r2.pack(fill=tk.X, padx=6, pady=4)
         tk.Entry(r2, textvariable=work_var, font=("Arial", 9)
                  ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        tk.Button(r2, text="Обзор…",
+        _ColorButton(r2, text="Обзор…",
                   command=lambda: work_var.set(
                       filedialog.askdirectory(parent=win,
                           initialdir=last_dir("edit_workdir",
@@ -3226,7 +4243,7 @@ class FlasherGUI:
         r3 = tk.Frame(f3); r3.pack(fill=tk.X, padx=6, pady=4)
         tk.Entry(r3, textvariable=out_var, font=("Arial", 9)
                  ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        tk.Button(r3, text="Обзор…",
+        _ColorButton(r3, text="Обзор…",
                   command=lambda: out_var.set(
                       filedialog.asksaveasfilename(parent=win, defaultextension=".img",
                           initialdir=last_dir("edit_save", IMG_DIR))
@@ -3244,7 +4261,7 @@ class FlasherGUI:
         ))
         desc.pack(anchor=tk.W, pady=(4, 0))
 
-        prog = ttk.Progressbar(top, mode="indeterminate")
+        prog = _Progress(top, mode="indeterminate")
         prog.pack(fill=tk.X, pady=(6, 0))
 
         cflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -3271,7 +4288,8 @@ class FlasherGUI:
             src = img_var.get()
             if not src or not os.path.exists(src):
                 messagebox.showwarning("!", "Выберите образ", parent=win); return
-            if not tools["bin_dir"]:
+            if not tools["bin_dir"] and \
+                    not (_IS_MAC and (tools.get("imgextractor") or tools.get("simg2img"))):
                 messagebox.showwarning("!",
                     "Консольные утилиты MIK (bin/) не найдены.\n"
                     "Используйте «Открыть GUI MIK» или скачайте MIK заново.",
@@ -3285,14 +4303,29 @@ class FlasherGUI:
                     os.makedirs(work, exist_ok=True)
                     raw = src
                     # sparse → raw
-                    if is_sparse.get() and tools["simg2img"]:
+                    if is_sparse.get():
                         raw = os.path.join(work, "_raw.img")
-                        log("🔄 simg2img (sparse → raw)...")
-                        rc, _ = run_tool([tools["simg2img"], src, raw])
-                        if rc != 0:
-                            log("❌ simg2img не сработал"); return
+                        if _IS_MAC:
+                            log("🔄 sparse → raw (Python)...")
+                            ok, msg = _yt_sparse_to_raw(src, raw, log=log)
+                            if not ok:
+                                log("❌ " + msg); return
+                        elif tools["simg2img"]:
+                            log("🔄 simg2img (sparse → raw)...")
+                            rc, _ = run_tool([tools["simg2img"], src, raw])
+                            if rc != 0:
+                                log("❌ simg2img не сработал"); return
                     # извлечение содержимого
-                    if tools["imgextractor"]:
+                    if _IS_MAC:
+                        log("📂 Распаковка нативными утилитами...")
+                        ok, msg = _yt_unpack_image_to_dir(
+                            raw, work, tools=tools.get("native") or {}, log=log)
+                        if ok:
+                            log("✓ " + msg)
+                            self.root.after(0, lambda: _open_folder(work))
+                        else:
+                            log("❌ " + msg)
+                    elif tools["imgextractor"]:
                         log("📂 imgextractor...")
                         rc, _ = run_tool([tools["imgextractor"], raw, work])
                         if rc == 0:
@@ -3303,13 +4336,18 @@ class FlasherGUI:
                             log("  Попробуйте «Открыть GUI MIK».")
                     else:
                         log("⚠ imgextractor не найден в bin/. Используйте GUI MIK.")
+                    # промежуточный raw-образ больше не нужен
+                    if raw != src and os.path.exists(raw):
+                        try:
+                            os.remove(raw)
+                        except Exception:
+                            pass
                 finally:
                     self.root.after(0, prog.stop)
             _th.Thread(target=_t, daemon=True).start()
 
         def _open_folder(path):
-            try: os.startfile(path)
-            except Exception: pass
+            _yt_open_folder(path)
             messagebox.showinfo("Распаковано",
                 f"Образ распакован в:\n{path}\n\n"
                 "Отредактируйте файлы, затем «Собрать образ».", parent=win)
@@ -3322,7 +4360,8 @@ class FlasherGUI:
                 messagebox.showwarning("!", "Нет папки распаковки", parent=win); return
             if not out:
                 messagebox.showwarning("!", "Укажите выходной файл", parent=win); return
-            if not tools["make_ext4fs"]:
+            if not tools["make_ext4fs"] and \
+                    not (_IS_MAC and tools.get("make_ext4fs")):
                 messagebox.showwarning("!",
                     "make_ext4fs не найден. Используйте «Открыть GUI MIK».",
                     parent=win); return
@@ -3347,19 +4386,35 @@ class FlasherGUI:
                     make_sparse = is_sparse.get()
                     if make_sparse:
                         raw_out = out + ".raw"
-                    log(f"📦 make_ext4fs (размер {size//(1024*1024)} MB)...")
-                    # make_ext4fs -s -l <size> -a <mountpoint> <out> <dir>
                     mp = os.path.basename(work).replace("_unpacked", "")
-                    rc, _ = run_tool([tools["make_ext4fs"],
-                                      "-l", str(size), "-a", mp or "system",
-                                      raw_out, work])
-                    if rc != 0:
-                        log("❌ make_ext4fs не сработал"); return
-                    if make_sparse and tools["img2simg"]:
-                        log("🔄 img2simg (raw → sparse)...")
-                        rc, _ = run_tool([tools["img2simg"], raw_out, out])
-                        try: os.remove(raw_out)
-                        except Exception: pass
+                    if _IS_MAC:
+                        log(f"📦 mke2fs -d (размер {size//(1024*1024)} MB)...")
+                        ok, msg = _yt_pack_dir_to_ext4(
+                            work, raw_out, size, tools=tools.get("native") or {},
+                            log=log, label=mp or "system")
+                        if not ok:
+                            log("❌ " + msg); return
+                    else:
+                        log(f"📦 make_ext4fs (размер {size//(1024*1024)} MB)...")
+                        # make_ext4fs -s -l <size> -a <mountpoint> <out> <dir>
+                        rc, _ = run_tool([tools["make_ext4fs"],
+                                          "-l", str(size), "-a", mp or "system",
+                                          raw_out, work])
+                        if rc != 0:
+                            log("❌ make_ext4fs не сработал"); return
+                    if make_sparse:
+                        if _IS_MAC:
+                            log("🔄 raw → sparse (Python)...")
+                            ok, msg = _yt_raw_to_sparse(raw_out, out, log=log)
+                            if not ok:
+                                log("❌ " + msg); return
+                            try: os.remove(raw_out)
+                            except Exception: pass
+                        elif tools["img2simg"]:
+                            log("🔄 img2simg (raw → sparse)...")
+                            rc, _ = run_tool([tools["img2simg"], raw_out, out])
+                            try: os.remove(raw_out)
+                            except Exception: pass
                     log(f"✓ Готово: {out}")
                     self.root.after(0, lambda: messagebox.showinfo(
                         "Готово", f"Новый образ:\n{out}", parent=win))
@@ -3461,35 +4516,37 @@ class FlasherGUI:
             _th.Thread(target=_t, daemon=True).start()
 
         # ── Кнопки ──
-        if tools["bin_dir"]:
-            tk.Button(btn_row, text="📂 Распаковать",
+        can_edit = bool(tools["bin_dir"]) or (_IS_MAC and
+                                              (tools.get("imgextractor") or tools.get("simg2img")))
+        if can_edit:
+            _ColorButton(btn_row, text="📂 Распаковать",
                       command=do_unpack, bg="#2980B9", fg="white",
                       font=("Arial", 10, "bold"), height=2
                       ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-            tk.Button(btn_row, text="📦 Собрать образ",
+            _ColorButton(btn_row, text="📦 Собрать образ",
                       command=do_pack, bg="#27AE60", fg="white",
                       font=("Arial", 10, "bold"), height=2
                       ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
         if tools.get("resize2fs"):
-            tk.Button(btn_row, text="📐 Сжать ext4\n(resize2fs -M)",
+            _ColorButton(btn_row, text="📐 Сжать ext4\n(resize2fs -M)",
                       command=do_shrink, bg="#16A085", fg="white",
                       font=("Arial", 9), height=2
                       ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        tk.Button(btn_row, text="🔓 vbmeta\ndisable-verity",
+        _ColorButton(btn_row, text="🔓 vbmeta\ndisable-verity",
                   command=do_vbmeta_patch, bg="#D35400", fg="white",
                   font=("Arial", 9), height=2
                   ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
         if tools["mik_gui"]:
-            tk.Button(btn_row, text="🖥 Открыть GUI MIK",
+            _ColorButton(btn_row, text="🖥 Открыть GUI MIK",
                       command=open_gui, bg="#8E44AD", fg="white",
                       font=("Arial", 9), height=2
                       ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
         if not have_tools:
-            tk.Button(btn_row, text="📥 Загрузить утилиты",
+            _ColorButton(btn_row, text="📥 Загрузить утилиты",
                       command=self.download_tools_from_github,
                       bg="#9B59B6", fg="white", font=("Arial", 10), height=2
                       ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        tk.Button(btn_row, text="Закрыть", command=win.destroy,
+        _ColorButton(btn_row, text="Закрыть", command=win.destroy,
                   font=("Arial", 9), height=2, width=10).pack(side=tk.RIGHT)
 
         log("Редактор образов готов.")
@@ -3497,12 +4554,33 @@ class FlasherGUI:
         log("   — лечит dm-verity бутлуп после прошивки несовместимых разделов.")
         if tools.get("_brew_hint"):
             log("⚠ " + tools["_brew_hint"])
-        if tools["bin_dir"]:
+        if _IS_MAC:
+            for k in ("simg2img", "img2simg", "make_ext4fs", "imgextractor"):
+                log(f"  {k}: {'✓' if tools.get(k) else '✗ (есть Python-замена)'}")
+        elif tools["bin_dir"]:
             log(f"Утилиты bin/: {tools['bin_dir']}")
             for k in ("simg2img", "img2simg", "make_ext4fs", "imgextractor"):
                 log(f"  {k}: {'✓' if tools[k] else '✗ не найден'}")
         else:
             log("⚠ Папка bin/ не найдена — доступен только GUI MIK.")
+
+    def open_adb_window(self):
+        """Окно «ADB инструменты» (отдельный Toplevel — как «Редактор ENV»)."""
+        for w in self.root.winfo_children():
+            if isinstance(w, tk.Toplevel) and getattr(w, "_adb_win", False):
+                try:
+                    w.deiconify(); w.lift()
+                except Exception:
+                    pass
+                return
+        try:
+            win = AdbWindow(self.root, self)
+            win._adb_win = True
+            self.log("📱 Открыто окно «ADB инструменты»")
+        except Exception as ex:
+            messagebox.showerror("ADB инструменты",
+                                 "Не удалось открыть окно:\n%s" % ex,
+                                 parent=self.root)
 
     def dump_partitions(self):
         """Дамп разделов устройства через update.exe mread.
@@ -3561,34 +4639,34 @@ class FlasherGUI:
         win.transient(self.root)
 
         # ══ КНОПКИ ВНИЗУ — пакуем ПЕРВЫМИ с side=BOTTOM, чтобы не исчезали ══
-        bottom = tk.Frame(win, bg="#ECF0F1", relief=tk.RIDGE, bd=2)
+        bottom = tk.Frame(win, relief=tk.RIDGE, bd=2)
         bottom.pack(side=tk.BOTTOM, fill=tk.X)
-        btn_inner = tk.Frame(bottom, bg="#ECF0F1")
+        btn_inner = tk.Frame(bottom)
         btn_inner.pack(fill=tk.X, padx=10, pady=8)
 
-        session_btn = tk.Button(
+        session_btn = _ColorButton(
             btn_inner,
             text="⚡ Запустить сессию (U-Boot → amlmmc part 1)",
             bg="#2980B9", fg="white", font=("Arial", 10, "bold"), height=2)
         session_btn.pack(fill=tk.X, pady=(0, 4))
 
-        mid_row = tk.Frame(btn_inner, bg="#ECF0F1")
+        mid_row = tk.Frame(btn_inner)
         mid_row.pack(fill=tk.X, pady=(0, 4))
-        paste_btn = tk.Button(
+        paste_btn = _ColorButton(
             mid_row, text="📋 Вставить UART лог",
             bg="#7F8C8D", fg="white", font=("Arial", 9))
         paste_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
-        reset_btn = tk.Button(
+        reset_btn = _ColorButton(
             mid_row, text="↺ Стандартная таблица",
             bg="#95A5A6", fg="white", font=("Arial", 9))
         reset_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0))
 
-        dump_btn = tk.Button(
+        dump_btn = _ColorButton(
             btn_inner, text="💾 Дамп выбранных разделов",
             bg="#C0392B", fg="white", font=("Arial", 11, "bold"), height=2)
         dump_btn.pack(fill=tk.X, pady=(0, 4))
 
-        tk.Button(btn_inner, text="Закрыть", command=win.destroy,
+        _ColorButton(btn_inner, text="Закрыть", command=win.destroy,
                   font=("Arial", 9)).pack(fill=tk.X)
 
         # ── Заголовок ─────────────────────────────────────────────────────────
@@ -3612,7 +4690,7 @@ class FlasherGUI:
         orow = tk.Frame(of); orow.pack(fill=tk.X, padx=6, pady=4)
         tk.Entry(orow, textvariable=out_var, font=("Arial", 9)
                  ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        tk.Button(orow, text="Обзор…",
+        _ColorButton(orow, text="Обзор…",
                   command=lambda: out_var.set(
                       filedialog.askdirectory(title="Папка дампов", parent=win,
                           initialdir=last_dir("dump_dir", ROOT_DIR))
@@ -3623,6 +4701,7 @@ class FlasherGUI:
         logf.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 4))
         log_box = scrolledtext.ScrolledText(logf, height=6, font=_mono_font(8),
                                             bg="#1E1E1E", fg="#00FF00", state='disabled')
+        log_box._keep_dark = True
         log_box.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
         def log(msg):
@@ -3671,11 +4750,11 @@ class FlasherGUI:
                 part_sel[n] = state
                 tree.set(row, "sel", "✓" if state else "")
 
-        tk.Button(sel_bar, text="✓ Выбрать все", font=("Arial", 8),
+        _ColorButton(sel_bar, text="✓ Выбрать все", font=("Arial", 8),
                   command=lambda: set_all(True), width=14).pack(side=tk.LEFT, padx=2)
-        tk.Button(sel_bar, text="✗ Снять все", font=("Arial", 8),
+        _ColorButton(sel_bar, text="✗ Снять все", font=("Arial", 8),
                   command=lambda: set_all(False), width=14).pack(side=tk.LEFT, padx=2)
-        tk.Button(sel_bar, text="⤺ Инвертировать", font=("Arial", 8),
+        _ColorButton(sel_bar, text="⤺ Инвертировать", font=("Arial", 8),
                   command=lambda: [
                       (part_sel.__setitem__(tree.set(r, "name"),
                           not part_sel.get(tree.set(r, "name"), True)),
@@ -3848,7 +4927,7 @@ class FlasherGUI:
                 else:
                     messagebox.showwarning("Не найдено",
                         "Разделы не распознаны.", parent=pw)
-            tk.Button(pw, text="Разобрать", command=do_parse,
+            _ColorButton(pw, text="Разобрать", command=do_parse,
                       bg="#27AE60", fg="white", font=("Arial", 10)
                       ).pack(pady=6, fill=tk.X, padx=10)
 
@@ -3976,6 +5055,12 @@ class FlasherGUI:
     def deselect_all(self):
         for var in self.image_vars.values():
             var.set(False)
+
+    def toggle_all_images(self):
+        """Простой переключатель: если все выбраны — снять, иначе выбрать все."""
+        on = not all(v.get() for v in self.image_vars.values())
+        for var in self.image_vars.values():
+            var.set(on)
     
     def check_all_files(self):
         """Проверка наличия всех необходимых файлов"""
@@ -4185,7 +5270,7 @@ class FlasherGUI:
                  font=("Arial", 12, "bold")).pack(pady=8)
         log_box = scrolledtext.ScrolledText(pw, font=_mono_font(9))
         log_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
-        prog = ttk.Progressbar(pw, mode="indeterminate")
+        prog = _Progress(pw, mode="indeterminate")
         prog.pack(fill=tk.X, padx=10, pady=4)
         prog.start(10)
         status = tk.Label(pw, text="", font=("Arial", 9))
@@ -4546,7 +5631,7 @@ class FlasherGUI:
         text_widget.insert("1.0", instructions)
         text_widget.config(state='disabled')
         
-        tk.Button(
+        _ColorButton(
             instructions_window,
             text="Закрыть",
             command=instructions_window.destroy,
@@ -4820,7 +5905,10 @@ class FlasherGUI:
 
         # libusb-1.0 нужен ещё и pyusb/pyamlboot (обнаружение устройства,
         # загрузка U-Boot). Если ни brew, ни бандла — качаем bottle.
-        if _IS_MAC and self._macos_libusb1_path() is None:
+        # ВНИМАНИЕ: _macos_libusb1_path — функция УРОВНЯ МОДУЛЯ (не метод).
+        # Раньше вызывалась как self._macos_libusb1_path() и «Загрузить
+        # утилиты» падало с AttributeError.
+        if _IS_MAC and _macos_libusb1_path() is None:
             _log("  📚 libusb-1.0 для pyusb не найдена — скачиваю...")
             if not self._macos_brew_install("libusb", _log):
                 self._macos_fetch_bottle_dylib("libusb", "libusb-1.0.0.dylib",
@@ -5221,9 +6309,9 @@ class FlasherGUI:
         win.transient(self.root)
 
         # ── Низ: кнопки ──
-        bottom = tk.Frame(win, bg="#ECF0F1", relief=tk.RIDGE, bd=2)
+        bottom = tk.Frame(win, relief=tk.RIDGE, bd=2)
         bottom.pack(side=tk.BOTTOM, fill=tk.X)
-        btn_row = tk.Frame(bottom, bg="#ECF0F1")
+        btn_row = tk.Frame(bottom)
         btn_row.pack(fill=tk.X, padx=10, pady=8)
 
         # ── Лог ──
@@ -5231,6 +6319,7 @@ class FlasherGUI:
         logf.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 4))
         log_box = scrolledtext.ScrolledText(logf, height=9, font=_mono_font(8),
                                             bg="#1E1E1E", fg="#00FF00", state='disabled')
+        log_box._keep_dark = True
         log_box.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         def log(m):
             log_box.config(state='normal')
@@ -5265,8 +6354,8 @@ class FlasherGUI:
                 remember_last_dir("burn_pkg", fn)
                 tpl_var.set(fn)
 
-        tk.Button(r1, text="Папка…", command=pick_tpl_dir, width=8).pack(side=tk.LEFT)
-        tk.Button(r1, text=".img…", command=pick_tpl_img, width=7).pack(side=tk.LEFT, padx=(3,0))
+        _ColorButton(r1, text="Папка…", command=pick_tpl_dir, width=8).pack(side=tk.LEFT)
+        _ColorButton(r1, text=".img…", command=pick_tpl_img, width=7).pack(side=tk.LEFT, padx=(3,0))
 
         tk.Label(f1, font=("Arial", 8), fg="gray", justify=tk.LEFT, text=(
             "Шаблон даёт служебные файлы (DDR/UBOOT/DTB/platform.conf) и image.cfg.\n"
@@ -5315,13 +6404,13 @@ class FlasherGUI:
         r3 = tk.Frame(f3); r3.pack(fill=tk.X, padx=6, pady=4)
         tk.Entry(r3, textvariable=out_var, font=("Arial", 9)
                  ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        tk.Button(r3, text="Обзор…",
+        _ColorButton(r3, text="Обзор…",
                   command=lambda: out_var.set(
                       filedialog.asksaveasfilename(parent=win, defaultextension=".img",
                           filetypes=[("Amlogic image","*.img")]) or out_var.get()),
                   width=9).pack(side=tk.LEFT)
 
-        prog = ttk.Progressbar(top, mode="indeterminate")
+        prog = _Progress(top, mode="indeterminate")
         prog.pack(fill=tk.X, pady=(4, 0))
 
         # ── Загрузка шаблона ──
@@ -5445,15 +6534,15 @@ class FlasherGUI:
                     self.root.after(0, prog.stop)
             _th.Thread(target=_t, daemon=True).start()
 
-        tk.Button(btn_row, text="📂 Загрузить шаблон",
+        _ColorButton(btn_row, text="📂 Загрузить шаблон",
                   command=load_template, bg="#2980B9", fg="white",
                   font=("Arial", 10, "bold"), height=2
                   ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        tk.Button(btn_row, text="🔨 Собрать пакет",
+        _ColorButton(btn_row, text="🔨 Собрать пакет",
                   command=build_pkg, bg="#16A085", fg="white",
                   font=("Arial", 10, "bold"), height=2
                   ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        tk.Button(btn_row, text="Закрыть", command=win.destroy,
+        _ColorButton(btn_row, text="Закрыть", command=win.destroy,
                   font=("Arial", 9), height=2, width=10).pack(side=tk.RIGHT)
 
         log("Сборка burning-пакета для оригинального USB Burning Tool.")
@@ -5517,9 +6606,9 @@ class FlasherGUI:
         win.transient(self.root)
 
         # ── Низ: кнопки ──
-        bottom = tk.Frame(win, bg="#ECF0F1", relief=tk.RIDGE, bd=2)
+        bottom = tk.Frame(win, relief=tk.RIDGE, bd=2)
         bottom.pack(side=tk.BOTTOM, fill=tk.X)
-        btn_row = tk.Frame(bottom, bg="#ECF0F1")
+        btn_row = tk.Frame(bottom)
         btn_row.pack(fill=tk.X, padx=10, pady=8)
 
         # ── Лог (тоже снизу) ──
@@ -5527,6 +6616,7 @@ class FlasherGUI:
         logf.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 4))
         log_box = scrolledtext.ScrolledText(logf, height=10, font=_mono_font(8),
                                             bg="#1E1E1E", fg="#00FF00", state='disabled')
+        log_box._keep_dark = True
         log_box.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         def log(m):
             log_box.config(state='normal')
@@ -5561,7 +6651,7 @@ class FlasherGUI:
                 remember_last_dir("burn_pkg", fn)
                 pkg_var.set(fn)
 
-        tk.Button(r1, text="Обзор…", command=pick_pkg, width=9).pack(side=tk.LEFT)
+        _ColorButton(r1, text="Обзор…", command=pick_pkg, width=9).pack(side=tk.LEFT)
 
         pk_row = tk.Frame(f1); pk_row.pack(fill=tk.X, padx=6, pady=(0, 4))
         pk_lbl = tk.Label(pk_row, font=("Arial", 8),
@@ -5582,7 +6672,7 @@ class FlasherGUI:
 
         nonlocal_holder = {"packer": packer_path}
         if not packer_path:
-            tk.Button(pk_row, text="📥 Скачать packer", command=dl_packer,
+            _ColorButton(pk_row, text="📥 Скачать packer", command=dl_packer,
                       font=("Arial", 8), bg="#9B59B6", fg="white"
                       ).pack(side=tk.LEFT, padx=(8, 0))
 
@@ -5638,7 +6728,7 @@ class FlasherGUI:
 
         tk.Entry(ur, textvariable=unpacked_dir_var, font=("Arial", 8)
                  ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
-        tk.Button(ur, text="Обзор…", command=pick_unpacked, width=9).pack(side=tk.LEFT)
+        _ColorButton(ur, text="Обзор…", command=pick_unpacked, width=9).pack(side=tk.LEFT)
 
         # Опции
         f2 = tk.LabelFrame(top, text="2. Опции прошивки", font=("Arial", 9, "bold"))
@@ -5674,9 +6764,9 @@ class FlasherGUI:
                 n = tree.set(row, "name")
                 psel[n] = state
                 tree.set(row, "sel", "✓" if state else "")
-        tk.Button(sel_bar, text="✓ Все", font=("Arial", 8),
+        _ColorButton(sel_bar, text="✓ Все", font=("Arial", 8),
                   command=lambda: set_all(True), width=8).pack(side=tk.LEFT, padx=2)
-        tk.Button(sel_bar, text="✗ Никого", font=("Arial", 8),
+        _ColorButton(sel_bar, text="✗ Никого", font=("Arial", 8),
                   command=lambda: set_all(False), width=8).pack(side=tk.LEFT, padx=2)
         def toggle(e):
             row = tree.identify_row(e.y)
@@ -5686,7 +6776,7 @@ class FlasherGUI:
             tree.set(row, "sel", "✓" if psel[n] else "")
         tree.bind("<ButtonRelease-1>", toggle)
 
-        prog = ttk.Progressbar(top, mode="indeterminate")
+        prog = _Progress(top, mode="indeterminate")
         prog.pack(fill=tk.X, pady=(4, 0))
 
         # ── Альтернатива: каноничный khadas flash-tool (только macOS) ──
@@ -5755,7 +6845,7 @@ class FlasherGUI:
 
                 _th.Thread(target=_t, daemon=True).start()
 
-            tk.Button(ft_row, text="⚡ Прошить через flash-tool",
+            _ColorButton(ft_row, text="⚡ Прошить через flash-tool",
                       command=do_flash_tool, bg="#8E44AD", fg="white",
                       font=("Arial", 10, "bold"), height=1
                       ).pack(side=tk.LEFT, padx=(8, 0))
@@ -5909,15 +6999,15 @@ class FlasherGUI:
                     self.root.after(0, prog.stop)
             _th.Thread(target=_t, daemon=True).start()
 
-        tk.Button(btn_row, text="📂 Распаковать и прочитать пакет",
+        _ColorButton(btn_row, text="📂 Распаковать и прочитать пакет",
                   command=do_unpack, bg="#2980B9", fg="white",
                   font=("Arial", 10, "bold"), height=2
                   ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        tk.Button(btn_row, text="🚀 Прошить пакет",
+        _ColorButton(btn_row, text="🚀 Прошить пакет",
                   command=do_flash, bg="#C0392B", fg="white",
                   font=("Arial", 10, "bold"), height=2
                   ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        tk.Button(btn_row, text="Закрыть", command=win.destroy,
+        _ColorButton(btn_row, text="Закрыть", command=win.destroy,
                   font=("Arial", 9), height=2, width=10).pack(side=tk.RIGHT)
 
         log("Окно прошивки burning-пакета (aml_upgrade_package.img).")
@@ -7208,6 +8298,2209 @@ class FlasherGUI:
         )
 
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ADB-инструменты: экран (живое управление), файлы (+remount rw), приложения
+# (иконки/псевдонимы/размеры), top-монитор с kill, полноценный терминал.
+# Работает с запущенной Android-системой устройства (USB-отладка владельца).
+# ═════════════════════════════════════════════════════════════════════════════
+
+_YT_KEYEVENTS = (("Домой", 3), ("Назад", 4), ("Меню", 82), ("OK/Enter", 66),
+                 ("Вверх", 19), ("Вниз", 20), ("Влево", 21), ("Вправо", 22),
+                 ("Питание", 26), ("Пробуждение", 224), ("Сон", 223),
+                 ("Громче", 24), ("Тише", 25))
+
+# физическая клавиатура → KEYCODE Android (для управления экраном)
+_YT_DEVICE_KEYS = {
+    "Up": 19, "Down": 20, "Left": 21, "Right": 22,
+    "Return": 66, "KP_Enter": 66, "Tab": 61, "ISO_Left_Tab": 61,
+    "BackSpace": 67, "Escape": 111, "Delete": 112, "space": 62,
+    "Home": 3, "End": 123, "Prior": 92, "Next": 93,
+    "F1": 131, "F2": 132, "F3": 133, "F4": 134, "F5": 135,
+    "F6": 136, "F7": 137, "F8": 138, "F9": 139, "F10": 140,
+    "F11": 141, "F12": 142,
+}
+
+_YT_LETTER_COLORS = ("#2980B9", "#27AE60", "#8E44AD", "#D35400", "#C0392B",
+                     "#16A085", "#7F8C8D", "#2C3E50", "#E67E22", "#7D3C98")
+
+
+def _yt_axml_label(axml):
+    """Псевдоним приложения из бинарного AndroidManifest.xml (best effort)."""
+    try:
+        if len(axml) < 8 or struct.unpack("<I", axml[:4])[0] != 0x00080003:
+            return None
+        pos = 8
+        strings = []
+
+        def read_pool(body):
+            (cnt, _styles, flags, sstart, _ststart) = struct.unpack(
+                "<IIIII", body[:20])
+            offs = struct.unpack("<%dI" % cnt, body[20:20 + 4 * cnt])
+            utf8 = bool(flags & 0x100)
+            out = []
+            base = 20 + 4 * cnt + sstart
+            for o in offs:
+                p = base + o
+                if utf8:
+                    def l8():
+                        nonlocal p
+                        ln = body[p]; p += 1
+                        if ln & 0x80:
+                            ln = ((ln & 0x7F) << 8) | body[p]; p += 1
+                        return ln
+                    l8()                      # длина символов
+                    blen = l8()               # длина байтов
+                    out.append(body[p:p + blen].decode("utf-8", "replace"))
+                else:
+                    ln = struct.unpack("<H", body[p:p + 2])[0]; p += 2
+                    if ln & 0x8000:
+                        ln = ((ln & 0x7FFF) << 16) | struct.unpack(
+                            "<H", body[p:p + 2])[0]; p += 2
+                    out.append(body[p:p + ln * 2].decode(
+                        "utf-16-le", "replace"))
+            return out
+
+        while pos + 8 <= len(axml):
+            ctype, hsize, csize = struct.unpack("<HHI", axml[pos:pos + 8])
+            body = axml[pos + hsize: pos + csize] if csize >= hsize else b""
+            if ctype == 0x0001 and not strings:            # string pool
+                strings = read_pool(axml[pos + 8: pos + csize])
+            elif ctype == 0x0102:                          # START_ELEMENT
+                try:
+                    (_line, _cm, _ns, name_i, attr_start, _asz, attr_cnt,
+                     _ai, _ci) = struct.unpack("<IIIIIHHHH", body[:24])
+                    tag = strings[name_i] if name_i < len(strings) else ""
+                    if tag == "application":
+                        for k in range(attr_cnt):
+                            a = body[attr_start - 8 + k * 20:
+                                      attr_start - 8 + (k + 1) * 20]
+                            if len(a) < 20:
+                                continue
+                            _ans, aname, rawval = struct.unpack("<III", a[:12])
+                            dtype = a[18]
+                            dval = struct.unpack("<I", a[16:20])[0] & 0xFFFFFFFF
+                            nm = strings[aname] if aname < len(strings) else ""
+                            if nm in ("label", "name"):
+                                if rawval != 0xFFFFFFFF and \
+                                        rawval < len(strings):
+                                    return strings[rawval]
+                                if dtype == 3 and dval < len(strings):
+                                    return strings[dval]
+                except Exception:
+                    pass
+            pos += csize if csize else 8
+    except Exception:
+        pass
+    return None
+
+
+def _yt_apk_icon_label(apk_path):
+    """(label|None, icon_bytes|None) из APK (zip): манифест + mipmap PNG."""
+    try:
+        with zipfile.ZipFile(apk_path) as z:
+            names = z.namelist()
+            label = None
+            if "AndroidManifest.xml" in names:
+                label = _yt_axml_label(z.read("AndroidManifest.xml"))
+            best, score = None, -1
+            for n in names:
+                ln = n.lower()
+                if not ln.endswith(".png"):
+                    continue
+                if "mipmap" not in ln and "drawable" not in ln:
+                    continue
+                base = n.rsplit("/", 1)[-1]
+                if not base.startswith(("ic_launcher", "icon", "app_icon",
+                                        "logo", "launcher")):
+                    continue
+                s = 0
+                for kw, v in (("xxxhdpi", 6), ("xxhdpi", 5), ("xhdpi", 4),
+                              ("hdpi", 3), ("mdpi", 2)):
+                    if kw in ln:
+                        s = max(s, v)
+                if "mipmap" in ln:
+                    s += 1
+                if s > score:
+                    score, best = s, n
+            icon = z.read(best) if best else None
+        return label, icon
+    except Exception:
+        return None, None
+
+
+class AdbWindow(tk.Toplevel):
+    """Окно «ADB инструменты»: экран, файлы, приложения, top, терминал."""
+
+    PLATFORM_TOOLS_URL = ("https://dl.google.com/android/repository/"
+                          "platform-tools-latest-darwin.zip")
+
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+        self.title("ADB инструменты")
+        self.geometry("1080x720")
+        self.minsize(880, 540)
+        self.transient(master)
+        self.adb_path = _yt_find_adb()
+        self.serial = None
+        self._devices = []
+        self._busy = False
+        self._resultq = queue.Queue()
+        self._term_hist, self._term_hi = [], -1
+        self._shot, self._shot_dev_size = None, None
+        self._auto_shot = tk.BooleanVar(value=False)
+        self._auto_top = tk.BooleanVar(value=False)
+        self._auto_boot = tk.BooleanVar(value=False)
+        self._top_sel_pkg = None
+        self._logcat_proc = None
+        self._logcatq = queue.Queue()
+        self._logq = queue.Queue()
+        self._logcat_evt = threading.Event()
+        self._app_iid_map = {}               # iid -> pkg
+        self._apps_info = {}                 # pkg -> сведения
+        # живой стрим экрана
+        self._stream_flag = threading.Event()
+        self._frameq = queue.Queue(maxsize=1)
+        self._frames_drawn = 0
+        # интерактивный shell (pty)
+        self._term_pty = None
+        self._term_proc = None
+        self._termq = queue.Queue()
+        self._closing = False
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(150, self._initial_probe)
+        self._poll_id = self.after(120, self._poll)
+
+    # ── общая инфраструктура ──────────────────────────────────────────────
+
+    def log(self, msg):
+        try:
+            self.app.log("[ADB] " + msg)
+        except Exception:
+            pass
+
+    def _adb(self, args, timeout=60, binary=False, serial=True):
+        if not self.adb_path:
+            raise RuntimeError("adb не найден")
+        cmd = [self.adb_path]
+        if serial and self.serial:
+            cmd += ["-s", self.serial]
+        cmd += args
+        cf = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                           creationflags=cf)
+        if binary:
+            return r.returncode, (r.stdout or b"")
+        out = ((r.stdout or b"") + (r.stderr or b"")).decode("utf-8", "replace")
+        return r.returncode, out
+
+    def _sh(self, command, timeout=60, binary=False):
+        return self._adb(["exec-out" if binary else "shell", command],
+                         timeout=timeout, binary=binary)
+
+    def _async(self, work, done=None, busy="работа…"):
+        if self._busy:
+            self.status_var.set("ADB: предыдущая операция ещё выполняется")
+            return
+        self._busy = True
+        self.status_var.set("ADB: " + busy)
+
+        def _t():
+            try:
+                res, err = work(), None
+            except Exception as ex:
+                res, err = None, ex
+            self._resultq.put((res, err, done))
+        threading.Thread(target=_t, daemon=True).start()
+
+    def _poll(self):
+        if getattr(self, "_closing", False):
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        for _ in range(16):
+            try:
+                res, err, done = self._resultq.get_nowait()
+            except queue.Empty:
+                break
+            self._busy = False
+            self.status_var.set("ADB: готово")
+            if done:
+                try:
+                    done(res, err)
+                except Exception as ex:
+                    self.log("❌ " + str(ex))
+        # вывод pty-консоли устройства
+        drained = 0
+        while drained < 4000:
+            try:
+                chunk = self._termq.get_nowait()
+            except queue.Empty:
+                break
+            drained += 1
+            if chunk is None:
+                self._term_pty = None
+                self._term_proc = None
+                continue
+            self._term_append(chunk)
+        # сообщения стрима (ошибки кадров и т.п.)
+        while True:
+            try:
+                msg = self._logq.get_nowait()
+            except queue.Empty:
+                break
+            self.log(msg)
+            self.stream_info.set(msg[:40])
+        # logcat-поток (если запущен)
+        while True:
+            try:
+                line = self._logcatq.get_nowait()
+            except queue.Empty:
+                break
+            if line is None:
+                self._logcat_proc = None
+                self.log("logcat завершён")
+                break
+            self._term_append(line + "\n")
+        try:
+            self._poll_id = self.after(80, self._poll)
+        except Exception:
+            pass
+
+    def _initial_probe(self):
+        if not self.adb_path:
+            self.status_var.set("ADB: не найден")
+            self.log("adb не найден. macOS: brew install --cask "
+                     "android-platform-tools, Windows: files/adb.exe, "
+                     "или кнопка «⬇ platform-tools»")
+            return
+        self.status_var.set("ADB: " + os.path.basename(self.adb_path))
+        self.refresh_devices()
+
+    # ── интерфейс ─────────────────────────────────────────────────────────
+
+    def _build(self):
+        top = tk.Frame(self)
+        top.pack(fill=tk.X, pady=(0, 4))
+        self.status_var = tk.StringVar(value="ADB: проверка…")
+        tk.Label(top, textvariable=self.status_var, font=("Arial", 9, "bold"),
+                 fg="#2980B9").pack(side=tk.LEFT, padx=(2, 8))
+        tk.Label(top, text="Устройство:", font=("Arial", 8)).pack(side=tk.LEFT)
+        self.dev_combo = ttk.Combobox(top, state="readonly", width=34)
+        self.dev_combo.pack(side=tk.LEFT, padx=4)
+        self.dev_combo.bind("<<ComboboxSelected>>", self._dev_selected)
+        _ColorButton(top, text="🔄 Устройства", width=13,
+                  command=self.refresh_devices).pack(side=tk.LEFT, padx=2)
+        _ColorButton(top, text="🌐 Скан сети", width=13,
+                  command=self.scan_lan_adb,
+                  bg="#16A085", fg="white").pack(side=tk.LEFT, padx=2)
+        _ColorButton(top, text="⬇ platform-tools", width=15,
+                  command=self._download_ptools).pack(side=tk.LEFT, padx=2)
+        self.mount_var = tk.StringVar(value="")
+        tk.Label(top, textvariable=self.mount_var, font=("Arial", 8),
+                 fg="#C0392B").pack(side=tk.LEFT, padx=10)
+
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill=tk.BOTH, expand=True)
+        self.nb.bind("<<NotebookTabChanged>>", self._tab_changed)
+        # клавиши окна (терминал/экран), поля ввода не перехватываем
+        self.bind("<Key>", self._window_key)
+        self.bind("<Escape>", lambda _e: (
+            self._toggle_fullscreen() if getattr(self, "_full", False) else None))
+        self._build_screen_tab()
+        self._build_files_tab()
+        self._build_apps_tab()
+        self._build_top_tab()
+        self._build_term_tab()
+
+    # ══ Экран: живое зеркало + управление ═════════════════════════════════
+
+    def _build_screen_tab(self):
+        p = tk.Frame(self.nb)
+        self.nb.add(p, text="🖥 Экран")
+        # вся вкладка на grid (смешивать pack/grid в одном контейнере нельзя)
+        row = tk.Frame(p); row.grid(row=0, column=0, columnspan=8,
+                                    sticky="we", pady=3)
+        _ColorButton(row, text="📸 Кадр", command=self.take_shot,
+                  bg="#2980B9", fg="white", width=10).pack(side=tk.LEFT, padx=2)
+        tk.Checkbutton(row, text="▶ Живой стрим",
+                       variable=self._auto_shot,
+                       command=self._toggle_stream).pack(side=tk.LEFT, padx=8)
+        self.stream_info = tk.StringVar(value="")
+        tk.Label(row, textvariable=self.stream_info, font=("Arial", 8),
+                 fg="#16A085").pack(side=tk.LEFT, padx=4)
+        _ColorButton(row, text="ℹ Устройство", width=11,
+                  command=self.show_devinfo).pack(side=tk.LEFT, padx=2)
+        self.full_btn = _ColorButton(row, text="⛶ Полный экран", width=14,
+                                  command=self._toggle_fullscreen)
+        self.full_btn.pack(side=tk.LEFT, padx=2)
+        tk.Label(row, text="Клик=tap, протянуть=swipe, "
+                           "клавиши — стрелки/Tab/Enter/Esc",
+                 font=("Arial", 8), fg="gray").pack(side=tk.LEFT, padx=8)
+        for i, (title, code) in enumerate(_YT_KEYEVENTS):
+            _ColorButton(p, text=title, font=("Arial", 8), width=10,
+                      command=lambda c=code: self._key(c)
+                      ).grid(row=1 + i // 8, column=i % 8, padx=1, pady=1)
+        trow = tk.Frame(p); trow.grid(row=3, column=0, columnspan=8,
+                                      sticky="we", pady=2)
+        tk.Label(trow, text="Текст:", font=("Arial", 8)).pack(side=tk.LEFT)
+        self.text_var = tk.StringVar()
+        ent = tk.Entry(trow, textvariable=self.text_var, font=("Arial", 9))
+        ent.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        ent.bind("<Return>", lambda _e: self._send_text())
+        _ColorButton(trow, text="Ввести", width=8,
+                  command=self._send_text).pack(side=tk.LEFT)
+        # Фон области экрана устройства — намеренно тёмный в любой теме
+        # (как «рамка» вокруг изображения телефона), поэтому помечаем его.
+        self.shot_canvas = tk.Canvas(p, bg="#101010", highlightthickness=0,
+                                     height=380)
+        self.shot_canvas._keep_dark = True
+        self.shot_canvas.grid(row=4, column=0, columnspan=8,
+                              sticky="nsew", padx=2, pady=2)
+        p.rowconfigure(4, weight=1)
+        p.columnconfigure(0, weight=1)
+        self.shot_canvas.configure(takefocus=True)
+        self.shot_canvas.bind("<Button-1>", self._shot_click)
+        self.shot_canvas.bind("<ButtonRelease-1>", self._shot_release)
+        self.shot_canvas.bind("<Key>", self._screen_key)
+        self._drag_start = None
+
+    def _grab_raw(self):
+        """Один кадр экрана: raw screencap (w,h,fmt + RGBA) → (w,h,rgb)."""
+        rc, data = self._sh("screencap", timeout=30, binary=True)
+        if rc != 0 or len(data) < 16:
+            raise RuntimeError("screencap вернул %d" % rc)
+        w, h, _fmt = struct.unpack("<III", data[:12])
+        need = w * h * 4
+        buf = bytes(data[12:12 + need])
+        if len(buf) < need:
+            raise RuntimeError("короткий кадр: %d из %d" % (len(buf), need))
+        rgb = bytearray(w * h * 3)
+        rgb[0::3] = buf[0::4]
+        rgb[1::3] = buf[1::4]
+        rgb[2::3] = buf[2::4]
+        return w, h, bytes(rgb)
+
+    def take_shot(self):
+        def _w():
+            return self._grab_raw()
+        self._async(_w, self._show_frame, busy="кадр…")
+
+    def _show_frame(self, res, err):
+        if err or not res:
+            self.status_var.set("ADB: ошибка кадра")
+            self.log("❌ кадр: %s" % err)
+            return
+        w, h, rgb = res
+        self._shot_dev_size = (w, h)
+        self._render_frame(w, h, rgb)
+
+    def _render_frame(self, w, h, rgb):
+        """Показать кадр на canvas с масштабированием средствами Tk."""
+        cw = max(int(self.shot_canvas.winfo_width() or 640), 200)
+        ch = max(int(self.shot_canvas.winfo_height() or 380), 150)
+        img = _yt_ppm_photo(w, h, rgb)
+        k = max(1, int(max(w / cw, h / ch) + 0.999))   # целое уменьшение
+        if k > 1:
+            img = img.subsample(k, k)
+        self._shot = img
+        self.shot_canvas.delete("all")
+        self.shot_canvas.create_image(cw // 2, ch // 2, image=img)
+
+    # ── живой стрим: кадры подряд, ввод не блокируется ────────────────────
+
+    def _toggle_stream(self):
+        if self._auto_shot.get():
+            self._stream_start()
+        else:
+            self._stream_stop()
+
+    def _stream_start(self):
+        self._stream_stop()
+        if not self.adb_path:
+            self.log("adb не найден — стрим недоступен")
+            self._auto_shot.set(False)
+            return
+        self._stream_flag.set()
+        threading.Thread(target=self._stream_worker, daemon=True).start()
+        self._stream_tick()
+        self.log("▶ Живой стрим экрана запущен")
+
+    def _stream_worker(self):
+        """Кадры подряд в фоне; в очереди держим только самый свежий."""
+        n = 0
+        while self._stream_flag.is_set():
+            try:
+                frame = self._grab_raw()
+                n += 1
+                try:
+                    self._frameq.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._frameq.put_nowait((frame, n))
+                except queue.Full:
+                    pass
+            except Exception as ex:
+                if self._stream_flag.is_set():
+                    self._logq.put("стрим: %s" % ex)
+                    self._stream_flag.clear()
+                    self._auto_shot.set(False)
+                    self.stream_info.set("стрим остановлен")
+                break
+
+    def _stream_tick(self):
+        if not self._stream_flag.is_set():
+            return
+        try:
+            frame, n = self._frameq.get_nowait()
+            self._frames_drawn += 1
+            w, h, rgb = frame
+            self._shot_dev_size = (w, h)
+            self._render_frame(w, h, rgb)
+            self.stream_info.set("кадр %d (%.1f fps)" % (
+                n, self._frames_drawn / max(1e-6, self._stream_t0_elapsed())))
+        except queue.Empty:
+            pass
+        except Exception as ex:
+            self.log("⚠ отрисовка: %s" % ex)
+        self.after(30, self._stream_tick)
+
+    def _stream_t0_elapsed(self):
+        import time as _t
+        if not hasattr(self, "_stream_t0"):
+            self._stream_t0 = _t.time()
+        return max(0.001, _t.time() - self._stream_t0)
+
+    def _stream_stop(self):
+        self._stream_flag.clear()
+        try:
+            self._frameq.get_nowait()
+        except Exception:
+            pass
+        if hasattr(self, "_stream_t0"):
+            del self._stream_t0
+        self._frames_drawn = 0
+
+    def _toggle_shot(self):
+        self._toggle_stream()
+
+    def _shot_tick(self):
+        self._stream_tick()
+
+    def _shot_click(self, ev):
+        self._drag_start = (ev.x, ev.y)
+
+    def _shot_release(self, ev):
+        if not self._shot_dev_size or not self._drag_start:
+            return
+        cw = max(int(self.shot_canvas.winfo_width() or 640), 1)
+        ch = max(int(self.shot_canvas.winfo_height() or 380), 1)
+        w, h = self._shot_dev_size
+        x0, y0 = self._drag_start
+        self._drag_start = None
+        # координаты внутри отрисованной области (по центру)
+        k = min(cw / w, ch / h, 1.0)
+        tw, th = w * k, h * k
+        ox, oy = (cw - tw) / 2, (ch - th) / 2
+        x1 = int((ev.x - ox) / k); y1 = int((ev.y - oy) / k)
+        x0 = int((x0 - ox) / k); y0 = int((y0 - oy) / k)
+        x1 = max(0, min(w - 1, x1)); y1 = max(0, min(h - 1, y1))
+        x0 = max(0, min(w - 1, x0)); y0 = max(0, min(h - 1, y0))
+        if abs(x1 - x0) < 12 and abs(y1 - y0) < 12:
+            self._async(lambda: self._sh("input tap %d %d" % (x1, y1)),
+                        busy="tap")
+        else:
+            self._async(lambda: self._sh(
+                "input swipe %d %d %d %d 300" % (x0, y0, x1, y1)), busy="swipe")
+        if not self._stream_flag.is_set():
+            self.after(250, self.take_shot)
+
+    def _key(self, code):
+        self._async(lambda: self._sh("input keyevent %d" % code),
+                    busy="keyevent")
+
+    def _screen_key(self, ev):
+        """Клавиши физической клавиатуры → keyevent на устройстве."""
+        if ev.keysym == "Escape" and getattr(self, "_full", False):
+            self._toggle_fullscreen()
+            return "break"
+        code = _YT_DEVICE_KEYS.get(ev.keysym)
+        if code is None and ev.char and ev.char.isprintable() \
+                and ev.char != " ":
+            # печатный символ отправляем как текст (полезно в полях ввода)
+            val = ev.char.replace('"', '\\"')
+            self._async(lambda: self._sh('input text "%s"' % val),
+                        busy="ввод")
+            return "break"
+        if code is not None:
+            self._async(lambda c=code: self._sh("input keyevent %d" % c),
+                        busy="keyevent")
+            return "break"
+        return None
+
+    def _toggle_fullscreen(self):
+        """Развернуть окно ADB на весь экран (и обратно)."""
+        self._full = not getattr(self, "_full", False)
+        try:
+            self.attributes("-fullscreen", self._full)
+        except Exception:
+            try:
+                self.state("zoomed" if self._full else "normal")
+            except Exception:
+                pass
+        try:
+            self.full_btn.config(
+                text="🗗 Выйти из полного" if self._full else "⛶ Полный экран")
+        except Exception:
+            pass
+        if self._full:
+            self.log("⛶ Полный экран (Esc — выход)")
+
+    def _tab_changed(self, _ev=None):
+        """При смене вкладки отдаём фокус нужному элементу."""
+        try:
+            idx = self.nb.index(self.nb.select())
+        except Exception:
+            return
+        try:
+            if idx == 0:
+                self.shot_canvas.focus_set()
+            elif idx == 4:
+                self.term.focus_set()
+        except Exception:
+            pass
+
+    def _send_text(self):
+        val = self.text_var.get()
+        if not val:
+            return
+        safe = val.replace('"', '\\"').replace(" ", "%s")
+        self._async(lambda: self._sh('input text "%s"' % safe),
+                    busy="ввод текста")
+
+    def show_devinfo(self):
+        def _w():
+            props = ("ro.product.model", "ro.product.device",
+                     "ro.build.version.release", "ro.build.display.id",
+                     "ro.build.version.security_patch")
+            out = []
+            for pr in props:
+                _rc, o = self._sh("getprop %s" % pr, timeout=15)
+                out.append("%s = %s" % (pr, o.strip()))
+            _rc, up = self._sh("cat /proc/uptime", timeout=15)
+            out.append("uptime: " + up.strip())
+            _rc, bat = self._sh("dumpsys battery", timeout=20)
+            for ln in bat.splitlines():
+                ln = ln.strip()
+                if ln.startswith(("level:", "status:", "temperature:")):
+                    out.append(ln)
+            return "\n".join(out)
+        self._async(_w, lambda r, e: messagebox.showinfo(
+            "Устройство", r if not e else str(e), parent=self), busy="инфо…")
+
+    # ══ Файлы: корень, pull/push, remount rw ══════════════════════════════
+
+    def _build_files_tab(self):
+        p = tk.Frame(self.nb)
+        self.nb.add(p, text="📁 Файлы")
+        row = tk.Frame(p); row.pack(fill=tk.X, pady=3)
+        tk.Label(row, text="Путь:", font=("Arial", 9)).pack(side=tk.LEFT)
+        self.path_var = tk.StringVar(value="/")           # сразу корень
+        ent = tk.Entry(row, textvariable=self.path_var, font=("Arial", 9))
+        ent.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        ent.bind("<Return>", lambda _e: self.browse_path())
+        _ColorButton(row, text="Открыть", width=8,
+                  command=self.browse_path).pack(side=tk.LEFT, padx=2)
+        _ColorButton(row, text="⬆ Вверх", width=8,
+                  command=self._go_up).pack(side=tk.LEFT, padx=2)
+        _ColorButton(row, text="🔓 Перемонтировать RW", bg="#C0392B",
+                  fg="white", command=self.remount_rw).pack(side=tk.LEFT,
+                                                            padx=6)
+        _ColorButton(row, text="df -h", width=6,
+                  command=self._df).pack(side=tk.LEFT, padx=2)
+        cols = ("size", "date")
+        self.file_tree = ttk.Treeview(p, columns=cols, show="tree headings")
+        self.file_tree.heading("#0", text="Имя",
+                               command=lambda: self._sort_files("name"))
+        self.file_tree.heading("size", text="Размер",
+                               command=lambda: self._sort_files("size"))
+        self.file_tree.heading("date", text="Дата",
+                               command=lambda: self._sort_files("date"))
+        self.file_tree.column("#0", width=380, anchor=tk.W)
+        self.file_tree.column("size", width=100, anchor=tk.E, stretch=False)
+        self.file_tree.column("date", width=170, anchor=tk.W, stretch=False)
+        self.file_tree.pack(fill=tk.BOTH, expand=True)
+        self.file_tree.bind("<Double-1>", self._file_activate)
+        self.file_tree.bind("<ButtonRelease-1>", self._file_click)
+        self.file_tree.bind("<Return>", self._file_activate)
+        self._files_raw = []
+        self._files_sort = ("name", False)
+        btns = tk.Frame(p); btns.pack(fill=tk.X, pady=3)
+        _ColorButton(btns, text="⬇ Скачать (pull)", bg="#2980B9", fg="white",
+                  width=16, command=self._pull).pack(side=tk.LEFT, padx=2)
+        _ColorButton(btns, text="⬆ Загрузить (push)", width=17,
+                  command=self._push).pack(side=tk.LEFT, padx=2)
+        _ColorButton(btns, text="📁 Новая папка", width=14,
+                  command=self._mkdir).pack(side=tk.LEFT, padx=2)
+        _ColorButton(btns, text="🗑 Удалить", fg="#C0392B", width=11,
+                  command=self._rm).pack(side=tk.LEFT, padx=2)
+
+    def browse_path(self):
+        target = self.path_var.get().strip() or "/"
+        self.path_var.set(target)
+
+        def _w():
+            rc, out = self._sh("ls -la '%s'" % target, timeout=45)
+            items, err = [], ""
+            for ln in out.splitlines():
+                if not ln or ln.startswith("total"):
+                    continue
+                if ln.startswith(("ls:", "No such", "Permission", "opendir")):
+                    err = ln.strip()
+                    continue
+                parts = ln.split()
+                if not parts:
+                    continue
+                perms = parts[0]
+                if not perms or perms[0] not in "-dlbcps":
+                    continue          # заголовок/предупреждение, не запись
+                # Формат (toybox/busybox): perms links owner group size <date> name
+                # Дата: "YYYY-MM-DD HH:MM" либо "YYYY-MM-DD" (старые файлы).
+                # Имя — ВСЁ после даты: пробелы в имени и " -> цель" сохраняются.
+                di = None
+                for i, tok in enumerate(parts):
+                    if _YT_DATE_RE.match(tok):
+                        di = i
+                        break
+                if di is None:
+                    continue
+                name_tokens = parts[di + 1:]
+                if name_tokens and _YT_TIME_RE.match(name_tokens[0]):
+                    date = parts[di] + " " + name_tokens[0]
+                    name_tokens = name_tokens[1:]
+                else:
+                    date = parts[di]
+                name = " ".join(name_tokens)
+                size_tok = parts[4] if len(parts) > 4 else ""
+                link = None
+                if " -> " in name:
+                    name, link = name.split(" -> ", 1)
+                if name in (".", "..", "/"):
+                    continue
+                isdir = perms.startswith("d")
+                items.append({
+                    "name": name,
+                    "dir": bool(isdir),
+                    "size": None if isdir else self._parse_size(size_tok),
+                    "date": date,
+                    "link": link,
+                })
+            return target, items, err
+        self._async(_w, self._show_files, busy="чтение каталога…")
+
+    @staticmethod
+    def _parse_size(s):
+        try:
+            return int(s)
+        except Exception:
+            return None
+
+    def _show_files(self, res, err):
+        if err or not res:
+            self.log("❌ файлы: %s" % err)
+            return
+        target, items, lerr = res
+        self._files_raw = items
+        if lerr:
+            self.log("⚠ %s" % lerr)
+        self._render_files()
+        self._refresh_mount_state()
+
+    def _size_str(self, n):
+        if n is None:
+            return ""
+
+        def _b(x):
+            for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
+                if x < 1024 or unit == "ТБ":
+                    return ("%d %s" % (x, unit)) if unit == "Б" \
+                        else ("%.1f %s" % (x, unit))
+                x /= 1024.0
+        return _b(float(n))
+
+    def _sort_files(self, key):
+        cur, rev = getattr(self, "_files_sort", ("name", False))
+        rev = (not rev) if cur == key else False
+        self._files_sort = (key, rev)
+        self._render_files()
+
+    def _render_files(self):
+        key, rev = getattr(self, "_files_sort", ("name", False))
+        items = list(getattr(self, "_files_raw", []))
+        base = self.path_var.get().strip().rstrip("/")
+
+        def _k(it):
+            if key == "size":
+                return (it["size"] if it["size"] is not None else -1)
+            if key == "date":
+                return it["date"]
+            return it["name"].lower()
+        items.sort(key=_k, reverse=rev)
+        items.sort(key=lambda it: not it["dir"])       # папки всегда сверху
+        for row in self.file_tree.get_children():
+            self.file_tree.delete(row)
+        for it in items:
+            ico = "📁" if it["dir"] else "📄"
+            shown = it["name"] + (("  →  " + it["link"]) if it["link"] else "")
+            self.file_tree.insert(
+                "", tk.END, iid=base + "/" + it["name"],
+                text="%s %s" % (ico, shown),
+                values=("<ПАПКА>" if it["dir"] else self._size_str(it["size"]),
+                        it["date"]))
+
+    def _file_click(self, _ev):
+        """Одиночный клик по заголовку — ничего; навигация — двойной/Enter."""
+        return None
+
+    def _refresh_mount_state(self):
+        def _w():
+            _rc, out = self._sh("mount", timeout=20)
+            ro = []
+            cur = self.path_var.get().strip()
+            for ln in out.splitlines():
+                if " ro," in ln or ln.split()[2 if len(ln.split()) > 2 else 0]:
+                    pass
+            for ln in out.splitlines():
+                parts = ln.split()
+                if len(parts) > 2 and parts[1] == "on":
+                    mp = parts[2]
+                    if (cur == mp or cur.startswith(mp.rstrip("/") + "/")) \
+                            and (" ro," in ln + " " or
+                                 parts[-1].endswith("(ro)")):
+                        ro.append(mp)
+            return ro
+        self._async(_w, lambda r, e: self.mount_var.set(
+            "⚠ read-only: " + ", ".join(r) if r and not e else
+            ("rw" if not e else "")), busy="mount…")
+
+    def remount_rw(self):
+        cur = self.path_var.get().strip() or "/"
+
+        def _w():
+            _rc, out = self._sh("mount", timeout=20)
+            best = None
+            for ln in out.splitlines():
+                parts = ln.split()
+                if len(parts) > 2 and parts[1] == "on":
+                    mp = parts[2]
+                    if (cur == mp or cur.startswith(mp.rstrip("/") + "/")):
+                        if best is None or len(mp) > len(best):
+                            best = mp
+            if not best:
+                return "mount-точка для %s не найдена" % cur
+            rc2, out2 = self._sh("mount -o remount,rw %s" % best, timeout=30)
+            return "remount,rw %s → rc=%d\n%s" % (best, rc2, out2.strip())
+        self._async(_w, lambda r, e: messagebox.showinfo(
+            "Remount", r if not e else str(e), parent=self) or
+            self.browse_path(), busy="remount…")
+
+    def _df(self):
+        self._async(lambda: self._sh("df -h 2>/dev/null | head -25", timeout=25),
+                    lambda r, e: messagebox.showinfo(
+                        "df -h", r if not e else str(e), parent=self),
+                    busy="df…")
+
+    def _go_up(self):
+        cur = self.path_var.get().strip().rstrip("/")
+        self.path_var.set(os.path.dirname(cur) or "/")
+        self.browse_path()
+
+    def _file_activate(self, _ev=None):
+        sel = self.file_tree.selection()
+        if not sel:
+            return
+        path = sel[0]
+        node = self.file_tree.item(sel[0])
+        is_dir = str(node.get("text", "")).startswith("📁")
+        if is_dir:
+            self.path_var.set(path)
+            self.browse_path()
+        else:
+            self.open_file(path)
+
+    # ── открытие/редактирование файла на устройстве ──────────────────────
+
+    _YT_TEXT_EXT = (".txt", ".prop", ".conf", ".cfg", ".ini", ".xml", ".json",
+                    ".sh", ".rc", ".log", ".md", ".csv", ".list", ".kl",
+                    ".xml", ".keylayout", ".idc", ".pl", ".py", ".js")
+
+    def open_file(self, path):
+        """Открыть файл: текст — редактор, прочее — скачать и открыть."""
+        base = path.rsplit("/", 1)[-1]
+        size = None
+        for it in getattr(self, "_files_raw", []):
+            if it["name"] == base:
+                size = it["size"]
+                break
+        is_text = base.lower().endswith(self._YT_TEXT_EXT) or size is None \
+            or (size is not None and size <= 512 * 1024)
+        if not is_text:
+            self.log("двоичный файл — скачиваю: %s" % path)
+            self._pull_to_temp_and_open(path)
+            return
+
+        def _w():
+            rc, out = self._sh("cat '%s'" % path, timeout=60)
+            return rc, out
+        self._async(_w, lambda r, e: self._show_editor(
+            path, (r[1] if r else ""), e), busy="чтение файла…")
+
+    def _show_editor(self, path, content, err):
+        if err:
+            self.log("❌ чтение: %s" % err)
+            return
+        win = tk.Toplevel(self)
+        win.title("Правка: %s" % path)
+        win.geometry("900x640")
+        win.transient(self)
+        bar = tk.Frame(win); bar.pack(fill=tk.X, padx=6, pady=4)
+        tk.Label(bar, text=path, font=("Arial", 9)).pack(side=tk.LEFT)
+        fam = "Menlo" if _IS_MAC else "Consolas"
+        txt = scrolledtext.ScrolledText(win, font=(fam, 10), undo=True)
+        txt.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+        txt.insert("1.0", content)
+        txt.focus_set()
+        btns = tk.Frame(win); btns.pack(fill=tk.X, padx=6, pady=(0, 8))
+
+        def _save():
+            data = txt.get("1.0", "end-1c")
+            self._save_file(path, data, win)
+        _ColorButton(btns, text="💾 Сохранить на устройство", bg="#27AE60",
+                  fg="white", command=_save).pack(side=tk.LEFT, padx=2)
+        _ColorButton(btns, text="⬇ Скачать локально",
+                  command=lambda: self._pull(path)).pack(side=tk.LEFT, padx=2)
+        _ColorButton(btns, text="Закрыть", command=win.destroy
+                  ).pack(side=tk.RIGHT, padx=2)
+        tk.Label(btns, text="Ctrl+S — сохранить", font=("Arial", 8),
+                 fg="gray").pack(side=tk.RIGHT, padx=8)
+        win.bind("<Control-s>", lambda _e: _save())
+
+    def _save_file(self, path, data, win=None):
+        """Записать текст на устройство (через push во временный файл)."""
+        def _w():
+            fd, tmp = tempfile.mkstemp()
+            os.close(fd)
+            try:
+                with open(tmp, "wb") as fh:
+                    fh.write(data.encode("utf-8"))
+                # служебный файл на устройстве: используем общий для всех
+                # редактирований и обязательно удаляем в finally ниже
+                remote_tmp = "/data/local/tmp/.yasta_edit.tmp"
+                rc1, out1 = self._adb(["push", tmp, remote_tmp], timeout=300)
+                if rc1 != 0:
+                    return "push: " + out1.strip()
+                rc2, out2 = self._sh("cat '%s' > '%s'" % (remote_tmp, path),
+                                     timeout=120)
+                self._sh("rm -f '%s'" % remote_tmp, timeout=30)
+                if rc2 != 0:
+                    return "запись: " + out2.strip()
+                return "OK"
+            finally:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+
+        def _done(res, err):
+            if err:
+                self.log("❌ сохранение: %s" % err)
+                messagebox.showerror("Сохранение", str(err), parent=self)
+                return
+            if res == "OK":
+                self.log("✓ сохранено: %s" % path)
+                messagebox.showinfo("Сохранение",
+                                    "Файл записан на устройство", parent=self)
+                if win is not None:
+                    win.destroy()
+                self.browse_path()
+            else:
+                self.log("❌ " + str(res))
+                messagebox.showerror("Сохранение", str(res), parent=self)
+        self._async(_w, _done, busy="сохранение…")
+
+    def _pull_to_temp_and_open(self, path):
+        """Скачать файл в служебный каталог и открыть системным приложением."""
+        def _w():
+            os.makedirs(_YT_DL_DIR, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(
+                suffix="_" + path.rsplit("/", 1)[-1], dir=_YT_DL_DIR)
+            os.close(fd)
+            rc, out = self._adb(["pull", path, tmp], timeout=1800)
+            return tmp if rc == 0 else None
+        def _done(res, err):
+            if not res:
+                self.log("❌ скачивание не удалось")
+                return
+            _yt_open_folder(os.path.dirname(res))
+            try:
+                if _IS_MAC:
+                    subprocess.Popen(["open", res])
+                elif sys.platform == "win32":
+                    os.startfile(res)          # noqa: S606
+                else:
+                    subprocess.Popen(["xdg-open", res])
+            except Exception:
+                pass
+            self.log("открыт: %s" % res)
+        self._async(_w, _done, busy="скачивание…")
+
+    def _sel_remote(self):
+        sel = self.file_tree.selection()
+        if not sel:
+            return None
+        return sel[0]                       # iid = полный путь на устройстве
+
+    def _pull(self):
+        remote = self._sel_remote()
+        if not remote:
+            self.log("файл не выбран")
+            return
+        local = filedialog.asksaveasfilename(
+            parent=self, initialfile=os.path.basename(remote))
+        if not local:
+            return
+
+        def _w():
+            rc, out = self._adb(["pull", remote, local], timeout=1800)
+            return rc, out
+        self._async(_w, lambda r, e: self.log(
+            "pull: %s" % (("OK" if r and r[0] == 0 else str(r)) if not e
+                          else str(e))), busy="pull…")
+
+    def _push(self):
+        local = filedialog.askopenfilename(parent=self)
+        if not local:
+            return
+        remote = self._sel_remote() or             (self.path_var.get().strip().rstrip("/"))
+        if not remote:
+            return
+        self._async(lambda: self._adb(
+            ["push", local, remote + "/" + os.path.basename(local)],
+            timeout=1800), lambda r, e: (self.log(
+                "push: OK" if not e and r and r[0] == 0 else "push: %s" %
+                (e or r)), self.browse_path()), busy="push…")
+
+    def _mkdir(self):
+        remote = self._sel_remote()
+        if not remote:
+            self.log("выберите место (файл/папку) для новой директории")
+            return
+        base = remote.rsplit("/", 1)[0]
+        name = simpledialog_askstring if False else None
+        # без simpledialog: мини-диалог
+        dlg = tk.Toplevel(self); dlg.title("Новая папка")
+        dlg.transient(self); dlg.grab_set()
+        tk.Label(dlg, text="Имя папки:").pack(padx=10, pady=6)
+        var = tk.StringVar()
+        e = tk.Entry(dlg, textvariable=var, width=32); e.pack(padx=10)
+        e.focus_set()
+
+        def _ok():
+            dlg.destroy()
+            nm = var.get().strip()
+            if nm:
+                self._async(lambda: self._sh("mkdir -p '%s/%s'" % (base, nm)),
+                            lambda r, e: self.browse_path(), busy="mkdir…")
+        _ColorButton(dlg, text="Создать", command=_ok).pack(pady=8)
+
+    def _rm(self):
+        remote = self._sel_remote()
+        if not remote or not messagebox.askyesno(
+                "Удаление", "Удалить на устройстве?\n%s" % remote,
+                parent=self):
+            return
+        self._async(lambda: self._sh("rm -rf '%s'" % remote),
+                    lambda r, e: self.browse_path(), busy="удаление…")
+
+    # ══ Приложения: иконки, псевдонимы, размеры, версии ═══════════════════
+
+    def _build_apps_tab(self):
+        p = tk.Frame(self.nb)
+        self.nb.add(p, text="📦 Приложения")
+        row = tk.Frame(p); row.pack(fill=tk.X, pady=3)
+        _ColorButton(row, text="🔄 Обновить", bg="#2980B9", fg="white",
+                  command=self.load_apps).pack(side=tk.LEFT, padx=2)
+        self.apps_filter = tk.StringVar()
+        ent = tk.Entry(row, textvariable=self.apps_filter, width=26)
+        ent.pack(side=tk.LEFT, padx=4)
+        ent.bind("<Return>", lambda _e: self._filter_apps())
+        _ColorButton(row, text="🔍 Фильтр", width=9,
+                  command=self._filter_apps).pack(side=tk.LEFT, padx=2)
+        self.apps_sys = tk.BooleanVar(value=False)
+        tk.Checkbutton(row, text="включая системные",
+                       variable=self.apps_sys,
+                       command=self.load_apps).pack(side=tk.LEFT, padx=8)
+        # иконки не грузим (на устройстве они часто битые), а имя оставляем
+        # одно: псевдоним, если он прочитан, иначе имя пакета
+        cols = ("ver", "size", "flags", "updated")
+        self.app_tree = ttk.Treeview(p, columns=cols, show="tree headings")
+        self.app_tree.heading("#0", text="Приложение")
+        self.app_tree.column("#0", width=340, anchor=tk.W)
+        for c, t, w in (("ver", "Версия", 100), ("size", "APK, МБ", 90),
+                        ("flags", "Тип", 110), ("updated", "Обновлено", 150)):
+            self.app_tree.heading(c, text=t)
+            self.app_tree.column(c, width=w, anchor=tk.W)
+        self.app_tree.pack(fill=tk.BOTH, expand=True)
+        self.app_tree.bind("<<TreeviewSelect>>", self._app_selected)
+        btns = tk.Frame(p); btns.pack(fill=tk.X, pady=3)
+        _ColorButton(btns, text="▶ Запустить", bg="#27AE60", fg="white",
+                  command=self._app_start).pack(side=tk.LEFT, padx=2)
+        _ColorButton(btns, text="⏹ Force stop", command=self._app_stop
+                  ).pack(side=tk.LEFT, padx=2)
+        _ColorButton(btns, text="🧹 Очистить данные",
+                  command=self._app_clear).pack(side=tk.LEFT, padx=2)
+        _ColorButton(btns, text="⤴ Enable/Disable",
+                  command=self._app_toggle).pack(side=tk.LEFT, padx=2)
+        _ColorButton(btns, text="🗑 Удалить", fg="#C0392B",
+                  command=self._app_uninstall).pack(side=tk.LEFT, padx=2)
+        _ColorButton(btns, text="📦 Установить APK…",
+                  command=self._app_install).pack(side=tk.LEFT, padx=2)
+
+    def _app_iid(self, pkg):
+        """Безопасный iid для Treeview: Tcl ломается на iid, начинающихся
+        не с буквы/цифры и содержащих точки как опции — используем 'a<hex>'."""
+        return "a" + pkg.encode("utf-8").hex()
+
+    def _app_pkg_by_iid(self, iid):
+        return self._app_iid_map.get(iid) or \
+            (bytes.fromhex(iid[1:]).decode("utf-8") if iid.startswith("a")
+             else iid)
+
+    def _app_selected(self, _ev):
+        sel = self.app_tree.selection()
+        self._top_sel_pkg = sel[0] if sel else None
+
+    def _cur_pkg(self):
+        iid = self.app_tree.selection()[0] if self.app_tree.selection() \
+            else self._top_sel_pkg
+        if not iid:
+            self.log("приложение не выбрано")
+            return None
+        return self._app_pkg_by_iid(iid)
+
+    def load_apps(self):
+        with_sys = self.apps_sys.get()
+
+        def _w():
+            cmd = "pm list packages -f" if with_sys else "pm list packages -3 -f"
+            rc, out = self._sh(cmd, timeout=60)
+            apps, problems = [], []
+            for ln in out.splitlines():
+                ln = ln.strip()
+                if not ln.startswith("package:"):
+                    if ln and ("error" in ln.lower() or "denied" in ln.lower()):
+                        problems.append(ln)
+                    continue
+                body = ln[8:]
+                if "=" in body:
+                    apk, pkg = body.rsplit("=", 1)
+                else:
+                    pkg, apk = body, ""
+                apps.append((pkg, apk))
+            # фолбэк: некоторые сборки не поддерживают -f — берём имена и
+            # находим apk отдельно
+            if not apps:
+                rc2, out2 = self._sh("pm list packages" + ("" if with_sys
+                                                           else " -3"),
+                                     timeout=60)
+                for ln in out2.splitlines():
+                    ln = ln.strip()
+                    if ln.startswith("package:"):
+                        apps.append((ln[8:].strip(), ""))
+            _rc3, probe = self._sh("pm path %s" % (apps[0][0] if apps else
+                                                   "android"), timeout=20)
+            return apps, problems, probe.strip(), rc
+        self._async(_w, self._show_apps, busy="список пакетов…")
+
+    def _show_apps(self, res, err):
+        if err or not res:
+            self.log("❌ пакеты: %s" % err)
+            return
+        apps, problems, probe, rc = res
+        if not apps:
+            self.log("⚠ пакетов не найдено (rc=%d). Проверьте USB-отладку "
+                     "и выбранное устройство." % rc)
+            for p in problems[:3]:
+                self.log("   " + p)
+            return
+        self.log("пакетов: %d" % len(apps))
+        self._apps_cache = apps
+        self._filter_apps()
+        # сведения (версия/размер/тип/дата/псевдоним) — в фоне, пачками
+        self._detail_queue = list(apps)
+        self._drain_detail_queue()
+
+    def _filter_apps(self):
+        flt = (self.apps_filter.get() or "").lower()
+        info = getattr(self, "_apps_info", {})
+        for row in self.app_tree.get_children():
+            self.app_tree.delete(row)
+        for pkg, apk in getattr(self, "_apps_cache", []):
+            if flt and flt not in pkg.lower():
+                continue
+            d = info.get(pkg, {})
+            iid = self._app_iid(pkg)
+            self.app_tree.insert(
+                "", tk.END, iid=iid, text=(d.get("label") or pkg),
+                values=(d.get("ver", ""), d.get("size", ""),
+                        d.get("flags", ""), d.get("updated", "")))
+            self._app_iid_map[iid] = pkg
+
+    def _drain_detail_queue(self, _batch=3):
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        for _ in range(_batch):
+            if not getattr(self, "_detail_queue", None):
+                return
+            pkg, apk = self._detail_queue.pop(0)
+            threading.Thread(target=self._load_app_details,
+                             args=(pkg, apk), daemon=True).start()
+        self.after(120, lambda: self._drain_detail_queue(_batch))
+
+    def _load_app_details(self, pkg, apk):
+        try:
+            info = {"label": None, "ver": "", "size": "", "flags": "",
+                    "updated": "", "icon": None}
+            _rc, o = self._sh("stat -c %%s '%s'" % apk, timeout=20)
+            sz = self._parse_size(o.strip().splitlines()[-1] if o.strip() else "")
+            if sz:
+                info["size"] = "%.1f" % (sz / 1048576.0)
+            _rc, o = self._sh("dumpsys package %s | grep -E "
+                              "'versionName|lastUpdateTime|pkgFlags' | head -4"
+                              % pkg, timeout=30)
+            for ln in o.splitlines():
+                ln = ln.strip()
+                if ln.startswith("versionName"):
+                    info["ver"] = ln.split("=", 1)[-1]
+                elif ln.startswith("lastUpdateTime"):
+                    info["updated"] = ln.split("=", 1)[-1][:16]
+                elif "SYSTEM" in ln:
+                    info["flags"] = "системное"
+            if not info["flags"]:
+                info["flags"] = "пользовательское"
+            # Псевдоним: берём ТОЛЬКО строку с application-label и проверяем,
+            # что это похоже на имя. Если вычитать не удалось — оставляем
+            # пусто, и в списке покажется имя пакета (одно имя, без дублей).
+            _rc, lab_out = self._sh(
+                "dumpsys package %s 2>/dev/null | grep -m1 -i "
+                "'application-label'" % pkg, timeout=30)
+            for ln in (lab_out or "").splitlines():
+                ln = ln.strip()
+                # реальный формат dumpsys: "application-label:'Имя'"
+                # (встречается и вариант через '=')
+                if "application-label" not in ln:
+                    continue
+                rest = ln.split("application-label", 1)[1].lstrip(":= ")
+                cand = rest.strip().strip("'\"").strip()
+                # валидное имя: непустое, короткое, без '=' и XML-мусора
+                if cand and len(cand) <= 60 and "=" not in cand \
+                        and not cand.startswith("<"):
+                    info["label"] = cand
+                break
+            self._resultq.put((("appinfo", pkg, info), None, self._apply_info))
+        except Exception as ex:
+            self._resultq.put((None, ex, None))
+
+    def _app_info_row(self, pkg, info):
+        """Обновить строку приложения в главном потоке."""
+        iid = self._app_iid(pkg)
+        if not self.app_tree.exists(iid):
+            return
+        self.app_tree.item(iid, text=(info.get("label") or pkg),
+                           values=(info.get("ver", ""), info.get("size", ""),
+                                   info.get("flags", ""),
+                                   info.get("updated", "")))
+
+    def _apply_info(self, res, err):
+        if err or not res:
+            return
+        _tag, pkg, info = res
+        self._apps_info = getattr(self, "_apps_info", {})
+        self._apps_info[pkg] = info
+        if not self.app_tree.exists(self._app_iid(pkg)):
+            return
+        self._app_info_row(pkg, info)
+
+    def _app_start(self):
+        pkg = self._cur_pkg()
+        if pkg:
+            self._async(lambda: self._sh(
+                "monkey -p %s -c android.intent.category.LAUNCHER 1" % pkg),
+                busy="запуск…")
+
+    def _app_stop(self):
+        pkg = self._cur_pkg()
+        if pkg:
+            self._async(lambda: self._sh("am force-stop %s" % pkg),
+                        busy="force-stop…")
+
+    def _app_clear(self):
+        pkg = self._cur_pkg()
+        if pkg and messagebox.askyesno(
+                "Очистка", "Очистить данные %s?" % pkg, parent=self):
+            self._async(lambda: self._sh("pm clear %s" % pkg), busy="pm clear…")
+
+    def _app_toggle(self):
+        pkg = self._cur_pkg()
+        if not pkg:
+            return
+
+        def _w():
+            _rc, o = self._sh("pm list packages -d", timeout=30)
+            disabled = pkg in o
+            rc, out = self._sh("pm %s %s" %
+                               ("enable" if disabled else "disable", pkg))
+            return "%s → rc=%d\n%s" % (
+                "enable" if disabled else "disable", rc, out.strip())
+        self._async(_w, lambda r, e: self.log(r or str(e)), busy="pm…")
+
+    def _app_uninstall(self):
+        pkg = self._cur_pkg()
+        if pkg and messagebox.askyesno(
+                "Удаление", "Удалить %s?" % pkg, parent=self):
+            self._async(lambda: self._adb(["uninstall", pkg], timeout=120),
+                        lambda r, e: (self.log("uninstall: %s" % (r or e)),
+                                      self.load_apps()), busy="uninstall…")
+
+    def _app_install(self):
+        apk = filedialog.askopenfilename(
+            parent=self, filetypes=[("APK", "*.apk"), ("All", "*.*")])
+        if not apk:
+            return
+        self._async(lambda: self._adb(["install", "-r", apk], timeout=600),
+                    lambda r, e: (self.log("install: %s" % (r or e)),
+                                  self.load_apps()), busy="install…")
+
+    # ══ Процессы: top + kill ══════════════════════════════════════════════
+
+    def _build_top_tab(self):
+        p = tk.Frame(self.nb)
+        self.nb.add(p, text="📈 Процессы (top)")
+        row = tk.Frame(p); row.pack(fill=tk.X, pady=3)
+        _ColorButton(row, text="📊 Обновить", bg="#2980B9", fg="white",
+                  command=self._top_refresh).pack(side=tk.LEFT, padx=2)
+        tk.Checkbutton(row, text="Авто (3 с)", variable=self._auto_top,
+                       command=self._top_toggle).pack(side=tk.LEFT, padx=8)
+        self.top_filter = tk.StringVar()
+        ent = tk.Entry(row, textvariable=self.top_filter, width=20)
+        ent.pack(side=tk.LEFT, padx=4)
+        ent.bind("<Return>", lambda _e: self._top_refresh())
+        _ColorButton(row, text="🔍", width=3,
+                  command=self._top_refresh).pack(side=tk.LEFT, padx=2)
+        _ColorButton(row, text="💀 kill -9", bg="#C0392B", fg="white",
+                  command=self._kill_pid).pack(side=tk.LEFT, padx=(16, 2))
+        _ColorButton(row, text="⏹ am force-stop", command=self._kill_pkg
+                  ).pack(side=tk.LEFT, padx=2)
+        self.boot_var = tk.StringVar(value="состояние не опрошено")
+        tk.Label(p, textvariable=self.boot_var, font=("Arial", 8),
+                 fg="#8E44AD", justify=tk.LEFT, anchor=tk.W
+                 ).pack(fill=tk.X, padx=2)
+        cols = ("pid", "user", "cpu", "rss", "state", "name")
+        self.top_tree = ttk.Treeview(p, columns=cols, show="headings")
+        for c, t, w in (("pid", "PID", 70), ("user", "USER", 80),
+                        ("cpu", "%CPU", 60), ("rss", "RSS, КБ", 90),
+                        ("state", "S", 40), ("name", "NAME", 320)):
+            self.top_tree.heading(c, text=t)
+            self.top_tree.column(c, width=w, anchor=tk.W)
+        self.top_tree.pack(fill=tk.BOTH, expand=True)
+
+    def _top_toggle(self):
+        if self._auto_top.get():
+            self._top_tick()
+
+    def _top_tick(self):
+        if not self._auto_top.get() or not self.winfo_exists():
+            return
+        if not self._busy:
+            self._top_refresh()
+        self.after(3000, self._top_tick)
+
+    def _top_refresh(self):
+        def _w():
+            rc, out = self._sh("top -n 1 -b -m 60 2>/dev/null || "
+                               "top -n 1 -m 60 2>/dev/null || top -n 1",
+                               timeout=30)
+            procs = []
+            cols = []
+            for ln in out.splitlines():
+                s = ln.strip()
+                if not s:
+                    continue
+                head = s.split()
+                if "PID" in head and ("%CPU" in "".join(head) or
+                                      "ARGS" in head or "COMMAND" in head):
+                    # busybox выводит шапку как один токен 'S[%CPU]', хотя в
+                    # данных это две колонки (S и %CPU) — разворачиваем
+                    cols = []
+                    for h in head:
+                        hu = h.upper()
+                        if "[" in hu and "]" in hu:
+                            pre, rest = hu.split("[", 1)
+                            mid = rest.split("]", 1)[0]
+                            if pre:
+                                cols.append(pre)
+                            if mid:
+                                cols.append(mid)
+                        else:
+                            cols.append(hu.rstrip("%"))
+                    continue
+                if not s[0].isdigit():
+                    continue
+                parts = s.split()
+                if len(parts) < 6:
+                    continue
+                pid = parts[0]
+                if not pid.isdigit():
+                    continue
+                if cols:
+                    def _idx(*names):
+                        """Индекс колонки; ищем по вхождению (шапки вида
+                        '%CPU', 'S[%CPU]', 'CPU%' и 'COMMAND'/'ARGS')."""
+                        for nm in names:
+                            for j, c in enumerate(cols):
+                                if nm == c or (len(nm) > 2 and nm in c):
+                                    return j
+                        return -1
+                    i_user = _idx("USER")
+                    i_cpu = _idx("CPU")
+                    i_rss = _idx("RES", "RSS")
+                    i_st = -1
+                    for j, c in enumerate(cols):
+                        if c in ("S", "STAT", "STATE"):
+                            i_st = j
+                            break
+                    i_args = _idx("ARGS", "COMMAND")
+                    # выравнивание: строки процессы начинаются с PID, но
+                    # busybox помечает текущую строку ('>' отдельным токеном)
+                    zero = 0
+                    for j, t in enumerate(parts[:3]):
+                        if t == pid:
+                            zero = j
+                            break
+                    def _get(i):
+                        if i < 0:
+                            return ""
+                        k = zero + i
+                        return parts[k] if k < len(parts) else ""
+                    start = zero + i_args if i_args >= 0 else len(parts) - 1
+                    name = " ".join(parts[start:])
+                    cpu = _get(i_cpu).strip().rstrip("%")
+                    rss = _get(i_rss)
+                    state = _get(i_st)
+                    if not state:
+                        for t in parts[zero + 2:zero + 9]:
+                            if t in ("R", "S", "D", "Z", "T", "I", "W", "X"):
+                                state = t
+                                break
+                    procs.append((pid, _get(i_user), cpu, rss, state, name))
+                else:
+                    procs.append((pid, parts[1], "", "", "", parts[-1]))
+            _rc, bo = self._sh(
+                "getprop sys.boot_completed; getprop dev.bootcomplete; "
+                "getprop ro.build.version.release; cat /proc/uptime",
+                timeout=20)
+            return procs, bo
+        self._async(_w, self._show_top, busy="top…")
+
+    def _show_top(self, res, err):
+        if err or not res:
+            self.log("❌ top: %s" % err)
+            return
+        procs, boot = res
+        flt = (self.top_filter.get() or "").lower()
+        keep = {r: self.top_tree.set(r, "pid") for r in ()}
+        for row in self.top_tree.get_children():
+            self.top_tree.delete(row)
+        for pid, user, cpu, rss, state, name in procs:
+            if flt and flt not in name.lower() and flt not in pid:
+                continue
+            self.top_tree.insert("", tk.END, values=(pid, user, cpu, rss,
+                                                     state, name))
+        bl = [x.strip() for x in boot.splitlines() if x.strip()]
+        if len(bl) >= 4:
+            self.boot_var.set(
+                "boot_completed=%s dev=%s android=%s uptime=%s" %
+                (bl[0], bl[1], bl[2], bl[3].split()[0] + " c"))
+
+    def _cur_top_row(self):
+        sel = self.top_tree.selection()
+        if not sel:
+            self.log("процесс не выбран")
+            return None
+        return self.top_tree.item(sel[0])["values"]
+
+    def _kill_pid(self):
+        vals = self._cur_top_row()
+        if not vals:
+            return
+        pid = str(vals[0]); name = str(vals[-1])
+        if not messagebox.askyesno(
+                "kill", "kill -9 PID %s (%s)?" % (pid, name), parent=self):
+            return
+        self._async(lambda: self._sh("kill -9 %s" % pid),
+                    lambda r, e: self._top_refresh(), busy="kill…")
+
+    def _kill_pkg(self):
+        vals = self._cur_top_row()
+        if not vals:
+            return
+        name = str(vals[-1])
+        if not messagebox.askyesno(
+                "force-stop", "am force-stop %s?" % name, parent=self):
+            return
+        self._async(lambda: self._sh("am force-stop %s" % name),
+                    lambda r, e: self._top_refresh(), busy="force-stop…")
+
+    # ══ Терминал: единое окно, приглашение, история ═══════════════════════
+
+    def _build_term_tab(self):
+        p = tk.Frame(self.nb)
+        self.nb.add(p, text="💻 Терминал")
+        row = tk.Frame(p); row.pack(fill=tk.X, pady=3)
+        self._term_on = tk.BooleanVar(value=False)
+        tk.Checkbutton(row, text="▶ shell (устройство)", variable=self._term_on,
+                       command=self._term_toggle,
+                       font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=2)
+        self.term_status = tk.StringVar(value="shell не подключён")
+        tk.Label(row, textvariable=self.term_status, font=("Arial", 8),
+                 fg="#8E44AD").pack(side=tk.LEFT, padx=6)
+        _ColorButton(row, text="📋 logcat", width=10,
+                  command=lambda: self._logcat_start()).pack(side=tk.LEFT,
+                                                             padx=(12, 2))
+        _ColorButton(row, text="⏹ logcat", command=self._logcat_stop
+                  ).pack(side=tk.LEFT, padx=2)
+        self.logcat_level = tk.StringVar(value="I")
+        ttk.Combobox(row, textvariable=self.logcat_level, state="readonly",
+                     width=4, values=("V", "D", "I", "W", "E")
+                     ).pack(side=tk.LEFT, padx=4)
+        _ColorButton(row, text="Очистить", width=9,
+                  command=self._term_clear).pack(side=tk.LEFT, padx=2)
+        tk.Label(row, text="Ctrl+D — закрыть, Ctrl+C — прервать",
+                 font=("Arial", 8), fg="gray").pack(side=tk.RIGHT, padx=8)
+        fam = "Menlo" if _IS_MAC else "Consolas"
+        self.term = scrolledtext.ScrolledText(
+            p, font=(fam, 10), bg="#0C0C0C", fg="#D6D6D6",
+            insertbackground="#D6D6D6", relief=tk.FLAT, bd=0)
+        self.term._keep_dark = True
+
+        self.term.pack(fill=tk.BOTH, expand=True)
+        self.term.bind("<Key>", self._term_key)
+        self.term.bind("<Button-1>", lambda _e: self.term.focus_set())
+        self.term.bind("<Control-d>", self._term_eof)
+        self._term_append("Нажмите «▶ shell (устройство)» — откроется "
+                          "интерактивная консоль adb на устройстве.\n")
+
+    def _term_append(self, text):
+        """Дописать вывод устройства в окно терминала."""
+        try:
+            self.term.insert(tk.END, text)
+            self.term.see(tk.END)
+            self.term.mark_set("insert", "end-1c")
+        except Exception:
+            pass
+
+    # старые имена оставлены как обёртки (используются в других местах)
+    def _term_print(self, text):
+        self._term_append(text + "\n")
+
+    def _term_greet(self):
+        self.term.delete("1.0", tk.END)
+        self._term_append("Нажмите «▶ shell (устройство)» — откроется "
+                          "интерактивная консоль adb.\n")
+
+    def _term_clear(self):
+        self.term.delete("1.0", tk.END)
+
+    def _term_toggle(self):
+        if self._term_on.get():
+            self._term_start()
+        else:
+            self._term_stop(user=True)
+
+    def _term_start(self):
+        # user=True: НЕ сбрасываем _term_on (иначе флаг, только что
+        # выставленный галочкой, снимался и ввод команд не уходил на устройство)
+        self._term_stop(user=True)
+        if not self.adb_path:
+            self.log("adb не найден")
+            self._term_on.set(False)
+            return
+        cmd = [self.adb_path]
+        if self.serial:
+            cmd += ["-s", self.serial]
+        cmd += ["shell"]
+        cf = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+        # ── Unix (macOS/Linux): настоящий pty — приглашение/цвета с устройства
+        # ── Windows: pty нет, работаем через потоки (ввод построчно,
+        #    вывод потоком) — терминал остаётся рабочим
+        use_pty = sys.platform != "win32"
+        if use_pty:
+            try:
+                import pty as _pty
+                master, slave = _pty.openpty()
+                self._term_proc = subprocess.Popen(
+                    cmd, stdin=slave, stdout=slave, stderr=slave,
+                    close_fds=True, creationflags=cf)
+                os.close(slave)
+                self._term_pty = master
+            except Exception as ex:
+                self.log("❌ shell: %s" % ex)
+                self._term_on.set(False)
+                return
+            fd = master
+
+            def _reader():
+                # ВАЖНО (macOS): закрывать master-fd должен ЭТОТ поток —
+                # os.close из другого, пока здесь блокирует os.read, вешает окно
+                try:
+                    while True:
+                        try:
+                            chunk = os.read(fd, 4096)
+                        except OSError:
+                            break
+                        if not chunk:
+                            break
+                        self._termq.put(chunk.decode("utf-8", "replace"))
+                finally:
+                    try:
+                        os.close(fd)
+                    except Exception:
+                        pass
+                    self._termq.put(None)
+        else:
+            try:
+                self._term_proc = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, bufsize=0,
+                    creationflags=cf)
+            except Exception as ex:
+                self.log("❌ shell: %s" % ex)
+                self._term_on.set(False)
+                return
+
+            def _reader():
+                try:
+                    while True:
+                        chunk = self._term_proc.stdout.read(1024)
+                        if not chunk:
+                            break
+                        self._termq.put(chunk.decode("utf-8", "replace"))
+                finally:
+                    self._termq.put(None)
+
+        self.term_status.set("shell: " + (self.serial or "device"))
+        self.log("💻 Интерактивный shell открыт (%s)" %
+                 ("pty" if use_pty else "потоки"))
+        threading.Thread(target=_reader, daemon=True).start()
+        self.term.delete("1.0", tk.END)
+        self._term_on.set(True)
+        # фокус в консоль, чтобы текст сразу уходил на устройство
+        try:
+            self.lift()
+            self.term.focus_set()
+            self.after(120, self.term.focus_force)
+        except Exception:
+            pass
+
+    def _term_stop(self, user=False):
+        """Остановить shell.
+
+        ПОРЯДОК ВАЖЕН (macOS): сначала завершаем процесс adb — тогда закрывается
+        slave-конец pty, поток-читатель получает EOF и сам закрывает master-fd.
+        Закрывать master из этого потока нельзя: os.close блокируется, пока
+        читатель ждёт в os.read, и окно «зависает» при закрытии.
+        """
+        proc, self._term_proc = getattr(self, "_term_proc", None), None
+        self._term_pty = None
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        if not user:
+            self._term_on.set(False)
+        self.term_status.set("shell не подключён")
+
+    def _term_eof(self, _ev=None):
+        self._term_on.set(False)
+        self._term_stop()
+        return "break"
+
+    # перевод клавиш Tk → последовательности, понятные shell на устройстве
+    _TERM_KEYS = {
+        "Return": "\r", "KP_Enter": "\r", "BackSpace": "\x7f",
+        "Tab": "\t", "Escape": "\x1b",
+        "Up": "\x1b[A", "Down": "\x1b[B", "Right": "\x1b[C",
+        "Left": "\x1b[D", "Home": "\x1b[H", "End": "\x1b[F",
+        "Prior": "\x1b[5~", "Next": "\x1b[6~",
+    }
+
+    # keycode клавиши «delete» на macOS: 51 — та самая ⌫ (в Windows это
+    # Backspace), 117 — forward delete (fn+⌫). На разных клавиатурах Tk
+    # отдаёт разные keysym, поэтому решаем по keycode.
+    _YT_KEYCODE_BACKSPACE = 51
+    _YT_KEYCODE_FORWARD_DELETE = 117
+
+    def _term_key_seq(self, ev):
+        """Последовательность для клавиши терминала (или None).
+
+        ВАЖНО: клавиша с надписью «delete» (аналог Backspace в Windows)
+        должна стирать символ слева. Раньше на keysym "Delete" уходило
+        ESC[3~ — курсор уходил вперёд, текст не стирался.
+        """
+        kc = getattr(ev, "keycode", None)
+        ks = ev.keysym
+        if kc == self._YT_KEYCODE_FORWARD_DELETE:
+            return "\x1b[3~"                 # fn+⌫ — действительно forward
+        if kc == self._YT_KEYCODE_BACKSPACE:
+            return "\x7f"
+        # ВАЖНО: shell на устройстве — это Linux (независимо от хоста),
+        # поэтому Enter = CR, забой = DEL (0x7f) и на macOS, и на Windows.
+        if ks == "BackSpace":
+            return "\x7f"
+        if ks == "Delete":
+            # на клавиатурах/раскладках, где ⌫ отдаётся как Delete —
+            # это забой; forward delete доступен через fn/Shift+Delete
+            if bool(getattr(ev, "state", 0) & 0x1):     # Shift
+                return "\x1b[3~"
+            return "\x7f"
+        if ks in ("F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9",
+                  "F10", "F11", "F12"):
+            return "\x1b[" + str({"F1": 11, "F2": 12, "F3": 13, "F4": 14,
+                                   "F5": 15, "F6": 17, "F7": 18, "F8": 19,
+                                   "F9": 20, "F10": 21, "F11": 23,
+                                   "F12": 24}[ks]) + "~"
+        return self._TERM_KEYS.get(ks)
+
+    def _term_send(self, data):
+        """Отправить данные в shell: pty (Unix) или stdin процесса (Windows)."""
+        fd = self._term_pty
+        if fd is not None:
+            try:
+                os.write(fd, data.encode("utf-8", "replace"))
+                return True
+            except Exception:
+                return False
+        proc = getattr(self, "_term_proc", None)
+        if proc is not None and proc.stdin:
+            try:
+                proc.stdin.write(data.encode("utf-8", "replace"))
+                proc.stdin.flush()
+                return True
+            except Exception:
+                return False
+        return False
+
+    def _window_key(self, ev):
+        """Клавиши окна ADB: на вкладке «Терминал» — в shell, на «Экран» —
+        в keyevent. Поля ввода (Entry/Combobox) не перехватываем.
+        """
+        try:
+            foc = self.focus_get()
+        except Exception:
+            foc = None
+        if isinstance(foc, (tk.Entry, ttk.Entry, ttk.Combobox)):
+            return None
+        try:
+            idx = self.nb.index(self.nb.select())
+        except Exception:
+            return None
+        if idx == 4:
+            return self._term_key(ev)
+        if idx == 0:
+            return self._screen_key(ev)
+        return None
+
+    def _term_key(self, ev):
+        """Печатаем прямо в pty устройства — приглашение рисует оно само."""
+        if not self._term_on.get() or self._term_pty is None:
+            # не подключено: подсказываем, как открыть консоль
+            if ev.keysym not in ("Control_L", "Control_R", "Shift_L",
+                                 "Shift_R", "Alt_L", "Alt_R", "Meta_L",
+                                 "Meta_R", "Caps_Lock", "Escape", "Tab"):
+                self.term_status.set("нажмите «▶ shell (устройство)»")
+            return "break"
+        ctrl = bool(ev.state & 0x4)
+        if ctrl and ev.keysym.lower() == "d":
+            self._term_eof()
+            return "break"
+        seq = self._term_key_seq(ev)
+        if seq:
+            self._term_send(seq)
+            return "break"
+        if ctrl and len(ev.keysym) == 1 and ev.keysym.isalpha():
+            self._term_send(chr(ord(ev.keysym.lower()) - 96))
+            return "break"
+        if ev.char and ev.char >= " ":
+            self._term_send(ev.char)
+            return "break"
+        return "break"
+
+    def _run_term(self, cmd):
+        """Разовая команда без pty (используется как запасной путь)."""
+        def _w():
+            rc, out = self._sh(cmd, timeout=120)
+            return rc, out
+        self._async(_w, self._term_result, busy=cmd[:24])
+
+    def _term_result(self, res, err):
+        if err:
+            self._term_append("error: %s\n" % err)
+        elif res:
+            rc, out = res
+            if out.strip():
+                self._term_append(out if out.endswith("\n") else out + "\n")
+            elif rc != 0:
+                self._term_append("(rc=%d)\n" % rc)
+
+    def _logcat_start(self):
+        if self._logcat_proc:
+            self.log("logcat уже запущен")
+            return
+        if not self.adb_path:
+            return
+        cmd = [self.adb_path]
+        if self.serial:
+            cmd += ["-s", self.serial]
+        cmd += ["logcat", "-v", "time", "*:" + self.logcat_level.get()]
+        cf = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        try:
+            self._logcat_proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                creationflags=cf)
+        except Exception as ex:
+            self.log("❌ logcat: %s" % ex)
+            return
+        self._logcat_evt.clear()
+        self.nb.select(4)
+
+        def _reader():
+            try:
+                for raw in iter(self._logcat_proc.stdout.readline, b""):
+                    if self._logcat_evt.is_set():
+                        break
+                    line = raw.decode("utf-8", "replace").rstrip()
+                    if line:
+                        self._logcatq.put(line)
+            except Exception:
+                pass
+            self._logcatq.put(None)
+        threading.Thread(target=_reader, daemon=True).start()
+        self.log("logcat запущен (вывод — в терминал)")
+
+    def _logcat_stop(self):
+        self._logcat_evt.set()
+        proc, self._logcat_proc = self._logcat_proc, None
+        if proc:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        self.log("logcat остановлен")
+
+    # ══ устройства / platform-tools / закрытие ════════════════════════════
+
+    # ══ Сканирование локальной сети на сетевой ADB (tcp/5555) ═══════════════
+
+    @staticmethod
+    def _local_ipv4_subnets():
+        """Локальные IPv4-подсети хоста в виде (host, prefix) для /24.
+
+        Возвращает список кортежей: ('192.168.2.0', 24) — без дублей.
+        Никаких внешних зависимостей: адрес получаем через UDP-сокет.
+        """
+        subnets = []
+        try:
+            import socket as _s
+            have = set()
+            # 1) обычный приём: соединение «в никуда» не отправляет пакеты,
+            #    но ядро выбирает нужный исходящий интерфейс
+            for probe in (("8.8.8.8", 80), ("1.1.1.1", 80)):
+                try:
+                    with _s.socket(_s.AF_INET, _s.SOCK_DGRAM) as sk:
+                        sk.settimeout(0.4)
+                        sk.connect(probe)
+                        ip = sk.getsockname()[0]
+                    if ip and not ip.startswith("127."):
+                        have.add(ip)
+                except Exception:
+                    continue
+            # 2) все интерфейсы (если доступно)
+            try:
+                for info in _s.getaddrinfo(_s.gethostname(), None,
+                                           _s.AF_INET):
+                    ip = info[4][0]
+                    if ip and not ip.startswith("127."):
+                        have.add(ip)
+            except Exception:
+                pass
+            for ip in have:
+                octets = ip.split(".")
+                if len(octets) == 4:
+                    subnets.append((".".join(octets[:3]) + ".0", 24))
+        except Exception:
+            pass
+        # без дублей, с сохранением порядка
+        out, seen = [], set()
+        for item in subnets:
+            if item not in seen:
+                seen.add(item)
+                out.append(item)
+        return out
+
+    @staticmethod
+    def _parse_targets(spec):
+        """Разобрать строку диапазона в список (host, port).
+
+        Поддерживаются формы:
+          192.168.2.7            — один адрес (порт 5555)
+          192.168.2.7:5555      — адрес с портом
+          192.168.2.0/24        — вся подсеть (/24 и крупнее)
+          192.168.2.10-40       — диапазон последнего октета
+        Пустая строка — автоопределение подсетей хоста.
+        """
+        import socket as _s
+        spec = (spec or "").strip().replace(" ", "")
+        port = 5555
+        hosts = []
+        try:
+            if not spec:
+                for base, _p in AdbWindow._local_ipv4_subnets():
+                    hosts += [base.rsplit(".", 1)[0] + ".%d" % i
+                              for i in range(1, 255)]
+                return hosts, port
+            if "/" in spec:
+                net, bits = spec.split("/", 1)
+                bits = int(bits)
+                octets = net.split(".")
+                if len(octets) != 4 or bits > 24:
+                    # поддерживаем только /24 и мельче — иначе слишком много
+                    bits = 24
+                base = ".".join(octets[:3])
+                return [base + ".%d" % i for i in range(1, 255)], port
+            if "-" in spec.rsplit(".", 1)[-1]:
+                head, rng = spec.rsplit(".", 1)
+                lo, hi = rng.split("-", 1)
+                lo, hi = max(1, int(lo)), min(254, int(hi))
+                return [head + ".%d" % i for i in range(lo, hi + 1)], port
+            if ":" in spec:
+                host, p = spec.rsplit(":", 1)
+                return [host], int(p)
+            return [spec], port
+        except Exception:
+            return [], port
+
+    @staticmethod
+    def _adb_packet(cmd, arg0=0, arg1=0, payload=b""):
+        """Собрать ADB-пакет по спецификации AOSP (24-байтный заголовок).
+
+        Структура заголовка (little-endian):
+            cmd, arg0, arg1, data_length, data_crc32, magic
+        где magic = cmd ^ 0xFFFFFFFF.
+
+        ВАЖНО: раньше пакет собирался вручную, и поле magic было неверным —
+        настоящий adbd такой пакет молча отбрасывает, поэтому реальные
+        устройства с сетевой отладкой не находились (хотя фейковый сервер
+        в тесте отвечал: он не проверял magic).
+        """
+        import struct as _st
+        import zlib as _zl
+        magic = cmd ^ 0xFFFFFFFF
+        hdr = _st.pack("<IIIIII", cmd, arg0, arg1, len(payload),
+                       (_zl.crc32(payload) & 0xFFFFFFFF) if payload else 0,
+                       magic)
+        return hdr + payload
+
+    @staticmethod
+    def _probe_adb_host(host, port=5555, timeout=0.45):
+        """Открыт ли TCP-порт (кандидат на сетевой ADB).
+
+        ВАЖНО: раньше здесь выполнялся «сырой» ADB-хендшейк и по ответу
+        решалось, ADB это или нет. На практике это ОТБРАСЫВАЛО реальные
+        устройства: adbd допускает только одно соединение за раз, поэтому
+        если рядом уже работал adb-сервер (или порт занят другим клиентом),
+        устройство принимало TCP, но на пакет не отвечало — и живое
+        устройство не попадало в список. Теперь проверяем только
+        доступность порта, а «настоящий ADB или нет» выясняет сам adb
+        командой connect (он умеет и версии, и авторизацию).
+        """
+        import socket as _s
+        try:
+            with _s.create_connection((host, port), timeout=timeout):
+                return True
+        except Exception:
+            return False
+
+    def scan_lan_adb(self, targets_spec=None):
+        """Найти устройства с сетевой отладкой и подключиться к ним."""
+        if not self.adb_path:
+            self.log("adb не найден — сканирование невозможно")
+            return
+        spec = targets_spec
+        if spec is None:
+            dlg = tk.Toplevel(self)
+            dlg.title("Скан локальной сети")
+            dlg.transient(self)
+            dlg.grab_set()
+            tk.Label(dlg, justify=tk.LEFT, font=("Arial", 9), padx=10, pady=8,
+                     text=("Поиск устройств с включённой сетевой отладкой "
+                           "(порт 5555).\n\n"
+                           "Пусто — автоопределение подсети этого компьютера.\n"
+                           "Можно указать: 192.168.2.0/24, 192.168.2.10-40,\n"
+                           "192.168.2.7 или 192.168.2.7:5555")
+                     ).pack()
+            var = tk.StringVar()
+            ent = tk.Entry(dlg, textvariable=var, width=34)
+            ent.pack(padx=10, pady=4)
+            ent.focus_set()
+            res = {"spec": None}
+
+            def _ok():
+                res["spec"] = var.get()
+                dlg.destroy()
+            _ColorButton(dlg, text="🔍 Сканировать", bg="#16A085", fg="white",
+                         command=_ok).pack(side=tk.LEFT, padx=10, pady=8)
+            _ColorButton(dlg, text="Отмена", command=dlg.destroy
+                         ).pack(side=tk.LEFT, padx=4, pady=8)
+            ent.bind("<Return>", lambda _e: _ok())
+            self.wait_window(dlg)
+            if res["spec"] is None:
+                return
+            spec = res["spec"]
+
+        hosts, port = self._parse_targets(spec)
+        if not hosts:
+            self.log("не удалось определить адреса для сканирования")
+            return
+        self.log("🌐 Скан сети: %d адрес(ов), порт %d" % (len(hosts), port))
+        self.status_var.set("ADB: скан сети…")
+
+        def _work():
+            import concurrent.futures as _cf
+            found = []
+            # ── шаг 1: mDNS. На Android 11+ беспроводная отладка
+            # анонсируется сервисом _adb-tls-connect._tcp — если adb умеет,
+            # это самый быстрый способ и он находит и нестандартные порты.
+            try:
+                rc, out = self._adb(["mdns", "services"], timeout=15,
+                                    serial=False)
+                if rc == 0:
+                    for ln in out.splitlines():
+                        s = ln.strip()
+                        if "_adb" in s and "\t" in s:
+                            # формат: "имя\t_adb-tls-connect._tcp.\t<ip>:<port>"
+                            addr = s.split("\t")[-1].strip()
+                            if ":" in addr:
+                                ip = addr.rsplit(":", 1)[0]
+                                if ip not in found:
+                                    found.append(ip)
+                                    self._logq.put("mDNS: найдено %s" % addr)
+            except Exception:
+                pass
+            # ── шаг 2: TCP-хендшейк по адресам подсети
+            total = len(hosts)
+            done = [0]
+            with _cf.ThreadPoolExecutor(max_workers=64) as pool:
+                futs = {pool.submit(self._probe_adb_host, h, port): h
+                        for h in hosts}
+                for fut in _cf.as_completed(futs):
+                    done[0] += 1
+                    try:
+                        if fut.result() and futs[fut] not in found:
+                            found.append(futs[fut])
+                    except Exception:
+                        pass
+                    if done[0] % 32 == 0 or done[0] == total:
+                        try:
+                            self.status_var.set(
+                                "ADB: скан %d/%d, найдено %d" % (
+                                    done[0], total, len(found)))
+                        except Exception:
+                            pass
+            # ── шаг 3: подключаем кандидатов НАСТОЯЩИМ adb connect.
+            # Именно adb выполняет полноценный ADB-хендшейк (версия, TLS на
+            # Android 11+, авторизация ключом) и точно сообщает результат:
+            #   "connected to ..."        — устройство добавлено;
+            #   "failed to authenticate"  — на устройстве нужно подтвердить
+            #                               отладку (ключ этого ПК);
+            #   "failed to connect"       — это не ADB (просто занятый порт).
+            # Свой пакет мы больше не шлём: он мешал (adbd держит одно
+            # соединение) и не умеет TLS/авторизацию.
+            connected = []
+            for ip in found:
+                try:
+                    rc, out = self._adb(
+                        ["connect", "%s:%d" % (ip, port)], timeout=25,
+                        serial=False)
+                    txt = (out or "").strip()
+                    last = txt.splitlines()[-1] if txt else "rc=%d" % rc
+                    low = last.lower()
+                    if "connected to" in low:
+                        connected.append(ip)
+                        self._logq.put("✓ %s:%d — %s" % (ip, port, last))
+                    elif "authenticate" in low or "unauthorized" in low:
+                        self._logq.put(
+                            "⚠ %s:%d — устройство требует подтверждения "
+                            "отладки (разрешите этот компьютер на экране "
+                            "устройства)" % (ip, port))
+                    elif "refused" in low or "no route" in low:
+                        self._logq.put("  %s:%d — не ADB (%s)" % (ip, port,
+                                                                  last))
+                    else:
+                        self._logq.put("  %s:%d — %s" % (ip, port, last))
+                except Exception as ex:
+                    self._logq.put("  %s:%d — %s" % (ip, port, ex))
+            return found, connected
+
+        self._async(_work, self._scan_done, busy="скан сети…")
+
+    def _scan_done(self, res, err):
+        if err:
+            self.log("❌ скан сети: %s" % err)
+            return
+        found, connected = res if isinstance(res, tuple) else (res or [], [])
+        if not found:
+            self.log("в локальной сети устройств с сетевой отладкой не найдено")
+            self.status_var.set("ADB: сетевых устройств нет")
+            return
+        self.log("портов ADB найдено: %d (%s); подключено: %d" % (
+            len(found), ", ".join(found), len(connected)))
+        # подключение выполнено в фоновом задании скана — просто обновляем
+        # список устройств (раньше connect шёл отдельными заданиями, и из
+        # нескольких найденных устройств подключалось только первое)
+        self.after(1200, self.refresh_devices)
+
+    def refresh_devices(self):
+        def _w():
+            rc, out = self._adb(["devices", "-l"], timeout=20, serial=False)
+            items = []
+            for ln in out.splitlines()[1:]:
+                s = ln.strip()
+                if not s or s.startswith("*"):
+                    continue
+                parts = s.split()
+                if len(parts) > 1 and parts[1] == "device":
+                    items.append((parts[0], " ".join(parts[2:])[:40]))
+            return items
+        self._async(_w, self._show_devices, busy="устройства…")
+
+    def _show_devices(self, devs, err):
+        if err:
+            self.status_var.set("ADB: ошибка")
+            self.log("❌ devices: %s" % err)
+            return
+        self._devices = devs
+        self.dev_combo["values"] = ["%s  %s" % (s, d) for s, d in devs] or \
+            ["— устройств нет —"]
+        if devs:
+            self.dev_combo.current(0)
+            self.serial = devs[0][0]
+            self.status_var.set("ADB: %s" % self.serial)
+        else:
+            self.dev_combo.current(0)
+            self.status_var.set("ADB: устройств нет (включите отладку)")
+            self.log("нет подключённых устройств — включите USB-отладку")
+
+    def _dev_selected(self, _ev=None):
+        idx = self.dev_combo.current()
+        if 0 <= idx < len(self._devices):
+            self.serial = self._devices[idx][0]
+            self.status_var.set("ADB: %s" % self.serial)
+            self._term_greet()
+
+    def _download_ptools(self):
+        if not _IS_MAC:
+            self.log("platform-tools: на Windows adb.exe уже в files/")
+            return
+
+        def _w():
+            import urllib.request as _u
+            req = _u.Request(self.PLATFORM_TOOLS_URL,
+                             headers={"User-Agent": "yasta_flasher/1.0"})
+            with _u.urlopen(req, timeout=300) as r:
+                blob = r.read()
+            import io
+            target = os.path.join(FILE_DIR, "macos")
+            os.makedirs(target, exist_ok=True)
+            with zipfile.ZipFile(io.BytesIO(blob)) as z:
+                z.extractall(target)
+            adb = os.path.join(target, "platform-tools", "adb")
+            os.chmod(adb, 0o755)
+            try:
+                subprocess.run(["xattr", "-cr", os.path.join(
+                    target, "platform-tools")], capture_output=True,
+                    timeout=60)
+            except Exception:
+                pass
+            return adb
+        self._async(_w, self._after_ptools, busy="загрузка platform-tools…")
+
+    def _after_ptools(self, path, err):
+        if err:
+            self.log("❌ platform-tools: %s" % err)
+            return
+        self.adb_path = path
+        self.log("✓ platform-tools: " + path)
+        self._initial_probe()
+
+    def _on_close(self):
+        """Закрыть окно: остановить все потоки/процессы и уничтожить окно.
+
+        Раньше падало из-за конфликта имён: Event self._logcat_stop перекрывал
+        метод _logcat_stop(), поэтому destroy() не вызывался и окно «не
+        закрывалось».
+        """
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
+        for stop in (self._stream_stop, self._term_stop,
+                     lambda: self._logcat_stop()):
+            try:
+                stop()
+            except Exception:
+                pass
+        try:
+            if getattr(self, "_poll_id", None):
+                self.after_cancel(self._poll_id)
+        except Exception:
+            pass
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+
 def _relaunch_without_console():
     """На Windows: если скрипт запущен через python.exe (с консолью),
     перезапустить через pythonw.exe (без консольного окна).
@@ -7358,7 +10651,7 @@ https://github.com/khadas/utils/tree/master/aml-flash-tool/tools/windows
         help_window.destroy()
 
     # Кнопка закрытия
-    tk.Button(
+    _ColorButton(
         help_window,
         text="Понятно, продолжить",
         command=close_help,
