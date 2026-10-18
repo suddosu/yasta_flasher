@@ -464,10 +464,30 @@ class _Progress(ttk.Progressbar):
 
     IDLE = "TProgressbar"
     BUSY = "Busy.TProgressbar"
+    # Режим процентов: заливка ВИДИМА (см. apply_ttk_theme).
+    DETERMINATE = "Flash.TProgressbar"
 
     def __init__(self, master=None, **kw):
         kw.setdefault("style", self.IDLE)
         super().__init__(master, **kw)
+
+    def begin_percent(self, value=0):
+        """Перевести бар в режим процентов с видимой заливкой.
+
+        Раньше здесь менялся только mode, а стиль оставался «TProgressbar»,
+        закрашенным цветом дорожки (это делалось, чтобы в покое бегунок был
+        невидим). В результате проценты шли, а полоса выглядела пустой.
+        """
+        try:
+            super().stop()
+        except Exception:
+            pass
+        try:
+            self.configure(style=self.DETERMINATE)
+            self.configure(mode="determinate", maximum=100)
+            self["value"] = value
+        except Exception:
+            pass
 
     def start(self, interval=None):
         try:
@@ -760,12 +780,28 @@ def apply_ttk_theme(pal):
         # «все прогресс-бары слегка заполнены зелёным». Красим бегунок в цвет
         # фона дорожки (то есть он невидим в покое) и включаем зелёный только
         # на время работы через стиль "Busy.TProgressbar" (см. ниже).
+        # ПОЧЕМУ ЗДЕСЬ ЯВНЫЙ layout У КАЖДОГО СТИЛЯ.
+        # Стиль вида "Busy.TProgressbar" — ПРОИЗВОДНЫЙ. В Tk 8.6/9 (у сборочного
+        # Python Tk 9.0.4) производный стиль НЕ наследует layout родителя:
+        # попытка нарисовать полосу с таким стилем падает с
+        #   "Layout Horizontal.Busy.TProgressbar not found"
+        # и прогресс-бар не отображается ВООБЩЕ (проверено на живом Tk).
+        # Поэтому layout копируем явно.
         st.configure("TProgressbar", background=alt, troughcolor=alt,
                      bordercolor=bg, lightcolor=alt, darkcolor=alt,
                      borderwidth=0)
-        st.configure("Busy.TProgressbar", background="#27AE60",
-                     troughcolor=alt, bordercolor=bg,
-                     lightcolor="#27AE60", darkcolor="#27AE60")
+        for _pstyle, _pcol in (("Busy.TProgressbar", "#27AE60"),
+                               ("Flash.TProgressbar", "#27AE60")):
+            st.configure(_pstyle, background=_pcol, troughcolor=alt,
+                         bordercolor=bg, lightcolor=_pcol, darkcolor=_pcol,
+                         borderwidth=0)
+            try:
+                # layout нужен и для Horizontal.*, и для Vertical.*
+                st.layout(_pstyle, st.layout("Horizontal.TProgressbar"))
+                st.layout("Vertical." + _pstyle,
+                          st.layout("Vertical.TProgressbar"))
+            except Exception:
+                pass
         st.configure("Treeview", background=ebg, fieldbackground=ebg,
                      foreground=efg, bordercolor=alt)
         st.configure("Treeview.Heading", background=alt, foreground=fg,
@@ -1751,72 +1787,75 @@ class FlasherGUI:
         # событие приходит без предварительного Enter либо после Leave.
         # Теперь колесо привязано ПОСТОЯННО, а обработчик сам проверяет,
         # что указатель действительно над списком.
-        def _pointer_in_list():
-            """Курсор сейчас над областью списка образов?
+        # ── ПРОКРУТКА СПИСКА ОБРАЗОВ ────────────────────────────────────────
+        # Сделано «как обычная область» (по образцу того, как Tk прокручивает
+        # Text/Listbox): обработчик привязан к САМОМУ канвасу и к виджетам
+        # ВНУТРИ него, без bind_all.
+        #
+        # Почему убраны прежние подходы:
+        #   • bind_all перехватывал колесо во ВСЁМ приложении — из-за этого
+        #     список образов «дрыгался», даже когда активно другое окно, а
+        #     журнал/терминал/таблицы теряли свою прокрутку;
+        #   • шаг считался в «units» при yscrollincrement=1, но величина шага
+        #     оставалась 1 или 40 — на macOS (колесо даёт delta=±1) список
+        #     сдвигался на пиксель за щелчок.
+        #
+        # Размерности (проверено на живом Tk 9.0.4, macOS):
+        #   • <MouseWheel>, delta=±1..±N — «щелчки» колеса (macOS даёт 1);
+        #   • delta кратно 120 (Windows/Linux WHEEL_DELTA);
+        #   • <TouchpadScroll> — ТОЧНАЯ прокрутка: delta упакована как
+        #     (dx << 16) | dy со знаком в младших 16 битах (см.
+        #     tk::PreciseScrollDeltas). Декодируем её сами.
+        ROW_PX = 24                 # высота строки списка, px
+        TRACKPAD_GAIN = 3           # чувствительность трекпада
 
-            ВАЖНО: событие колеса приходит на ТОТ виджет, который под
-            курсором (чекбокс, метка, вложенный фрейм), и он НЕ является
-            потомком canvas в смысле «master»-цепочки от события — поэтому
-            прежняя проверка по родителям не срабатывала, и прокрутка
-            работала только при наведении на полосу прокрутки.
-            Надёжнее сравнить координаты курсора с областью canvas.
-            """
+        def _decode_precise(delta):
+            """Распаковать delta точной прокрутки: (dx << 16) | dy (знак в младших 16 битах)."""
             try:
-                x, y = canvas.winfo_pointerxy()
-                cx, cy = canvas.winfo_rootx(), canvas.winfo_rooty()
-                return (cx <= x < cx + canvas.winfo_width() and
-                        cy <= y < cy + canvas.winfo_height())
+                d = int(delta)
             except Exception:
-                return False
-
-        # Прокрутка: на macOS трекпад присылает ОЧЕНЬ частые события с
-        # малым delta (пиксельный скролл), на Windows — редкие, кратные 120.
-        # Шаг в «units» для трекпада был слишком крупным (одно событие =
-        # целая строка), из-за чего прокрутку «бросало» и список прыгал
-        # обратно. Теперь:
-        #   * трекпад (малый delta) — плавный пиксельный сдвиг;
-        #   * колесо (|delta| >= 120) — по одной строке за щелчок;
-        #   * лишние события одного жеста объединяются по времени.
-        _wheel_state = {"last": 0.0, "acc": 0.0}
+                return 0, 0
+            dx = d >> 16
+            low = d & 0xFFFF
+            dy = low if low < 0x8000 else low - 0x10000
+            return dx, dy
 
         def _on_mousewheel(event):
-            import time as _tm
-            delta = getattr(event, "delta", 0) or 0
+            # Обработчик висит только на канвасе и на виджетах ВНУТРИ него,
+            # поэтому проверка «курсор над списком» не нужна: событие приходит
+            # именно тому виджету, что под курсором.
             num = getattr(event, "num", 0) or 0
-            if num == 4:                 # Linux: колесо вверх
-                canvas.yview_scroll(-40, "units")
+            delta = getattr(event, "delta", 0) or 0
+            if num == 4:
+                canvas.yview_scroll(-ROW_PX, "units")
                 return "break"
-            if num == 5:                 # Linux: колесо вниз
-                canvas.yview_scroll(40, "units")
+            if num == 5:
+                canvas.yview_scroll(ROW_PX, "units")
                 return "break"
-            if not delta:
-                return "break"
-            now = _tm.monotonic()
-            # Всё считаем В ПИКСЕЛЯХ (yscrollincrement=1), поэтому шаг можно
-            # делать мелким и соразмерным движению пальца.
-            #   * колесо мыши — строго кратно ±120 → строку на щелчок;
-            #   * трекпад — произвольные значения: сдвигаем ровно на столько
-            #     пикселей, сколько «проехал» палец (умеренно).
-            if delta % 120 == 0 and abs(delta) >= 120:
-                lines = int(-delta / 120) or (-1 if delta > 0 else 1)
-                canvas.yview_scroll(lines * 22, "units")   # ~одна строка
-                _wheel_state["acc"] = 0.0
-                _wheel_state["last"] = now
+            try:
+                d = int(delta)
+            except Exception:
+                return None
+            if not d:
+                return None
+
+            # Тип события различаем по event.type (проверено на Tk 9.0.4):
+            #   "38" — <MouseWheel>     : целые «щелчки» (1 на macOS, 120 на Win)
+            #   "39" — <TouchpadScroll> : точная прокрутка, delta упакована как
+            #                             (dx << 16) | dy, знак в младших 16 битах
+            #                             (tk::PreciseScrollDeltas)
+            # Раньше величину угадывали по порогу — быстрая прокрутка колеса
+            # могла быть принята за трекпад и список «прыгал».
+            if str(getattr(event, "type", "")) == "39":
+                _dx, dy = _decode_precise(d)
+                if dy:
+                    canvas.yview_scroll(dy * TRACKPAD_GAIN, "units")
                 return "break"
 
-            # Трекпад: прямое пиксельное смещение. Копим мелкие события,
-            # чтобы не терять дробные значения и не «дёргать» список.
-            if now - _wheel_state["last"] > 0.25:
-                _wheel_state["acc"] = 0.0      # новый жест
-            _wheel_state["last"] = now
-            _wheel_state["acc"] += -delta      # вниз = увеличение y
-            px = int(_wheel_state["acc"])
-            if px:
-                # ограничение на одно событие, чтобы быстрый жест не
-                # проскакивал весь список одним прыжком
-                px = max(-60, min(60, px))
-                _wheel_state["acc"] -= px
-                canvas.yview_scroll(px, "units")
+            if d % 120 == 0:
+                canvas.yview_scroll(-(d // 120) * ROW_PX, "units")
+                return "break"
+            canvas.yview_scroll(-d * ROW_PX, "units")
             return "break"
 
         # ВАЖНО (найдено инструментальной проверкой): на macOS трекпад
@@ -1825,10 +1864,12 @@ class FlasherGUI:
         # хотя обычное колесо и полоса прокрутки действовали.
         _WHEEL_SEQS = ("<MouseWheel>", "<TouchpadScroll>", "<Button-4>",
                        "<Button-5>", "<Shift-MouseWheel>")
+        # НИКАКОГО bind_all: он ловил колесо во ВСЁМ приложении (другие окна,
+        # журнал, таблицы) — отсюда «дрыгание» списка, когда активным было
+        # другое окно. Привязываем только к канвасу и к виджетам внутри него.
         for seq in _WHEEL_SEQS:
             try:
                 canvas.bind(seq, _on_mousewheel)
-                canvas.bind_all(seq, _on_mousewheel)
             except Exception:
                 pass
         # то же — для виджетов внутри списка (чекбоксы, метки, кнопки):
@@ -2113,11 +2154,15 @@ class FlasherGUI:
         """
         snap = {}
 
-        # 1. Amlogic через Windows PnP (WMI) — БЕЗ открытия устройства
+        # 1. Amlogic — через системные списки устройств, БЕЗ открытия USB-хэндла
+        #    (macOS: IORegistry; Windows: PnP). pyusb — только резерв для
+        #    отладочных платформ: лишние обращения к libusb во время работы
+        #    U-Boot в burn-режиме могут спровоцировать пере-энумерацию.
         if sys.platform == "win32":
             snap.update(self._wmi_amlogic_snapshot())
+        elif _IS_MAC:
+            snap.update(self._ioreg_amlogic_snapshot())
         elif USB_AVAILABLE:
-            # На не-Windows (отладка) — резерв через pyusb
             try:
                 for dev in usb.core.find(find_all=True, idVendor=0x1b8e):
                     pid = dev.idProduct
@@ -4624,7 +4669,10 @@ class FlasherGUI:
                     if name in seen or name in ('name','Type','Size','Sect','Start'):
                         continue
                     seen.add(name)
-                    parts.append((name, int(m.group(3))))   # sectors
+                    # name, sectors, СТАРТ. Старт обязателен для точного
+                    # дампа: между разделами есть ПРОМЕЖУТКИ, и сумма
+                    # размеров даёт неверный старт (см. _resolve_partition_start).
+                    parts.append((name, int(m.group(3)), int(m.group(2))))
             return parts
 
         # ── Окно ──────────────────────────────────────────────────────────────
@@ -4696,6 +4744,31 @@ class FlasherGUI:
                           initialdir=last_dir("dump_dir", ROOT_DIR))
                       or out_var.get()), width=8).pack(side=tk.LEFT)
 
+        # ── Режим чтения ─────────────────────────────────────────────────────
+        mf = tk.LabelFrame(win, text="Режим чтения", font=("Arial", 9, "bold"))
+        mf.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(0, 4))
+        sectioned_var = tk.BooleanVar(value=True)
+        used_only_var = tk.BooleanVar(value=False)
+        sparse_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(mf, variable=sectioned_var, font=("Arial", 9),
+                       text="Читать секциями по 64 МиБ — устойчиво к обрыву, "
+                            "продолжается с места остановки"
+                       ).pack(anchor=tk.W, padx=6)
+        tk.Checkbutton(mf, variable=used_only_var, font=("Arial", 9),
+                       text="Только занятые блоки (ext4): читать реальные "
+                            "данные — быстрее и меньше"
+                       ).pack(anchor=tk.W, padx=6)
+        tk.Checkbutton(mf, variable=sparse_var, font=("Arial", 9),
+                       text="Собирать sparse-образ (прошивается штатно)"
+                       ).pack(anchor=tk.W, padx=6)
+        tk.Label(mf, justify=tk.LEFT, font=("Arial", 8), fg="#555555",
+                 text=("По умолчанию читается весь раздел — побайтовая копия. "
+                       "«Только занятые блоки» сохраняет метаданные всех групп "
+                       "и журнал целиком, поэтому образ прошивается как есть, "
+                       "но НЕ является побитовой копией (удалённые данные не "
+                       "сохраняются)."),
+                 wraplength=780).pack(anchor=tk.W, padx=6, pady=(0, 4))
+
         # ── Лог (внизу, фиксированной высоты, перед таблицей) ─────────────────
         logf = tk.LabelFrame(win, text="Журнал", font=("Arial", 9, "bold"))
         logf.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 4))
@@ -4714,7 +4787,13 @@ class FlasherGUI:
         # Подключаем журнал дампа к USB-watcher, чтобы события
         # подключения/отключения USB дублировались и сюда.
         self._dump_log_fn = log
+        # Флаг отмены для операций этого окна: закрыли окно — прекращаем
+        # и ожидание устройства, и чтение разделов.
+        dump_cancel = {"v": False}
+        def _cancel():
+            return bool(dump_cancel["v"])
         def _on_dump_close():
+            dump_cancel["v"] = True
             self._dump_log_fn = None
             win.destroy()
         win.protocol("WM_DELETE_WINDOW", _on_dump_close)
@@ -4743,6 +4822,9 @@ class FlasherGUI:
 
         part_sect = {}   # name → sectors
         part_sel  = {}   # name → bool
+        part_start = {}  # name → стартовый сектор (ТОЛЬКО с устройства:
+                         # в таблице есть промежутки, сумма размеров неверна)
+        table_order = []  # порядок имён разделов как в таблице
 
         def set_all(state):
             for row in tree.get_children():
@@ -4774,15 +4856,25 @@ class FlasherGUI:
         def populate(parts_sect, source=""):
             for row in tree.get_children(): tree.delete(row)
             part_sect.clear(); part_sel.clear()
-            for name, sect in parts_sect:
+            part_start.clear()
+            table_order.clear()
+            for item in parts_sect:
+                name, sect = item[0], item[1]
+                start = item[2] if len(item) > 2 else None
                 part_sect[name] = sect
+                if start is not None:
+                    part_start[name] = int(start)
                 part_sel[name]  = True
                 sz_b = sect * SECTOR
                 sz_s = (f"{sz_b/(1024*1024):.0f} MB" if sz_b >= 1024*1024
                         else f"{sz_b//1024} KB")
                 tree.insert("", tk.END, values=("✓", name, sz_s))
+                table_order.append(name)
             if source:
                 log(f"✓ Загружено {len(parts_sect)} разделов ({source})")
+                if part_start:
+                    log(f"  стартовые сектора: точные с устройства "
+                        f"({len(part_start)} шт.)")
 
         populate(KNOWN_PARTS_SECT, "стандартная таблица YSM")
 
@@ -4797,11 +4889,57 @@ class FlasherGUI:
             ev.wait(timeout=5)
             return result[0]
 
+        # ── Таблица разделов с устройства (нужна для ТОЧНЫХ стартов) ──────────
+        def fetch_device_table():
+            """Запросить у устройства таблицу разделов со стартами.
+
+            Ответ на `amlmmc part 1` печатает сам U-Boot, то есть приходит
+            по UART (как и в кнопке «Сессия»). Старты обязательны: между
+            разделами есть промежутки, и без них адреса чтения окажутся
+            смещены (для data — на 184 МиБ).
+            """
+            try:
+                if _cancel():
+                    return False
+                snap_before = snapshot_terminal()
+                len_before = len(snap_before)
+                self._terminal_capture_buf = []
+                usb_out = ""
+                try:
+                    usb_out = self.aml_bulkcmd("amlmmc part 1")
+                except Exception as ex:
+                    log(f"  ⚠ amlmmc part 1: {safe_decode(ex)[:80]}")
+                _t.sleep(4 if self.serial_running else 1)
+                snap_after = snapshot_terminal()
+                new_text = snap_after[len_before:]
+                captured = "\n".join(self._terminal_capture_buf or [])
+                self._terminal_capture_buf = None
+                parts = parse_table(new_text + "\n" + captured + "\n" + usb_out)
+                got = [p for p in parts if len(p) > 2]
+                if not got:
+                    log("  ℹ таблица с устройства не считана (ответ amlmmc "
+                        "part 1 идёт по UART — проверьте подключение UART)")
+                    return False
+                # Старты кладём в словарь СРАЗУ (этот же поток читает его
+                # дальше); дерево обновляем в UI-потоке.
+                for it in got:
+                    part_start[it[0]] = int(it[2])
+                parts_snapshot = list(parts)
+                self.root.after(0, lambda: populate(
+                    parts_snapshot, "с устройства (старты точные)"))
+                return True
+            except Exception as ex:
+                log(f"  ⚠ таблица с устройства: {safe_decode(ex)[:90]}")
+                self._terminal_capture_buf = None
+                return False
+
         # ── Сессия ────────────────────────────────────────────────────────────
         def run_session():
             session_btn.config(state=tk.DISABLED)
             def _thread():
                 self._pause_usb_watch()   # пауза USB-watcher на время сессии
+                if _cancel():
+                    return
                 try:
                     self.get_update_path()
                 except FileNotFoundError as ex:
@@ -4840,19 +4978,46 @@ class FlasherGUI:
                         self.root.after(0, lambda: session_btn.config(state=tk.NORMAL))
                         return
                     log("🔌 Ожидание устройства (USB Boot)...")
-                    try:
-                        _sender(bundle); log("✓ U-Boot загружен")
-                        self._release_aml_usb()   # отпускаем интерфейс для update
-                    except Exception as ex:
-                        log(f"❌ pyamlboot: {safe_decode(ex)}")
+                    # Ждём реального появления устройства перед загрузкой U-Boot.
+                    # Отмена — только закрытием окна (см. _wait_amlogic_usb:
+                    # раньше ожидание мгновенно прерывалось по is_flashing,
+                    # которого в этом окне нет).
+                    if not self._wait_amlogic_usb(120, log_fn=log, settle=0,
+                                                  cancel_check=_cancel):
+                        if _cancel():
+                            log("⛔ Сессия прервана (окно закрыто)")
+                        else:
+                            log("❌ Устройство не появилось на USB — проверьте, что "
+                                "пин 6 замкнут на GND и подано питание")
                         self._resume_usb_watch()
                         self.root.after(0, lambda: session_btn.config(state=tk.NORMAL))
                         return
-                    _t.sleep(3)
+                    loaded = False
+                    for _i in range(1, 4):
+                        if _cancel():
+                            break
+                        try:
+                            _sender(bundle); loaded = True
+                            log("✓ U-Boot загружен")
+                            break
+                        except Exception as ex:
+                            log(f"  ⚠ попытка {_i}/3: {safe_decode(ex)[:90]}")
+                            self._release_aml_usb()
+                            self._wait_amlogic_usb(20, log_fn=log, settle=0,
+                                                   cancel_check=_cancel)
+                            _t.sleep(2)
+                    if not loaded:
+                        log("❌ pyamlboot: не удалось загрузить U-Boot")
+                        self._resume_usb_watch()
+                        self.root.after(0, lambda: session_btn.config(state=tk.NORMAL))
+                        return
+                    self._release_aml_usb()   # отпускаем интерфейс для update
                     # U-Boot пере-энумерирует USB — ждём реального возврата
-                    if not self._wait_amlogic_usb(30, log_fn=log):
+                    if not self._wait_amlogic_usb(60, log_fn=log,
+                                                  cancel_check=_cancel):
                         log("❌ Устройство не вернулось на USB после загрузки "
-                            "U-Boot — переподключите питание/USB и повторите")
+                            "U-Boot. Проверьте питание и кабель (лучше напрямую "
+                            "в Mac, без хаба) и повторите сессию.")
                         self._resume_usb_watch()
                         self.root.after(0, lambda: session_btn.config(state=tk.NORMAL))
                         return
@@ -4944,47 +5109,355 @@ class FlasherGUI:
             except FileNotFoundError as ex:
                 log(f"❌ {ex}"); return
 
-            def _thread():
-                self._pause_usb_watch()   # пауза USB-watcher на время дампа
-                dump_btn.config(state=tk.DISABLED)
-                log(f"\n💾 Дамп {len(to_dump)} разделов → {out_dir}")
-                cflags = subprocess.CREATE_NO_WINDOW if sys.platform=='win32' else 0
+            def _read_part(update_path, pname, size_hex, out_file, cflags):
+                """Одно чтение раздела штатным способом (update mread store).
+
+                Пишем во временный .part-файл: если update упал, недописанный
+                файл удаляется, и в папке дампов не остаётся «успешного» 0-KB
+                образа.
+
+                ВАЖНО (найдено по итогам дампа 15.10). Раньше вывод утилиты
+                захватывался целиком (subprocess.run) и показывался только в
+                конце. Чтение раздела в 9,37 ГиБ занимает 15–25 минут, и всё
+                это время в журнале не было НИ СТРОКИ — выглядело как «зависло
+                / не делается». Теперь вывод читается ПОТОКОМ: прогресс
+                «[ 16%/ 4MB]» и любые сообщения видны сразу.
+
+                Успех = код возврата 0 И ТОЧНЫЙ запрошенный размер файла.
+                Подстрока «ERR» в выводе — только предупреждение: этот же
+                инструмент печатает «ERR: AmlUsbBulkCmd failed!» и в штатных
+                случаях (проверено по его логам), поэтому судить по ней нельзя.
+                """
+                tmp_file = out_file + ".part"
                 try:
-                    for pname in to_dump:
+                    if os.path.exists(tmp_file):
+                        os.remove(tmp_file)
+                except Exception:
+                    pass
+                expected = int(size_hex, 16)
+                try:
+                    timeout = float(getattr(self, "DUMP_READ_TIMEOUT", 1800))
+                except Exception:
+                    timeout = 1800.0
+                cmd = [update_path, "mread", "store",
+                       pname, "normal", size_hex, tmp_file]
+                log(f"     ⏱ Штатное чтение по имени: {expected:,} Б "
+                    f"({expected / 1024 ** 3:.2f} ГиБ). Это несколько минут — "
+                    "прогресс будет ниже; закрытие окна прервёт чтение.")
+
+                t_start = _t.time()
+                try:
+                    proc = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        bufsize=0, creationflags=cflags)
+                except Exception as ex:
+                    _cleanup_tmp(tmp_file)
+                    return False, safe_decode(ex)
+
+                # Вывод читаем в отдельном потоке (так работает и на Windows,
+                # где select по pipe недоступен), а здесь разбираем по мере
+                # поступления: прогресс — в журнал с шагом 5%, прочие строки —
+                # целиком, всё дублируется в COM-терминал.
+                q = queue.Queue()
+
+                def _pump():
+                    try:
+                        while True:
+                            chunk = proc.stdout.read(4096)
+                            if not chunk:
+                                break
+                            q.put(chunk)
+                    except Exception:
+                        pass
+                    finally:
+                        q.put(None)
+
+                _th.Thread(target=_pump, daemon=True).start()
+                out_parts, term_buf = [], []
+                buf = b""
+                last_pct = -1
+                deadline = t_start + timeout
+
+                def _term_flush():
+                    if term_buf:
+                        txt = "\n".join(term_buf)
+                        term_buf.clear()
+                        try:
+                            self.root.after(0, lambda t=txt:
+                                            self.terminal_log(t))
+                        except Exception:
+                            pass
+
+                try:
+                    while True:
+                        if _cancel():
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                            _cleanup_tmp(tmp_file)
+                            _term_flush()
+                            return False, "отменено (окно закрыто)"
+                        if _t.time() > deadline:
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                            _cleanup_tmp(tmp_file)
+                            _term_flush()
+                            return False, f"timeout ({int(timeout)} с)"
+                        try:
+                            chunk = q.get(timeout=1.0)
+                        except queue.Empty:
+                            continue
+                        if chunk is None:
+                            break
+                        buf += chunk
+                        while True:
+                            ir = buf.find(b"\r")
+                            inn = buf.find(b"\n")
+                            cand = [x for x in (ir, inn) if x >= 0]
+                            if not cand:
+                                break
+                            k = min(cand)
+                            rec, buf = buf[:k], buf[k + 1:]
+                            txt = safe_decode(rec).strip()
+                            if not txt:
+                                continue
+                            if len(out_parts) < 4000:
+                                out_parts.append(txt)
+                            mpct = _re.search(r"(\d{1,3})\s?%", txt)
+                            if mpct:
+                                pct = int(mpct.group(1))
+                                if pct >= last_pct + 5:
+                                    last_pct = pct
+                                    log(f"     … {pct}% "
+                                        f"({int(_t.time() - t_start)} с)")
+                                    term_buf.append("[USB] " + txt)
+                            else:
+                                log(f"     [update] {txt[:160]}")
+                                term_buf.append("[USB] " + txt)
+                            if len(term_buf) >= 20:
+                                _term_flush()
+                    if buf.strip():
+                        txt = safe_decode(buf).strip()
+                        if len(out_parts) < 4000:
+                            out_parts.append(txt)
+                        log(f"     [update] {txt[:160]}")
+                    _term_flush()
+                    rc = proc.wait()
+                except Exception as ex:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    _cleanup_tmp(tmp_file)
+                    _term_flush()
+                    return False, safe_decode(ex)
+
+                out_t = "\n".join(out_parts)
+                n_written = (os.path.getsize(tmp_file)
+                             if os.path.exists(tmp_file) else 0)
+                # ТОЧНЫЙ РАЗМЕР: раньше требовалось лишь «файл не пуст» —
+                # из-за этого мгновенный обрыв чтения выглядел успешным дампом.
+                ok = (rc == 0 and n_written == expected)
+                if not ok:
+                    _cleanup_tmp(tmp_file)
+                    parts = []
+                    if rc != 0:
+                        parts.append(f"код {rc}")
+                    if n_written != expected:
+                        parts.append(f"получено {n_written} из {expected} байт")
+                    why = "; ".join(parts) if parts else "неизвестная ошибка"
+                    tail = out_t.strip()
+                    if tail:
+                        why += f": {tail[-300:]}"
+                    return False, why
+                if "ERR" in out_t.upper():
+                    log("     ⚠ в выводе update есть «ERR», но размер файла "
+                        "точный — продолжаю (инструмент печатает ERR и при "
+                        "успешных командах)")
+                try:
+                    if os.path.exists(out_file):
+                        os.remove(out_file)
+                    os.replace(tmp_file, out_file)
+                except Exception as ex:
+                    _cleanup_tmp(tmp_file)
+                    return False, f"не удалось сохранить файл: {ex}"
+                log(f"     ✓ файл записан полностью за "
+                    f"{int(_t.time() - t_start)} с")
+                return True, out_t
+
+            def _cleanup_tmp(path):
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except Exception:
+                    pass
+
+            def _thread():
+                self._pause_usb_watch()
+                dump_btn.config(state=tk.DISABLED)
+                mode = []
+                if used_only_var.get():
+                    mode.append("только занятые блоки")
+                if sectioned_var.get():
+                    mode.append("секциями по %d МиБ" % (self.DUMP_SECTION_BYTES >> 20))
+                else:
+                    mode.append("одним чтением")
+                if sparse_var.get():
+                    mode.append("sparse")
+                log(f"\n💾 Дамп {len(to_dump)} разделов → {out_dir}")
+                log("   Режим: " + ", ".join(mode))
+                saved, failed = [], []
+                try:
+                    # ── Подготовка: U-Boot → ожидание USB → mmc dev 1 ──
+                    log("\n⚙ Подготовка устройства (U-Boot → eMMC)...")
+                    if not self._ensure_uboot_ready(log_fn=log, cancel_check=_cancel):
+                        log("❌ Устройство не готово к дампу — операция прервана.")
+                        log("  Проверьте: USB к сервисной колодке, пин 6 на GND,")
+                        log("  питание подано, кабель напрямую в Mac (без хаба).")
+                        return
+
+                    # ── Стартовые сектора ─────────────────────────────────
+                    # ВАЖНО: между разделами на устройстве ЕСТЬ ПРОМЕЖУТКИ
+                    # (выравнивание Amlogic). Пример из таблицы этого
+                    # устройства: sysrecovery кончается на 10874880, а data
+                    # начинается с 10891264 — зазор 16384 сектора. Поэтому
+                    # СУММА РАЗМЕРОВ даёт неверный старт (для data — сдвиг на
+                    # 184 МиБ), и по ней читать нельзя. Точные старты берём из
+                    # таблицы устройства; сумму используем только как
+                    # подсказку для поиска фактического старта.
+                    if sectioned_var.get() and any(n not in part_start
+                                                   for n in to_dump):
+                        log("📋 Запрашиваю таблицу разделов с устройства "
+                            "(нужны точные старты)...")
+                        if fetch_device_table():
+                            log("  ✓ таблица получена со стартами")
+                    computed = self._partition_starts(
+                        [(n, part_sect.get(n, 0)) for n in table_order])
+                    starts = {n: part_start[n] for n in table_order
+                              if n in part_start}
+                    log(f"  ℹ таблица: {len(table_order)} разделов, "
+                        f"точных стартов {len(starts)}")
+
+                    for idx, pname in enumerate(to_dump, 1):
+                        if _cancel():
+                            log("⛔ Дамп прерван (окно закрыто)")
+                            return
                         sect = part_sect.get(pname, 0)
                         nbytes = sect * SECTOR
                         if nbytes <= 0:
                             log(f"  ⚠ {pname}: неизвестен размер, пропуск")
                             continue
                         out_file = os.path.join(out_dir, f"{pname}.img")
-                        size_hex = hex(nbytes)
-                        log(f"  ⬇ {pname}  ({nbytes//1024} KB, {size_hex})...")
-                        try:
-                            r = subprocess.run(
-                                [update_path, "mread", "store",
-                                 pname, "normal", size_hex, out_file],
-                                capture_output=True, timeout=1800,
-                                creationflags=cflags)
-                            out_t = safe_decode((r.stdout or b"")+(r.stderr or b""))
-                            for ln in out_t.splitlines():
-                                if ln.strip():
-                                    self.root.after(0,
-                                        lambda l=ln.strip(): self.terminal_log(f"[USB] {l}"))
-                            if r.returncode == 0 and os.path.exists(out_file):
-                                log(f"     ✓ {os.path.getsize(out_file)//1024} KB сохранено")
+                        log(f"  ⬇ [{idx}/{len(to_dump)}] {pname}  "
+                            f"({nbytes // 1024} KB = {nbytes / 1024 ** 3:.2f} ГиБ)")
+                        ok = False
+                        info = ""
+                        start_sector = None
+                        if sectioned_var.get():
+                            # Точный старт — из таблицы устройства.
+                            start_sector = starts.get(pname)
+                            if start_sector is None:
+                                # Точного старта нет: ищем фактический по
+                                # сигнатуре ФС (старты сдвинуты из-за
+                                # промежутков между разделами).
+                                start_sector = self._resolve_partition_start(
+                                    pname, computed.get(pname), nbytes,
+                                    log_fn=log, cancel_check=_cancel)
+                            if start_sector is None:
+                                log("     ⚠ точный старт неизвестен — читаю "
+                                    "штатным способом (по имени, целиком)")
+                        if start_sector is not None:
+                            used = None
+                            if used_only_var.get():
+                                log("     🔍 Анализ ext4 (карта занятых блоков)...")
+                                try:
+                                    used = self._ext4_used_runs(
+                                        start_sector, nbytes, log_fn=log,
+                                        cancel_check=_cancel)
+                                except Exception as ex:
+                                    log(f"     ⚠ анализ не удался: "
+                                        f"{safe_decode(ex)[:90]}")
+                                    used = None
+                                if used is None:
+                                    log("     → читаю весь раздел")
+                            ok = self._dump_partition_sectioned(
+                                pname, start_sector, nbytes, out_file,
+                                log_fn=log, cancel_check=_cancel,
+                                used_runs=used)
+                            info = "" if ok else "секционный дамп прерван"
+                        else:
+                            # Читаем ПО ИМЕНИ через update mread store: этот
+                            # способ не требует знать смещение раздела.
+                            ok, info = _read_part(update_path, pname,
+                                                  hex(nbytes), out_file, cflags)
+                            if not ok:
+                                log("     ⚠ ошибка чтения — переинициализация eMMC")
+                                log(f"       {safe_decode(info).strip()[:140]}")
+                                self._release_aml_usb()
+                                if self._wait_amlogic_usb(30, log_fn=log,
+                                                          cancel_check=_cancel,
+                                                          settle=0) and \
+                                   self._ensure_uboot_ready(log_fn=log,
+                                                            cancel_check=_cancel):
+                                    ok, info = _read_part(update_path, pname,
+                                                          hex(nbytes), out_file,
+                                                          cflags)
+                        if ok and sparse_var.get():
+                            # Упаковка в sparse НА МЕСТЕ: имя остаётся
+                            # <раздел>.img, поэтому окно прошивки находит образ
+                            # как обычно. Формат опознаётся по magic самим
+                            # update («sparse format detected») и нашей
+                            # _yt_probe_image_format — доработок не требуется.
+                            log("     📦 Упаковка в sparse...")
+                            tmp_sp = out_file + ".sparse.tmp"
+                            sp_ok = False
+                            try:
+                                sp_ok = self._raw_to_sparse_streaming(
+                                    out_file, tmp_sp, log_fn=log,
+                                    cancel_check=_cancel)
+                            except Exception as ex:
+                                log(f"     ⚠ sparse: {safe_decode(ex)[:90]}")
+                            if sp_ok and os.path.exists(tmp_sp):
+                                try:
+                                    os.replace(tmp_sp, out_file)
+                                    log(f"     ✓ {pname}: sparse готов "
+                                        f"({os.path.getsize(out_file) // 1024 ** 2} МиБ)")
+                                except Exception as ex:
+                                    log(f"     ⚠ не удалось заменить файл: "
+                                        f"{safe_decode(ex)[:80]}")
                             else:
-                                log(f"     ❌ код {r.returncode}: {out_t.strip()[:140]}")
-                        except subprocess.TimeoutExpired:
-                            log(f"     ❌ таймаут (раздел слишком большой?)")
-                        except Exception as ex:
-                            log(f"     ❌ {safe_decode(ex)}")
+                                try:
+                                    if os.path.exists(tmp_sp):
+                                        os.remove(tmp_sp)
+                                except Exception:
+                                    pass
+                                log("     ⚠ sparse не собрался — оставляю raw")
+                        if ok:
+                            if not sparse_var.get():
+                                kb = os.path.getsize(out_file) // 1024
+                                log(f"     ✓ {pname}: {kb} KB сохранено")
+                            saved.append(pname)
+                        else:
+                            log(f"     ❌ {pname}: {safe_decode(info).strip()[:140]}")
+                            failed.append(pname)
                 finally:
-                    self._resume_usb_watch()   # возобновляем после дампа
-                self.root.after(0, lambda: (
-                    dump_btn.config(state=tk.NORMAL),
-                    messagebox.showinfo("Готово",
-                                        f"Дампы в:\n{out_dir}", parent=win)))
+                    self._resume_usb_watch()
+
+                def _done():
+                    dump_btn.config(state=tk.NORMAL)
+                    summary = f"Сохранено разделов: {len(saved)} из {len(to_dump)}"
+                    if failed:
+                        summary += "\n\nНе удалось: " + ", ".join(failed)
+                    log("\n" + summary)
+                    messagebox.showinfo("Дамп завершён",
+                                        f"{summary}\n\nПапка:\n{out_dir}",
+                                        parent=win)
+                self.root.after(0, _done)
             _th.Thread(target=_thread, daemon=True).start()
+
 
         # ── Привязка кнопок ───────────────────────────────────────────────────
         session_btn.config(command=run_session)
@@ -5652,24 +6125,24 @@ class FlasherGUI:
         cflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
         MARKERS = ["1B8E", "C003", "AMLOGIC", "BURNING", "WORLDCUP", "GX-CHIP"]
 
-        # macOS: WMIC/PowerShell недоступны — сразу проверка через libusb/pyusb
+        # macOS: WMIC/PowerShell недоступны — проверяем через IORegistry.
+        # ВАЖНО: используется ioreg (чтение дерева IORegistry), а НЕ pyusb.
+        # Открытие USB-хэндла через libusb в цикле раз в секунду давало лишние
+        # пере-энумерации и «залипание» бутрома Amlogic; ioreg устройство не
+        # открывает и работает даже без установленного libusb.
         if _IS_MAC:
             while self.is_flashing and elapsed < 300:
                 try:
-                    import usb.core as _uc
-                    dev = _uc.find(idVendor=0x1b8e, idProduct=0xc003)
-                    if dev is not None:
-                        self.log("  ✓ Устройство обнаружено через libusb (1b8e:c003)")
+                    snap = self._ioreg_amlogic_snapshot()
+                    if snap:
+                        self.log("  ✓ Устройство обнаружено через IORegistry "
+                                 "(1b8e:c003)")
                         self.log("✓ Устройство обнаружено! Ждем стабилизации...")
                         time.sleep(2)
                         return True
-                except ImportError:
-                    self.log("  ⚠ pyusb не установлен (pip install pyusb)")
                 except Exception as e:
-                    # libusb может быть не установлен — не спамим, пишем раз
                     if elapsed == 0:
-                        self.log(f"  ⚠ Ошибка libusb: {e} "
-                                 "(нужен brew install libusb)")
+                        self.log(f"  ⚠ Ошибка ioreg: {e}")
                 if elapsed % 5 == 0:
                     self.log(f"⏳ Поиск устройства... ({elapsed}с)")
                 time.sleep(1)
@@ -6138,16 +6611,32 @@ class FlasherGUI:
                 log_fn(f"  ❌ Не удалось пропатчить update: {ex}")
                 return
 
-        # Smoke-тест: бинарник без устройства должен выдать usage, а не
-        # ошибку загрузки dylib
+        # Проверка запуска БЕЗ исполнения: раньше здесь запускался сам update
+        # «для проверки», но он ОПРАШИВАЕТ USB. Во время дампа или прошивки это
+        # лишнее обращение к устройству (и риск помешать операции), поэтому
+        # проверяем статически: файл на месте, исполняемый, зависимости найдены.
         try:
-            r = subprocess.run([update_bin], capture_output=True,
-                               text=True, errors="ignore", timeout=10)
-            log_fn("  ✓ update запускается")
+            ok_file = os.path.exists(update_bin) and os.access(update_bin, os.X_OK)
+            r = subprocess.run(["otool", "-L", update_bin],
+                               capture_output=True, text=True, timeout=10)
+            deps = r.stdout or ""
+            missing = []
+            for line in deps.splitlines()[1:]:
+                dep = line.strip().split(" ")[0] if line.strip() else ""
+                if dep.startswith("@executable_path/"):
+                    cand = os.path.join(os.path.dirname(update_bin),
+                                        dep.replace("@executable_path/", ""))
+                    if not os.path.exists(cand):
+                        missing.append(dep)
+            if ok_file and not missing:
+                log_fn("  ✓ update на месте и зависимости найдены (не запускаем — "
+                       "он опрашивает USB)")
+            elif not ok_file:
+                log_fn(f"  ⚠ update не исполняемый: {update_bin}")
+            else:
+                log_fn(f"  ⚠ у update не найдены зависимости: {missing}")
         except Exception as ex:
-            log_fn(f"  ⚠ update не запустился: {ex}")
-            log_fn("     Если ошибка про 'cannot be opened' — выполните: "
-                   "xattr -cr files/macos/ && sudo spctl --add files/macos/update")
+            log_fn(f"  ⚠ проверка update: {ex}")
 
     def _find_aml_packer(self):
         """Найти aml_image_v2_packer (Windows) в files/ и подпапках.
@@ -6980,6 +7469,10 @@ class FlasherGUI:
             wipe = wipe_var.get()
             do_reset = reset_var.get()
             wd = unpack_dir[0]
+            # Флаг отмены этой операции. ВАЖНО: окно пакета НЕ выставляет
+            # self.is_flashing (его ставит только главное окно прошивки),
+            # поэтому опираться на него нельзя — см. _burn_package_*.
+            burn_cancel = {"v": False}
 
             def _t():
                 prog.start(10)
@@ -6988,7 +7481,8 @@ class FlasherGUI:
                         # macOS: ROM/bl2-режимы ненадёжны для bulk-записи —
                         # прошиваем разделы через U-Boot из aml_bundle
                         self._burn_package_partitions_via_uboot(
-                            wd, to_flash, wipe, do_reset, log)
+                            wd, to_flash, wipe, do_reset, log,
+                            cancel_check=lambda: burn_cancel["v"])
                     else:
                         self._burn_package_sequence(
                             wd, parts_info, to_flash, platform_cfg,
@@ -7007,7 +7501,16 @@ class FlasherGUI:
                   command=do_flash, bg="#C0392B", fg="white",
                   font=("Arial", 10, "bold"), height=2
                   ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        _ColorButton(btn_row, text="Закрыть", command=win.destroy,
+
+        def _close_burn_win():
+            # Закрытие окна прекращает операцию на ближайшем шаге
+            try:
+                burn_cancel["v"] = True
+            except NameError:
+                pass
+            win.destroy()
+
+        _ColorButton(btn_row, text="Закрыть", command=_close_burn_win,
                   font=("Arial", 9), height=2, width=10).pack(side=tk.RIGHT)
 
         log("Окно прошивки burning-пакета (aml_upgrade_package.img).")
@@ -7021,7 +7524,8 @@ class FlasherGUI:
             "«папка уже распакованного пакета» и сразу прошивайте.")
 
     def _burn_package_partitions_via_uboot(self, wd, to_flash,
-                                           wipe, do_reset, log):
+                                           wipe, do_reset, log,
+                                           cancel_check=None):
         """Прошивка разделов распакованного burning-пакета через U-Boot из
         files/aml_bundle.img (pyamlboot) + update partition.
 
@@ -7041,17 +7545,32 @@ class FlasherGUI:
                 "files/aml_bundle.img не найден — положите U-Boot образ "
                 "устройства в files/ (он используется вместо DDR.USB пакета)")
 
+        # Отмена: окно прошивки пакета не выставляет is_flashing, поэтому
+        # раньше сюда попадал cancel_check=lambda: not self.is_flashing, и
+        # ожидание возврата USB завершалось МГНОВЕННО (флаг всегда False) —
+        # отсюда «Устройство не вернулось на USB», хотя U-Boot загружался.
+        cancel = cancel_check or (lambda: False)
+
         # 1. U-Boot уже в памяти с прошлой попытки?
-        rc, out = self.aml_update_raw(["bulkcmd", "echo 12345"], timeout=10)
-        uboot_alive = (rc == 0)
-        if not uboot_alive:
+        #    Проба — по ЭХУ маркера (_uboot_alive): эвристика «есть ERR → провал»
+        #    здесь неприменима, update печатает ERR и при успешной команде.
+        if self._uboot_alive(log_fn=log):
+            log("✓ U-Boot уже запущен (burn mode активен)")
+        else:
             log("🔌 Загрузка U-Boot (aml_bundle) через pyamlboot...")
             sender = get_aml_bundle_sender()
             if not sender:
                 raise Exception("pyamlboot_local недоступен — нажмите "
                                 "«Загрузить утилиты» и перезапустите")
+            # Дождаться появления устройства: человек может ещё подавать питание
+            if not self._wait_amlogic_usb(120, log_fn=log, cancel_check=cancel,
+                                          settle=0):
+                raise Exception("Устройство не появилось на USB. Проверьте, что "
+                                "пин 6 замкнут на GND и подано питание")
             last = None
             for i in range(1, 4):
+                if cancel():
+                    raise Exception("Операция отменена (окно закрыто)")
                 try:
                     sender(bundle)
                     log("✓ U-Boot загружен")
@@ -7060,21 +7579,23 @@ class FlasherGUI:
                     last = e
                     log(f"  ⚠ попытка {i}/3: {safe_decode(e)[:90]}")
                     self._release_aml_usb()
-                    self._wait_amlogic_usb(15, log_fn=log)
+                    self._wait_amlogic_usb(20, log_fn=log, cancel_check=cancel,
+                                           settle=0)
                     _t.sleep(2)
             else:
                 raise Exception(f"Не удалось загрузить U-Boot: {last}")
             self._release_aml_usb()
-            if not self._wait_amlogic_usb(30, log_fn=log):
+            log("⏳ Ожидание возврата устройства на USB (U-Boot burn mode)...")
+            if not self._wait_amlogic_usb(60, log_fn=log, cancel_check=cancel):
                 raise Exception("Устройство не вернулось на USB после "
                                 "загрузки U-Boot (переподключите питание/USB)")
             _t.sleep(2)
-        else:
-            log("✓ U-Boot уже запущен (burn mode активен)")
 
         # 2. Переключение на eMMC
         ok = False
         for i in range(1, 6):
+            if cancel():
+                raise Exception("Операция отменена (окно закрыто)")
             try:
                 self.aml_bulkcmd("mmc dev 1")
                 ok = True
@@ -7082,7 +7603,8 @@ class FlasherGUI:
             except Exception as e:
                 log(f"  ⚠ mmc dev 1 ({i}/5): {safe_decode(e)[:90]}")
                 self._release_aml_usb()
-                self._wait_amlogic_usb(15, log_fn=log)
+                self._wait_amlogic_usb(20, log_fn=log, cancel_check=cancel,
+                                       settle=0)
                 _t.sleep(1.5)
         if not ok:
             raise Exception("Не удалось переключить U-Boot на eMMC "
@@ -7113,7 +7635,7 @@ class FlasherGUI:
             log(f"  ⬇ {p['name']} ({p.get('file')})...")
             rc, out = self._aml_update_retry(
                 ["partition", p["name"], pf],
-                tries=2, timeout=1800, log_fn=log)
+                tries=2, timeout=1800, log_fn=log, cancel_check=cancel)
             if rc == 0:
                 log(f"     ✓ {p['name']}")
             else:
@@ -7136,10 +7658,14 @@ class FlasherGUI:
                 pass
 
     def _burn_package_sequence(self, wd, all_parts, to_flash,
-                                platform_cfg, wipe, do_reset, log):
+                                platform_cfg, wipe, do_reset, log,
+                                cancel_check=None):
         """Последовательность команд update.exe для прошивки burning-пакета.
         soc=gxl (S905X2). Адреса берутся из platform.conf, имена служебных
         файлов — из image.cfg (._svc)."""
+        # Отмена: окно прошивки пакета не выставляет is_flashing, поэтому
+        # приходит явный cancel_check. Иначе — кнопка «Стоп» главного окна.
+        cancel = cancel_check or (lambda: not self.is_flashing)
         import time as _t
 
         svc = platform_cfg.get("_svc", {})
@@ -7201,10 +7727,10 @@ class FlasherGUI:
                     "запустить U-Boot из пакета. Скачайте вручную: "
                     "github.com/khadas/utils → aml-flash-tool/tools/datas/")
             log("⚙ Инициализация DDR...")
-            self._aml_update_retry(["cwr", bl2, ddr_load], timeout=60, log_fn=log)
+            self._aml_update_retry(["cwr", bl2, ddr_load], timeout=60, log_fn=log, cancel_check=cancel)
             self._aml_update_retry(["write", ddr_init, bl2_para],
-                                   timeout=60, log_fn=log)
-            self._aml_update_retry(["run", ddr_run], timeout=60, log_fn=log)
+                                   timeout=60, log_fn=log, cancel_check=cancel)
+            self._aml_update_retry(["run", ddr_run], timeout=60, log_fn=log, cancel_check=cancel)
             for _ in range(8):
                 _t.sleep(1)
             rc, out = self.aml_update_raw(["identify", "7"], timeout=10,
@@ -7224,34 +7750,37 @@ class FlasherGUI:
                 f"(firmware {ver})")
             if usb_protocol == "8":
                 self._aml_update_retry(["run", bl2_para],
-                                       timeout=60, log_fn=log)
+                                       timeout=60, log_fn=log, cancel_check=cancel)
                 for _ in range(4):
                     _t.sleep(1)
             # ── Запуск U-Boot (порядок как в khadas flash-tool, gxl) ──
             log("⚙ Запуск U-Boot...")
             self._aml_update_retry(["write", bl2, ddr_load],
-                                   timeout=60, log_fn=log)
+                                   timeout=60, log_fn=log, cancel_check=cancel)
             # runfipimg: «tell bl2 to jump to tpl, aka u-boot»
             self._aml_update_retry(["write", fip_run, bl2_para],
-                                   timeout=60, log_fn=log)
+                                   timeout=60, log_fn=log, cancel_check=cancel)
             if tpl and os.path.exists(tpl):
                 self._aml_update_retry(["write", tpl, uboot_load],
-                                       timeout=90, log_fn=log)
+                                       timeout=90, log_fn=log, cancel_check=cancel)
             else:
                 log("  ⚠ tpl (UBOOT) не найден в пакете — пропускаю запись")
             # Для нового протокола запуск через bl2_params, а не UbootRun
             if usb_protocol == "8":
                 self._aml_update_retry(["run", bl2_para],
-                                       timeout=60, log_fn=log)
+                                       timeout=60, log_fn=log, cancel_check=cancel)
             else:
                 self._aml_update_retry(["run", uboot_run],
-                                       timeout=60, log_fn=log)
+                                       timeout=60, log_fn=log, cancel_check=cancel)
             for _ in range(8):
                 _t.sleep(1)
             log("✓ U-Boot загружен")
             self._release_aml_usb()
             # U-Boot пере-энумерирует USB — ждём реального возврата устройства
-            if not self._wait_amlogic_usb(30, log_fn=log):
+            if not self._wait_amlogic_usb(
+                    30, log_fn=log,
+                    cancel_check=(cancel_check
+                                  or (lambda: not self.is_flashing))):
                 log("✗ Устройство не вернулось на USB после загрузки U-Boot —"
                     " прерываю (переподключите питание/USB и повторите)")
                 raise Exception("Устройство пропало с USB после загрузки U-Boot")
@@ -7326,8 +7855,211 @@ class FlasherGUI:
         self.root.after(0, lambda: messagebox.showinfo(
             "Готово", "Прошивка burning-пакета завершена!", parent=self.root))
 
+    def _ioreg_amlogic_snapshot(self):
+        """Amlogic-устройство на шине по IORegistry (macOS) — БЕЗ libusb.
+
+        ioreg — штатная утилита macOS: читает дерево IORegistry и НЕ открывает
+        USB-устройство. Поэтому опрос безопасен и во время работы U-Boot в
+        burn-режиме, и когда libusb/pyusb вообще не установлены.
+
+        VID Amlogic — 0x1B8E (в выводе ioreg это десятичное 7054),
+        PID ROM-режима — 0xC003 (49155).
+        """
+        found = {}
+        try:
+            r = subprocess.run(["ioreg", "-p", "IOUSB", "-l", "-w", "0"],
+                               capture_output=True, timeout=8)
+            text = safe_decode((r.stdout or b"") + (r.stderr or b""))
+        except Exception:
+            return found
+        if not text:
+            return found
+        for node in re.split(r'\n\s*\+-o ', text):
+            if not re.search(r'"idVendor"\s*=\s*7054\b', node):
+                continue
+            m = re.search(r'"idProduct"\s*=\s*(\d+)', node)
+            pid = int(m.group(1)) if m else 0
+            name = None
+            nm = re.search(r'"USB Product Name"\s*=\s*"([^"]*)"', node)
+            if nm:
+                name = nm.group(1).strip()
+            if pid == 0xC003:
+                desc = f"Amlogic USB Boot (1B8E:{pid:04X})"
+            elif name:
+                desc = f"{name} (1B8E:{pid:04X})"
+            else:
+                desc = f"Amlogic USB device (1B8E:{pid:04X})"
+            found[f"aml:1b8e:{pid:04x}"] = desc
+        return found
+
+    UBOOT_PROBE = "YASTA-UBOOT-OK"
+
+    def _uboot_alive(self, log_fn=None, quiet=False):
+        """Живой ли U-Boot в burn-режиме.
+
+        ВАЖНО (исправление регрессии): нельзя опираться на эвристику «в выводе
+        есть ERR → команда провалилась». Утилита update печатает
+        'ERR: AmlUsbBulkCmd failed!' и при УСПЕШНО выполненной bulk-команде —
+        рядом идут эхо ответа, '[MSG]ret = 0' и '[info]success'. Прежняя
+        проверка из-за этого считала живой U-Boot мёртвым и запускала повторную
+        загрузку U-Boot (pyamlboot) в 0xfffa0000 — в лучшем случае лишняя
+        работа, в худшем 'Synchronous Abort' и разрушение идущей операции
+        (именно так был уронен дамп раздела data).
+
+        Теперь критерий — ЭХО уникального маркера в ответе. Дополнительно
+        требуем, чтобы в выводе не было признаков физического обрыва USB
+        (Input/output error, device not found): тогда устройство действительно
+        недоступно, а не «ответило с ERR».
+
+        Возвращает True, если U-Boot ответил эхом маркера.
+        """
+        marker = self.UBOOT_PROBE
+        try:
+            rc, out = self.aml_update_raw(["bulkcmd", f"echo {marker}"],
+                                          timeout=15)
+        except Exception as ex:
+            if log_fn:
+                log_fn(f"  ⚠ Проба U-Boot не удалась: {safe_decode(ex)[:80]}")
+            return False
+
+        low = out.lower()
+        # Признаки реального обрыва связи с устройством
+        broken = ("input/output error", "no such device", "cannot open",
+                  "device not found", "libusb_error_no_device",
+                  "bulk transfer failed", "read failed")
+        echoed = marker.lower() in low
+        if echoed and not any(b in low for b in broken):
+            return True
+
+        if log_fn and not quiet:
+            why = " (в выводе признаки обрыва USB)" \
+                if any(b in low for b in broken) else ""
+            log_fn(f"  ⚠ U-Boot не ответил (нет эха «{marker}»){why}")
+        return False
+
+    def _ensure_uboot_ready(self, log_fn=None, cancel_check=None):
+        """Подготовить устройство к работе с eMMC: U-Boot → mmc dev 1 → disprotect.
+
+        ЭТО ИСПРАВЛЕНИЕ ПРОБЛЕМЫ ДАМПА. Раньше окно дампа сразу рассылало
+        `update mread` без подготовки: U-Boot отвечал 'Cannot find dev.' и
+        'amlmmc cmd <NULL> failed', и ВСЕ разделы падали с кодом 249
+        (ERR: ReadMediaFile failed!). Здесь выполняется тот же порядок, что и
+        при прошивке:
+          1) если U-Boot не отвечает — загрузить его из files/aml_bundle.img;
+          2) дождаться реального возврата устройства на USB (см.
+             _wait_amlogic_usb: сначала уход ROM-устройства, затем появление);
+          3) `mmc dev 1` с ретраями — выбрать eMMC;
+          4) `store disprotect key` — снять защиту key-раздела.
+        Возвращает True, если eMMC готова к чтению/записи.
+        """
+        _log = (log_fn or self.log)
+        cancel = cancel_check or (lambda: False)
+
+        if cancel():
+            return False
+
+        if self._uboot_alive():
+            if log_fn:
+                log_fn("✓ U-Boot активен (burn-режим)")
+        else:
+            bundle = os.path.join(FILE_DIR, "aml_bundle.img")
+            if not os.path.exists(bundle):
+                _log(f"❌ aml_bundle.img не найден в {FILE_DIR}")
+                return False
+            # Ждём появления устройства (человек мог ещё не подать питание)
+            if log_fn:
+                log_fn("🔌 Ожидание устройства (USB Boot)...")
+            if not self._wait_amlogic_usb(120, log_fn=log_fn,
+                                          cancel_check=cancel, settle=0):
+                _log("❌ Устройство не появилось на USB — проверьте, что пин 6 "
+                     "замкнут на GND и подано питание")
+                return False
+            sender = get_aml_bundle_sender()
+            if not sender:
+                _log("❌ pyamlboot_local недоступен — нажмите «Загрузить "
+                     "утилиты» и перезапустите программу")
+                return False
+            loaded = False
+            for i in range(1, 4):
+                if cancel():
+                    return False
+                try:
+                    if log_fn:
+                        log_fn(f"🔧 Загрузка U-Boot (aml_bundle) — попытка {i}/3...")
+                    sender(bundle)
+                    loaded = True
+                    break
+                except Exception as ex:
+                    _log(f"  ⚠ попытка {i}/3: {safe_decode(ex)[:100]}")
+                    self._release_aml_usb()
+                    self._wait_amlogic_usb(20, log_fn=log_fn,
+                                           cancel_check=cancel, settle=0)
+                    time.sleep(2)
+            if not loaded:
+                _log("❌ Не удалось загрузить U-Boot")
+                return False
+            # pyamlboot держит интерфейс открытым — отпускаем ДО запуска update
+            self._release_aml_usb()
+            if log_fn:
+                log_fn("✓ U-Boot загружен, ждём возврата устройства...")
+            if not self._wait_amlogic_usb(60, log_fn=log_fn,
+                                          cancel_check=cancel):
+                _log("❌ Устройство не вернулось на USB после загрузки U-Boot")
+                return False
+
+        # ── eMMC ──
+        ok = False
+        for i in range(1, 6):
+            if cancel():
+                return False
+            try:
+                self.aml_bulkcmd("mmc dev 1")
+                ok = True
+                break
+            except Exception as ex:
+                _log(f"  ⚠ mmc dev 1 ({i}/5): {safe_decode(ex)[:90]}")
+                self._release_aml_usb()
+                if not self._wait_amlogic_usb(20, log_fn=log_fn,
+                                              cancel_check=cancel, settle=0):
+                    break
+                time.sleep(1.5)
+        if not ok:
+            _log("❌ Не удалось выбрать eMMC (mmc dev 1) — U-Boot не видит "
+                 "накопитель. Попробуйте полный сброс питания и повторный "
+                 "вход в USB Boot")
+            return False
+        if log_fn:
+            log_fn("✓ eMMC активирована (mmc dev 1)")
+
+        try:
+            self.aml_bulkcmd("store disprotect key")
+            if log_fn:
+                log_fn("✓ store disprotect key")
+        except Exception as ex:
+            _log(f"  ⚠ store disprotect key: {safe_decode(ex)[:90]}")
+
+        return True
+
     def _aml_device_present(self):
-        """Есть ли сейчас Amlogic-устройство на USB (pyusb, без открытия хэндла)."""
+        """Есть ли сейчас Amlogic-устройство на USB (VID 1B8E).
+
+        Определяем по системным спискам устройств, НЕ открывая USB-хэндл:
+          • macOS   — IORegistry (ioreg);
+          • Windows — PnP (Get-PnpDevice / wmic);
+          • иначе   — резервный путь через pyusb (только отладка).
+        Это важно во время работы U-Boot в burn-режиме: лишние обращения к
+        libusb могут спровоцировать пере-энумерацию устройства.
+        """
+        if _IS_MAC:
+            try:
+                return bool(self._ioreg_amlogic_snapshot())
+            except Exception:
+                return False
+        if sys.platform == "win32":
+            try:
+                return bool(self._wmi_amlogic_snapshot())
+            except Exception:
+                return False
         try:
             import usb.core
             return usb.core.find(idVendor=0x1b8e) is not None
@@ -7357,25 +8089,65 @@ class FlasherGUI:
         except Exception:
             pass
 
-    def _wait_amlogic_usb(self, timeout=30, log_fn=None):
-        """Ждать возврата Amlogic-устройства на USB (после загрузки U-Boot оно
-        перезагружается в burn-режим и пере-энумерируется).
+    def _wait_amlogic_usb(self, timeout=60, log_fn=None, cancel_check=None,
+                          wait_gone=20.0, settle=1.0):
+        """Ждать возврата Amlogic-устройства на USB после перехода в U-Boot
+        burn-режим.
 
-        Возвращает True, как только устройство появилось, False по таймауту
-        (или если прошивка остановлена пользователем).
+        Две фазы (это принципиально): после загрузки U-Boot ROM-устройство
+        (1B8E:C003) сначала ОТКЛЮЧАЕТСЯ, и только затем появляется снова. Если
+        проверять лишь «устройство есть?», можно получить True от ещё живого
+        ROM-устройства и начать работу слишком рано — команды update падают.
+
+        ВАЖНО (исправление): раньше здесь стояло `if not self.is_flashing:
+        return False`. В окне дампа и в «сессии» is_flashing не выставляется,
+        поэтому ожидание завершалось МГНОВЕННО и операция сообщала «устройство
+        не вернулось на USB», хотя оно возвращалось через 20–30 с (в логе —
+        «🔴 USB отключено» → «🟢 USB подключено»). Теперь отмена — только через
+        явный cancel_check (кнопка «Стоп» / закрытие окна), а по умолчанию
+        ожидание всегда идёт до таймаута.
+
+        Возвращает True, если устройство появилось на шине.
         """
         _log = log_fn or self.log
+        t0 = time.time()
+
+        def _cancelled():
+            return bool(cancel_check and cancel_check())
+
+        # Фаза 1: дождаться, пока уйдёт старое (ROM) устройство.
+        if self._aml_device_present():
+            gone_deadline = time.time() + wait_gone
+            while time.time() < gone_deadline:
+                if _cancelled():
+                    return False
+                if not self._aml_device_present():
+                    break
+                time.sleep(0.4)
+
+        # Фаза 2: дождаться появления устройства (U-Boot уже поднял USB).
         deadline = time.time() + timeout
+        note = 0
         while time.time() < deadline:
-            if not self.is_flashing:
+            if _cancelled():
+                _log("  ⛔ Ожидание устройства прервано пользователем")
                 return False
             if self._aml_device_present():
-                return True
-            time.sleep(0.5)
-        _log(f"  ⏳ Ожидание устройства на USB: {timeout} с без результата")
+                time.sleep(settle)          # стабилизация после энумерации
+                if self._aml_device_present():
+                    if log_fn:
+                        log_fn(f"  ✓ Устройство снова на USB "
+                               f"(через {time.time() - t0:.1f} с)")
+                    return True
+            elapsed = time.time() - t0
+            if log_fn and elapsed - note >= 5:
+                note = elapsed
+                log_fn(f"  ⏳ Ожидание устройства на USB... {int(elapsed)} с")
+            time.sleep(0.4)
+        _log(f"  ⏳ Устройство не появилось на USB за {timeout} с")
         return False
 
-    def aml_bulkcmd(self, cmd):
+    def aml_bulkcmd(self, cmd, timeout=30):
         """Выполнение команды U-Boot.
         Возвращает декодированный stdout+stderr.
         Весь вывод дублируется в COM-терминал (метка [USB]) —
@@ -7385,7 +8157,7 @@ class FlasherGUI:
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
         process = subprocess.run(
             [update_path, "bulkcmd", cmd],
-            capture_output=True, text=False, timeout=30,
+            capture_output=True, text=False, timeout=timeout,
             creationflags=creationflags
         )
         raw = (process.stdout or b"") + (process.stderr or b"")
@@ -7429,7 +8201,8 @@ class FlasherGUI:
             rc = 1
         return rc, out
 
-    def _aml_update_retry(self, args, tries=3, timeout=60, log_fn=None):
+    def _aml_update_retry(self, args, tries=3, timeout=60, log_fn=None,
+                          cancel_check=None):
         """aml_update_raw с ретраями при rc != 0 (включая таймаут).
 
         После пере-энумерации USB (DDR init / запуск U-Boot) одиночный запуск
@@ -7447,7 +8220,12 @@ class FlasherGUI:
                 log_fn(f"  ⚠ {label} — попытка {i}/{tries} не удалась"
                        + (" (таймаут)" if out == "timeout" else ""))
             self._release_aml_usb()
-            self._wait_amlogic_usb(20, log_fn=log_fn)
+            # Отмена: если задана снаружи — используем её; иначе только
+            # кнопка «Стоп» главного окна (окно пакета is_flashing НЕ ставит)
+            self._wait_amlogic_usb(
+                20, log_fn=log_fn,
+                cancel_check=(cancel_check
+                              or (lambda: not self.is_flashing)))
             time.sleep(1.5)
         return last_rc, last_out
     
@@ -7622,6 +8400,815 @@ class FlasherGUI:
         except Exception:
             pass
 
+    # ═════════════════════════════════════════════════════════════════════════
+    # УСТОЙЧИВЫЙ ДАМП: чтение СЕКЦИЯМИ, докачка, карта занятых блоков ext4
+    # ═════════════════════════════════════════════════════════════════════════
+    # Зачем: раньше раздел читался ОДНОЙ командой на весь объём. Для data
+    # (9,37 ГиБ) это единая транзакция на десятки минут: любой сбой — таймаут,
+    # пере-энумерация USB, срыв записи в файл — уничтожал весь результат, и
+    # дамп приходилось начинать с нуля. Секции (по умолчанию 64 МиБ):
+    #   • каждый перенос мал и предсказуем;
+    #   • обрыв стоит одной секции, а не всего дампа;
+    #   • докачка продолжает с последней недописанной секции (сайдкар .json);
+    #   • режим «только занятые блоки» читает лишь реальные данные ext4.
+    DUMP_SECTION_BYTES = 64 * 1024 * 1024
+    DUMP_RAM_ADDR = 0x10000000        # буфер в RAM устройства
+    DUMP_SECTOR = 512
+    # Разрывы до этого размера читаются «за компанию»: дешевле, чем
+    # лишний обмен по USB (каждый диапазон = две команды).
+    # По эталонному data.img: порог 4 МиБ даёт ~55 секций вместо 2270
+    # при чтении 2,6 ГиБ вместо 9,37 — разумный компромисс.
+    DUMP_JOIN_GAP = 4 * 1024 * 1024
+    # Предел на одно штатное чтение раздела (update mread store).
+    DUMP_READ_TIMEOUT = 1800
+
+    def _raw_to_sparse_streaming(self, src_path, dst_path, log_fn=None,
+                                 blk_sz=4096, chunk_bytes=8 * 1024 * 1024,
+                                 cancel_check=None):
+        """Потоково упаковать raw-образ в Android sparse (AOSP libsparse).
+
+        Зачем нужен свой вариант: штатный _yt_raw_to_sparse накапливает все
+        ненулевые блоки в памяти — для образа разделов в несколько ГиБ это
+        неприемлемо. Здесь образ читается блоками и сразу пишется на диск:
+        память ограничена размером буфера.
+
+        Формат: заголовок файла (magic 0xED26FF3A) + чанки
+          RAW  (0xCAC1) — ненулевые блоки,
+          FILL (0xCAC2) — длинные последовательности нулей.
+        Прошивается штатной командой update partition <part> <file> sparse —
+        доработок не требует.
+        """
+        import struct as _st
+        _log = log_fn or (lambda m: None)
+        cancel = cancel_check or (lambda: False)
+        FILE_HDR = _st.Struct("<IHHHHIIII")
+        CHUNK_HDR = _st.Struct("<HHII")
+
+        size = os.path.getsize(src_path)
+        nblocks = (size + blk_sz - 1) // blk_sz
+        zero = b"\x00" * blk_sz
+        chunks = 0
+        raw_bytes = 0
+        fill_bytes = 0
+
+        def write_chunk(fout, ctype, nblocks_in_chunk, body):
+            total = CHUNK_HDR.size + len(body)
+            fout.write(CHUNK_HDR.pack(ctype, 0, nblocks_in_chunk, total))
+            if body:
+                fout.write(body)
+
+        with open(src_path, "rb") as fin, open(dst_path, "wb") as fout:
+            # заголовок файла: число чанков заранее неизвестно — посчитаем
+            # первым проходом? Нет: пишем 0, затем вернёмся и поправим.
+            fout.write(FILE_HDR.pack(0xED26FF3A, 1, 0, FILE_HDR.size,
+                                     CHUNK_HDR.size, blk_sz, nblocks, 0, 0))
+            buf = bytearray()      # накопленные НЕнулевые блоки
+            zeros_run = 0          # подряд идущие нулевые блоки
+            while True:
+                if cancel():
+                    _log("  ⛔ Упаковка sparse прервана")
+                    return False
+                block = fin.read(blk_sz)
+                if not block:
+                    break
+                if len(block) < blk_sz:
+                    block = block + b"\x00" * (blk_sz - len(block))
+
+                if block == zero:
+                    # ВАЖНО: перед началом серии нулей нужно СБРОСИТЬ уже
+                    # накопленные данные — иначе порядок блоков в образе
+                    # нарушится (нули «уедут» на место данных). Именно такую
+                    # ошибку поймала проверка на эталонном образе.
+                    if buf:
+                        n = len(buf) // blk_sz
+                        write_chunk(fout, 0xCAC1, n, bytes(buf))
+                        raw_bytes += n * blk_sz
+                        chunks += 1
+                        buf = bytearray()
+                    zeros_run += 1
+                    continue
+
+                if zeros_run:
+                    write_chunk(fout, 0xCAC2, zeros_run, b"\x00" * 4)
+                    fill_bytes += zeros_run * blk_sz
+                    chunks += 1
+                    zeros_run = 0
+
+                buf += block
+                if len(buf) >= chunk_bytes:
+                    n = len(buf) // blk_sz
+                    write_chunk(fout, 0xCAC1, n, bytes(buf[:n * blk_sz]))
+                    raw_bytes += n * blk_sz
+                    chunks += 1
+                    buf = buf[n * blk_sz:]
+
+            # хвост: сначала незавершённые нули, затем остаток данных
+            if zeros_run:
+                write_chunk(fout, 0xCAC2, zeros_run, b"\x00" * 4)
+                fill_bytes += zeros_run * blk_sz
+                chunks += 1
+                zeros_run = 0
+            if buf:
+                n = len(buf) // blk_sz
+                if n:
+                    write_chunk(fout, 0xCAC1, n, bytes(buf[:n * blk_sz]))
+                    raw_bytes += n * blk_sz
+                    chunks += 1
+                rest = buf[n * blk_sz:]
+                if rest:
+                    pad = blk_sz - len(rest)
+                    write_chunk(fout, 0xCAC1, 1, bytes(rest) + b"\x00" * pad)
+                    raw_bytes += blk_sz
+                    chunks += 1
+            # правим число чанков в заголовке
+            fout.seek(0)
+            fout.write(FILE_HDR.pack(0xED26FF3A, 1, 0, FILE_HDR.size,
+                                     CHUNK_HDR.size, blk_sz, nblocks,
+                                     chunks, 0))
+        _log(f"    sparse: {os.path.getsize(dst_path) / 1024 ** 2:.0f} МиБ "
+             f"(чанков {chunks}: данных {raw_bytes / 1024 ** 3:.2f} ГиБ, "
+             f"пропущено нулей {fill_bytes / 1024 ** 3:.2f} ГиБ)")
+        return True
+
+    def _partition_starts(self, sect_sizes):
+        """Абсолютные стартовые сектора разделов по их размерам.
+
+        sect_sizes — список (name, sectors) В ПОРЯДКЕ таблицы разделов: на
+        Yandex Station Max они идут подряд, поэтому старт каждого — сумма
+        размеров предыдущих. Порядок берём из той же таблицы, что и размеры
+        (встроенная таблица YSM либо распознанная с устройства).
+        """
+        starts, cur = {}, 0
+        for name, sect in sect_sizes:
+            starts[name] = cur
+            cur += int(sect)
+        return starts
+
+    def _uboot_mmc_read(self, addr, blk, cnt, timeout=300, log_fn=None):
+        """bulkcmd «mmc read <addr> <blk> <cnt>»: блоки eMMC → RAM устройства.
+
+        КОНТРОЛЬ КОРОТКОГО ЧТЕНИЯ. U-Boot отвечает «<n> blocks read: OK».
+        Если n МЕНЬШЕ запрошенного (плохие/служебные блоки, особенно у конца
+        eMMC), остаток буфера в RAM остаётся от предыдущей секции — и в образ
+        молча попадают чужие данные, а хвост раздела выглядит «недокачанным».
+        Раньше вывод mmc read не проверялся вообще.
+
+        ВАЖНО (подтверждено логом UART): U-Boot разбирает blk и cnt как
+        ШЕСТНАДЦАТЕРИЧНЫЕ числа. Десятичные значения читаются неверно:
+        «10514432» = 0x10514432 (273761330 блоков) → «block number exceeds max»
+        → «0 blocks read: ERROR». Поэтому все три числа передаём в hex.
+        """
+        out = self.aml_bulkcmd(
+            f"mmc read 0x{int(addr):x} 0x{int(blk):x} 0x{int(cnt):x}",
+            timeout=timeout)
+        m = re.search(r"(\d+)\s+blocks?\s+read", out or "", re.I)
+        if m and int(m.group(1)) != int(cnt):
+            raise Exception(
+                f"mmc read: прочитано {m.group(1)} блоков из {cnt} "
+                f"(блок {blk}) — чтение неполное")
+        return out
+
+    def _uboot_mread_mem(self, addr, nbytes, out_file, timeout=1800):
+        """update mread mem <addr> normal <nbytes> <файл> — слить RAM на хост.
+
+        Это документированный путь (khadas flash-tool):
+            update mread mem 0x03000000 normal 512 emmc.bin
+        Возвращает (ok, вывод, сколько_байт_записано).
+        """
+        upd = self.get_update_path()
+        cflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        try:
+            r = subprocess.run(
+                [upd, "mread", "mem", f"0x{addr:x}", "normal",
+                 str(int(nbytes)), out_file],
+                capture_output=True, timeout=timeout, creationflags=cflags)
+        except subprocess.TimeoutExpired:
+            return False, "timeout", 0
+        except Exception as ex:
+            return False, safe_decode(ex), 0
+        out = safe_decode((r.stdout or b"") + (r.stderr or b""))
+        for ln in out.splitlines():
+            if ln.strip():
+                self.root.after(0,
+                    lambda l=ln.strip(): self.terminal_log(f"[USB] {l}"))
+        n = os.path.getsize(out_file) if os.path.exists(out_file) else 0
+        # УСПЕХ = инструмент завершился и записал не меньше запрошенного.
+        # НЕ судим по подстроке "ERR": update печатает
+        # «ERR: AmlUsbBulkCmd failed!» и при УСПЕШНОЙ команде (проверено на
+        # живом журнале), из-за чего исправные секции считались сбойными и
+        # отбрасывались — снаружи это выглядело как «не докачались блоки».
+        # ТРЕБУЕМ ТОЧНЫЙ РАЗМЕР, а не «не меньше»: файл-приёмник каждый раз
+        # создаётся заново, поэтому короткий результат означает потерю хвоста
+        # секции (именно так выглядело «не докачались последние блоки»).
+        ok = (r.returncode == 0 and n == int(nbytes))
+        return ok, out, n
+
+    def _device_read_range(self, start_sector, offset, size, log_fn=None):
+        """Прочитать size байт из eMMC по смещению offset ВНУТРИ раздела.
+
+        Границы выравниваются по блокам, лишнее отрезается. Возвращает bytes
+        либо None при ошибке.
+        """
+        if size <= 0:
+            return b""
+        blk0 = start_sector + (offset // self.DUMP_SECTOR)
+        misalign = offset % self.DUMP_SECTOR
+        cnt = (misalign + size + self.DUMP_SECTOR - 1) // self.DUMP_SECTOR
+        try:
+            self._uboot_mmc_read(self.DUMP_RAM_ADDR, blk0, cnt)
+        except Exception as ex:
+            if log_fn:
+                log_fn(f"    ⚠ mmc read ({offset:#x}): {safe_decode(ex)[:80]}")
+            return None
+        tmp = out_file = None
+        try:
+            fd, tmp = tempfile.mkstemp(prefix="yasta_sec_", suffix=".bin")
+            os.close(fd)
+            ok, out, _n = self._uboot_mread_mem(
+                self.DUMP_RAM_ADDR, cnt * self.DUMP_SECTOR, tmp)
+            if not ok:
+                if log_fn:
+                    log_fn(f"    ⚠ mread mem ({offset:#x}): {out.strip()[:80]}")
+                return None
+            with open(tmp, "rb") as f:
+                data = f.read()
+            if len(data) < misalign + size:
+                if log_fn:
+                    log_fn(f"    ⚠ короткий ответ: {len(data)} < "
+                           f"{misalign + size}")
+                return None
+            return data[misalign:misalign + size]
+        finally:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _merge_ranges(ranges):
+        """Слить пересекающиеся диапазоны (start, length) в минимальный набор."""
+        out = []
+        for s, l in sorted((int(a), int(b)) for a, b in ranges if b > 0):
+            if out and s <= out[-1][0] + out[-1][1]:
+                end = max(out[-1][0] + out[-1][1], s + l)
+                out[-1] = (out[-1][0], end - out[-1][0])
+            else:
+                out.append((s, l))
+        return out
+
+    # ── ext4: карта занятых блоков ───────────────────────────────────────────
+    _EXT4_MAGIC = 0xEF53
+    _EXT4_FEATURE_INCOMPAT_64BIT = 0x0080
+    _EXT4_SB_OFFSET = 1024
+
+    def _ext4_parse_superblock(self, sb):
+        """Разобрать суперблок ext4 → dict параметров (или None)."""
+        if len(sb) < 1024:
+            return None
+        u = lambda fmt, off: struct.unpack_from(fmt, sb, off)[0]
+        if u("<H", 0x38) != self._EXT4_MAGIC:
+            return None
+        log_bs = u("<I", 0x18)
+        d = {
+            "block_size": 1024 << log_bs,
+            "blocks_count": u("<I", 0x04),
+            "free_blocks": u("<I", 0x0C),
+            "first_data_block": u("<I", 0x14),
+            "blocks_per_group": u("<I", 0x20),
+            "inodes_per_group": u("<I", 0x28),
+            "state": u("<H", 0x3A),
+            "inode_size": u("<H", 0x58) or 128,
+            "feature_incompat": u("<I", 0x60),
+        }
+        d["has_64bit"] = bool(d["feature_incompat"]
+                              & self._EXT4_FEATURE_INCOMPAT_64BIT)
+        d["desc_size"] = u("<H", 0xFE) if d["has_64bit"] else 0
+        if d["desc_size"] < 32:
+            d["desc_size"] = 32
+        if d["has_64bit"]:
+            d["blocks_count"] |= (u("<I", 0x150) << 32)
+            d["free_blocks"] |= (u("<I", 0x158) << 32)
+        if not d["blocks_per_group"] or d["block_size"] < 1024:
+            return None
+        d["group_count"] = ((d["blocks_count"] - d["first_data_block"]
+                             + d["blocks_per_group"] - 1)
+                            // d["blocks_per_group"])
+        d["gdt_offset"] = (d["first_data_block"] + 1) * d["block_size"]
+        d["gdt_size"] = d["group_count"] * d["desc_size"]
+        d["mounted"] = bool(d["feature_incompat"] & 0x4)   # needs_recovery
+        return d
+
+    def _verify_tail(self, pname, start_sector, psize, out_file, log_fn=None,
+                     tail_bytes=2 * 1024 * 1024, tries=3, ranges=None):
+        """Проверить ХВОСТ раздела: перечитать последние байты и сверить с файлом.
+
+        Зачем: жалоба «не докачались последние блоки» иначе не проверяема —
+        размер файла всегда равен размеру раздела (он создаётся разряжённым),
+        поэтому потерянный хвост снаружи неотличим от нулей. Здесь последние
+        tail_bytes раздела читаются ПОВТОРНО и сравниваются с тем, что уже
+        лежит в образе: несовпадение видно сразу, и хвост перечитывается.
+
+        Возвращает True (совпало), False (не удалось) или None (проверить
+        нельзя). Это самая дешёвая защита от «тихой» потери последних блоков.
+        """
+        _log = log_fn or self.log
+        # ВАЖНО: в режиме «только занятые блоки» конец раздела намеренно не
+        # читается (там нет данных ext4). Проверять надо конец ФАКТИЧЕСКИ
+        # прочитанных данных, а не конец раздела — иначе самопроверка
+        # дописывала бы в образ мегабайты в обход выбранного режима.
+        if ranges:
+            last_off, last_len = ranges[-1]
+            tail = int(min(tail_bytes, last_len))
+            off = last_off + last_len - tail
+        else:
+            tail = int(min(tail_bytes, psize))
+            off = psize - tail
+        if tail <= 0:
+            return None
+        try:
+            with open(out_file, "rb") as f:
+                f.seek(off)
+                in_file = f.read(tail)
+        except Exception as ex:
+            _log(f"     ⚠ самопроверка хвоста: файл не читается ({ex})")
+            return None
+        for attempt in range(1, tries + 1):
+            data = self._device_read_range(start_sector, off, tail, log_fn=log_fn)
+            if data is not None and len(data) == tail:
+                if data == in_file:
+                    _log(f"     ✓ хвост раздела проверен "
+                         f"({tail // 1024} КиБ совпали)")
+                    return True
+                # Несовпадение: дописываем прочитанное и проверяем ещё раз
+                _log(f"     ⚠ хвост не совпал (попытка {attempt}/{tries}) — "
+                     "перезаписываю")
+                try:
+                    with open(out_file, "r+b") as f:
+                        f.seek(off)
+                        f.write(data)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    in_file = data
+                except Exception as ex:
+                    _log(f"     ⚠ не удалось перезаписать хвост: {ex}")
+                    return False
+            else:
+                _log(f"     ⚠ хвост не перечитан (попытка {attempt}/{tries})")
+        # Финальная сверка
+        try:
+            data = self._device_read_range(start_sector, off, tail, log_fn=log_fn)
+            with open(out_file, "rb") as f:
+                f.seek(off)
+                cur = f.read(tail)
+            if data is not None and data == cur:
+                _log("     ✓ хвост раздела совпал после перезаписи")
+                return True
+        except Exception:
+            pass
+        _log("     ❌ хвост раздела не удалось подтвердить")
+        return False
+
+    def _fs_magic_at(self, start_sector, log_fn=None):
+        """Тип ФС по сигнатуре в начале раздела: 'ext4' | 'erofs' | None.
+
+        Обе сигнатуры лежат по смещению 1024 от начала раздела:
+          • ext4  — magic 0xEF53;
+          • erofs — magic 0xE0F5E1E2.
+        """
+        try:
+            head = self._device_read_range(start_sector, 0, 2048,
+                                           log_fn=log_fn)
+        except Exception:
+            return None
+        if not head or len(head) < 1082:
+            return None
+        if struct.unpack_from("<H", head, 1024 + 0x38)[0] == self._EXT4_MAGIC:
+            return "ext4"
+        if head[1024:1028] == b"\xe2\xe1\xf5\xe0":
+            return "erofs"
+        return None
+
+    def _resolve_partition_start(self, pname, computed, psize, log_fn=None,
+                                 cancel_check=None, max_steps=40, step=16384):
+        """Определить ФАКТИЧЕСКИЙ старт раздела, когда он неизвестен.
+
+        Почему нельзя просто суммировать размеры: в таблице устройства между
+        разделами есть ПРОМЕЖУТКИ (проверено по UART-логу этого устройства:
+        sysrecovery кончается на 10874880, а data начинается с 10891264 —
+        зазор 16384 сектора). Сумма даёт для data сдвиг на 184 МиБ, то есть
+        секционный дамп читал бы ЧУЖИЕ блоки.
+
+        Порядок: проверяем computed, затем ищем сигнатуру ФС (ext4/erofs) с
+        шагом 8 МиБ (16384 сектора — выравнивание разметки Amlogic).
+
+        Возвращает сектор либо None (тогда раздел читается штатным способом
+        по имени — без смещений, всегда корректно).
+        """
+        _log = log_fn or self.log
+        cancel = cancel_check or (lambda: False)
+        if computed is None:
+            return None
+        if self._fs_magic_at(computed, log_fn=log_fn):
+            return computed
+        if psize < 32 * 1024 * 1024:
+            return None      # для мелких разделов проще прочитать целиком
+        _log(f"     ⚠ {pname}: по вычисленному старту {computed} "
+            f"({computed:#x}) сигнатуры ФС нет — ищу фактический старт...")
+        for k in range(1, int(max_steps) + 1):
+            if cancel():
+                return None
+            cand = int(computed) + k * int(step)
+            fs = self._fs_magic_at(cand, log_fn=log_fn)
+            if fs:
+                _log(f"     ✓ {pname}: фактический старт {cand} ({cand:#x}), "
+                    f"сигнатура {fs} (сдвиг +{k * 8} МиБ)")
+                return cand
+            if k % 4 == 0:
+                _log(f"       поиск старта: проверено +{k * 8} МиБ...")
+        _log(f"     ⚠ {pname}: фактический старт не найден (проверено "
+            f"+{int(max_steps) * 8} МиБ)")
+        return None
+
+    def _verify_partition_start(self, pname, start_sector, log_fn=None):
+        """Проверить, что раздел действительно начинается в start_sector.
+
+        Стартовые сектора вычисляются как сумма размеров предыдущих разделов
+        (таблица YSM идёт подряд). Если реальная разметка отличается, дамп
+        получится МУСОРОМ, а его прошивка приведёт к кирпичу. Поэтому перед
+        чтением делаем дешёвую проверку: у ext4-разделов по смещению 1024
+        лежит суперблок с сигнатурой 0xEF53.
+
+        Возвращает True (похоже на правильный старт), False (подозрительно)
+        или None, если проверить нельзя (нет данных/не ext4-раздел).
+        """
+        _log = log_fn or self.log
+        try:
+            head = self._device_read_range(start_sector, 0, 2048,
+                                           log_fn=log_fn)
+        except Exception as ex:
+            if log_fn:
+                log_fn(f"    ⚠ проверка старта {pname}: {safe_decode(ex)[:70]}")
+            return None
+        if not head or len(head) < 1082:
+            return None
+        magic = struct.unpack_from("<H", head, 1024 + 0x38)[0]
+        if magic == self._EXT4_MAGIC:
+            return True
+        # не ext4: возможно, это другой тип раздела — не считаем ошибкой,
+        # но сообщаем, что подтвердить старт не удалось
+        if log_fn:
+            log_fn(f"    ℹ {pname}: ext4-сигнатуры нет — старт не подтверждён "
+                   f"(раздел может быть другого типа)")
+        return None
+
+    def _ext4_used_runs(self, start_sector, psize, log_fn=None,
+                        cancel_check=None):
+        """Диапазоны байт для чтения в режиме «только занятые блоки».
+
+        ВАЖНО: помимо блоков, помеченных в битмапах, ВСЕГДА включаются
+        метаданные всех групп (суперблок, групповые дескрипторы, битмапы,
+        inode-таблицы) и журнал. Причина — на снятом «на лету» разделе
+        счётчики ext4 могут быть несогласованы (проверено на эталонном
+        data.img: флаг needs_recovery, три разных значения свободного места,
+        46 групп из 75 помечены BLOCK_UNINIT с пустыми битмапами). Слепое
+        доверие битмапам потеряло бы данные.
+
+        Возвращает список (offset, length) в байтах или None, если ФС не ext4.
+        """
+        _log = log_fn or self.log
+        cancel = cancel_check or (lambda: False)
+
+        sb = self._device_read_range(start_sector, self._EXT4_SB_OFFSET, 1024,
+                                     log_fn=log_fn)
+        if not sb:
+            return None
+        d = self._ext4_parse_superblock(sb)
+        if not d:
+            _log("    ℹ Раздел не ext4 — «только занятое» неприменимо")
+            return None
+
+        bs = d["block_size"]
+        _log(f"    ext4: блок {bs} Б, групп {d['group_count']}, "
+             f"занято {(d['blocks_count'] - d['free_blocks']) * bs / 1024 ** 3:.2f} ГиБ "
+             f"из {d['blocks_count'] * bs / 1024 ** 3:.2f} ГиБ")
+        if d["mounted"]:
+            _log("    ⚠ ФС смонтирована (needs_recovery) — метаданные всегда "
+                 "включаются в дамп")
+
+        gdt = self._device_read_range(start_sector, d["gdt_offset"],
+                                      d["gdt_size"], log_fn=log_fn)
+        if not gdt:
+            return None
+
+        runs = []
+        # 1) Всегда: суперблок + таблица дескрипторов
+        runs.append((0, d["gdt_offset"] + d["gdt_size"]))
+        # 2) Всегда: метаданные каждой группы (битмапы + inode-таблица)
+        it_blocks = ((d["inodes_per_group"] * d["inode_size"] + bs - 1) // bs)
+        n_meta = 0
+        for g in range(d["group_count"]):
+            base = g * d["desc_size"]
+            try:
+                bm = struct.unpack_from("<I", gdt, base + 0x00)[0]
+                ib = struct.unpack_from("<I", gdt, base + 0x04)[0]
+                it = struct.unpack_from("<I", gdt, base + 0x08)[0]
+            except Exception:
+                continue
+            if d["has_64bit"]:
+                bm |= (struct.unpack_from("<I", gdt, base + 0x20)[0] << 32)
+                ib |= (struct.unpack_from("<I", gdt, base + 0x24)[0] << 32)
+                it |= (struct.unpack_from("<I", gdt, base + 0x28)[0] << 32)
+            for b in (bm, ib):
+                if b:
+                    runs.append((b * bs, bs))
+            if it:
+                runs.append((it * bs, it_blocks * bs))
+            n_meta += 1
+        _log(f"    метаданные: {n_meta} групп (битмапы + inode-таблицы)")
+        # 3) Журнал (s_journal_inum) — читается обязательно и целиком.
+        #    Нумерация inode начинается с 1, поэтому смещение считается как
+        #    (inum - 1): ошибка здесь читает ЧУЖОЙ inode. На эталонном образе
+        #    это подтвердилось (прежний код смотрел inode 8 по индексу 8).
+        try:
+            jnum = struct.unpack_from("<I", sb, 0xE0)[0]   # s_journal_inum
+            if 0 < jnum <= d["inodes_per_group"]:
+                g0_it = struct.unpack_from("<I", gdt, 0x08)[0]
+                ioff = g0_it * bs + (jnum - 1) * d["inode_size"]
+                raw = self._device_read_range(start_sector, ioff,
+                                              d["inode_size"], log_fn=log_fn)
+                jsize, jblocks = 0, []
+                if raw and len(raw) >= 0x6C:
+                    jsize = struct.unpack_from("<I", raw, 0x04)[0]
+                    jsize |= (struct.unpack_from("<I", raw, 0x6C)[0] << 32)
+                    magic, entries, _mx, depth, _g = struct.unpack_from(
+                        "<HHHHI", raw, 0x28)
+                    if magic == 0xF30A and depth == 0:
+                        for i in range(min(entries, 4)):
+                            e = struct.unpack_from("<IHHI", raw,
+                                                   0x28 + 12 + i * 12)
+                            sb_blk, ln = (e[3] | (e[2] << 32)), e[1]
+                            if ln and sb_blk:
+                                jblocks.append((sb_blk * bs, ln * bs))
+                if jblocks:
+                    runs.extend(jblocks)
+                    _log(f"    журнал: inode {jnum}, "
+                         f"{sum(l for _, l in jblocks) / 1024 ** 2:.0f} МиБ — "
+                         "включён в дамп")
+                elif jsize:
+                    _log(f"    ⚠ журнал {jsize / 1024 ** 2:.0f} МиБ: extent не "
+                         "разобран, полагаемся на битмапы")
+        except Exception as ex:
+            if log_fn:
+                log_fn(f"    ⚠ журнал: {str(ex)[:60]}")
+
+        # 4) Занятые блоки по битмапам.
+        #    ВАЖНО: счётчики ext4 могут быть несогласованы (в эталонном образе —
+        #    ФС смонтирована, needs_recovery; три разных значения свободного
+        #    места). Поэтому на каждую группу проверяем битмап против счётчика
+        #    free_blocks_lo: если битмап «пустее», чем говорит счётчик, группу
+        #    читаем ЦЕЛИКОМ — так гарантированно ничего не теряем; группа
+        #    BLOCK_UNINIT без данных читается как метаданные.
+        BG_BLOCK_UNINIT = 0x0002
+        it_blocks = ((d["inodes_per_group"] * d["inode_size"] + bs - 1) // bs)
+        grp_whole = grp_bits = grp_meta = 0
+        for g in range(d["group_count"]):
+            if cancel():
+                return None
+            base = g * d["desc_size"]
+            try:
+                bm = struct.unpack_from("<I", gdt, base + 0x00)[0]
+                flags = struct.unpack_from("<H", gdt, base + 0x12)[0]
+                free_lo = struct.unpack_from("<H", gdt, base + 0x0C)[0]
+            except Exception:
+                continue
+            if d["has_64bit"]:
+                bm |= (struct.unpack_from("<I", gdt, base + 0x20)[0] << 32)
+            first = d["first_data_block"] + g * d["blocks_per_group"]
+            big = min(d["blocks_per_group"], d["blocks_count"] - first)
+            if big <= 0:
+                continue
+            need = max(0, big - free_lo)      # сколько занято «по счётчику»
+            meta_blocks = 2 + it_blocks       # битмапы группы + inode-таблица
+
+            if not bm:
+                # Некуда читать битмап — считаем группу служебной
+                grp_meta += 1
+                continue
+            nbytes = (big + 7) // 8
+            raw = self._device_read_range(start_sector, bm * bs, nbytes,
+                                          log_fn=log_fn)
+            if not raw:
+                grp_meta += 1
+                continue
+            ones = sum(bin(byte).count("1") for byte in raw)
+
+            if (flags & BG_BLOCK_UNINIT) or ones < need:
+                # Битмап не подтверждает занятость: либо группа «uninit», либо
+                # счётчики противоречат. Безопаснее прочитать её целиком.
+                if need <= meta_blocks and (flags & BG_BLOCK_UNINIT):
+                    grp_meta += 1          # пустая служебная группа
+                else:
+                    runs.append((first * bs, big * bs))
+                    grp_whole += 1
+                continue
+
+            # Битмап согласован — читаем только помеченные блоки
+            grp_bits += 1
+            run_start = None
+            limit = min(big, len(raw) * 8)
+            for i in range(limit):
+                busy = (raw[i // 8] >> (i % 8)) & 1
+                if busy and run_start is None:
+                    run_start = i
+                elif not busy and run_start is not None:
+                    runs.append(((first + run_start) * bs,
+                                 (i - run_start) * bs))
+                    run_start = None
+            if run_start is not None:
+                runs.append(((first + run_start) * bs,
+                             (big - run_start) * bs))
+        _log(f"    групп: по битмапам {grp_bits}, целиком {grp_whole}, "
+             f"только метаданные {grp_meta}")
+        merged = self._merge_ranges(runs)
+        merged = [(o, l) for o, l in merged if o < psize]
+        merged = [(o, min(l, psize - o)) for o, l in merged]
+        total = sum(l for _, l in merged)
+        _log(f"    занятых диапазонов: {len(merged)}, к чтению "
+             f"{total / 1024 ** 3:.2f} ГиБ из {psize / 1024 ** 3:.2f} ГиБ "
+             f"({total * 100.0 / max(1, psize):.0f}%)")
+        return merged
+
+    def _dump_partition_sectioned(self, pname, start_sector, psize, out_file,
+                                  log_fn=None, cancel_check=None,
+                                  used_runs=None):
+        """Прочитать раздел секциями, дописывая файл; уметь продолжать.
+
+        used_runs=None — читать весь раздел; иначе читать только указанные
+        диапазоны (режим «только занятые блоки»). Файл создаётся разряжённым
+        (sparse) на полный размер раздела, поэтому результат — обычный raw
+        образ, пригодный для прошивки как есть.
+        """
+        _log = log_fn or self.log
+        cancel = cancel_check or (lambda: False)
+        sec = int(self.DUMP_SECTION_BYTES)
+
+        runs = self._merge_ranges(used_runs) if used_runs else [(0, int(psize))]
+
+        # Склейка близких диапазонов в окна. Зачем: в режиме «только занятые
+        # блоки» диапазонов бывают тысячи, а каждый — это ДВЕ команды по USB
+        # (mmc read + mread mem). Если разрыв между ними небольшой, дешевле
+        # прочитать и его, чем платить за лишний обмен.
+        gap = int(self.DUMP_JOIN_GAP)
+        windows = []
+        for roff, rlen in runs:
+            if windows and roff - windows[-1][1] <= gap:
+                windows[-1][1] = max(windows[-1][1], roff + rlen)
+            else:
+                windows.append([roff, roff + rlen])
+        sections = []
+        for wi, (wstart, wend) in enumerate(windows):
+            off, wlen = 0, wend - wstart
+            while off < wlen:
+                n = min(sec, wlen - off)
+                sections.append((wi, off, wstart + off, n))
+                off += n
+        if used_runs and sections:
+            _log(f"    диапазонов {len(runs)} → окон {len(windows)}, "
+                 f"секций {len(sections)} (склейка разрывов до "
+                 f"{gap // 1024} КиБ)")
+        if not sections:
+            _log("  ⚠ нечего читать: пустой список диапазонов")
+            return False
+
+        # Файл на весь размер раздела: данные дописываются по смещениям.
+        if (not os.path.exists(out_file)) or os.path.getsize(out_file) != psize:
+            if os.path.exists(out_file):
+                try:
+                    os.remove(out_file)
+                except Exception:
+                    pass
+            with open(out_file, "wb") as f:
+                if psize > 0:
+                    f.seek(psize - 1)
+                    f.write(b"\x00")
+
+        state_path = out_file + ".dumpstate.json"
+        done = set()
+        try:
+            import json
+            if os.path.exists(state_path):
+                with open(state_path, "r", encoding="utf-8") as f:
+                    st = json.load(f)
+                if (st.get("size") == psize
+                        and st.get("sections") == len(sections)
+                        and st.get("start_sector") == start_sector):
+                    done = set(st.get("done", []))
+                    if done:
+                        _log(f"  ↻ Продолжаю: уже принято секций {len(done)} "
+                             f"из {len(sections)}")
+        except Exception:
+            done = set()
+
+        def _save_state():
+            try:
+                import json
+                tmp = state_path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump({"size": psize, "start_sector": start_sector,
+                               "sections": len(sections),
+                               "done": sorted(done)}, f)
+                os.replace(tmp, state_path)
+            except Exception:
+                pass
+
+        total_bytes = sum(s[3] for s in sections)
+        written = sum(s[3] for s in sections
+                      if f"{s[0]}:{s[1]}" in done)
+        fout = open(out_file, "r+b")
+        try:
+            for idx, (ri, off_in_run, roff, length) in enumerate(sections, 1):
+                if cancel():
+                    _log("  ⛔ Дамп прерван пользователем")
+                    _save_state()
+                    return False
+                key = f"{ri}:{off_in_run}"
+                if key in done:
+                    continue
+                blk = start_sector + (roff // self.DUMP_SECTOR)
+                align = roff % self.DUMP_SECTOR
+                cnt = (align + length + self.DUMP_SECTOR - 1) // self.DUMP_SECTOR
+                ok, last = False, ""
+                for attempt in (1, 2, 3):
+                    if cancel():
+                        _save_state()
+                        return False
+                    tmp = out_file + ".sec.tmp"
+                    try:
+                        self._uboot_mmc_read(self.DUMP_RAM_ADDR, blk, cnt)
+                        ok2, out2, n2 = self._uboot_mread_mem(
+                            self.DUMP_RAM_ADDR, cnt * self.DUMP_SECTOR, tmp)
+                        if ok2 and n2 >= align + length:
+                            with open(tmp, "rb") as fs:
+                                fs.seek(align)
+                                data = fs.read(length)
+                            if len(data) == length:
+                                fout.seek(roff)
+                                fout.write(data)
+                                fout.flush()
+                                try:
+                                    os.fsync(fout.fileno())
+                                except Exception:
+                                    pass
+                                ok = True
+                            else:
+                                last = f"получено {len(data)} из {length}"
+                        else:
+                            last = out2.strip()[:90] or "mread mem не дал данных"
+                    except Exception as ex:
+                        last = safe_decode(ex)[:100]
+                    finally:
+                        try:
+                            if os.path.exists(tmp):
+                                os.remove(tmp)
+                        except Exception:
+                            pass
+                    if ok:
+                        break
+                    _log(f"     ⚠ секция {idx}/{len(sections)}: попытка "
+                         f"{attempt}/3 не удалась — {last}")
+                    time.sleep(1.5)
+                if not ok:
+                    _log(f"     ❌ секция {idx}/{len(sections)} не прочитана: {last}")
+                    _save_state()
+                    return False
+                done.add(key)
+                written += length
+                if idx % 2 == 0 or idx == len(sections):
+                    _log(f"     секция {idx}/{len(sections)} ✓ "
+                         f"({written * 100.0 / max(1, total_bytes):.1f}%)")
+                if idx % 8 == 0:
+                    _save_state()
+        finally:
+            try:
+                fout.close()
+            except Exception:
+                pass
+        try:
+            if os.path.exists(state_path):
+                os.remove(state_path)
+        except Exception:
+            pass
+        # ПРОВЕРКА ХВОСТА: последние блоки раздела перечитываются и сверяются
+        # с файлом — так потеря хвоста обнаруживается, а не остаётся «нулями».
+        try:
+            self._verify_tail(pname, start_sector, psize, out_file, log_fn=_log,
+                              ranges=runs if used_runs else None)
+        except Exception as ex:
+            _log(f"     ⚠ самопроверка хвоста не выполнена: "
+                 f"{safe_decode(ex)[:80]}")
+        return True
+
     def aml_read_part(self, name, size, outfile):
         """Чтение раздела с устройства"""
         update_path = self.get_update_path()
@@ -7750,6 +9337,10 @@ class FlasherGUI:
     def _set_flash_progress(self, pct, display=""):
         """Обновить прогресс-бар значением процента записи раздела."""
         try:
+            # ВАЖНО: меняем и СТИЛЬ. У «TProgressbar» заливка совпадает с
+            # дорожкой (невидима в покое), поэтому в процентах полоса
+            # казалась пустой — прогресс шёл, а её не было видно.
+            self.progress.configure(style=self.progress.DETERMINATE)
             self.progress.config(mode='determinate', maximum=100)
             self.progress['value'] = pct
             if display:
@@ -7769,9 +9360,7 @@ class FlasherGUI:
 
         # Прогресс-бар в режим процентов на время записи раздела
         try:
-            self.progress.stop()
-            self.progress.config(mode='determinate', maximum=100)
-            self.progress['value'] = 0
+            self.progress.begin_percent(0)
         except Exception:
             pass
 
@@ -7959,7 +9548,8 @@ class FlasherGUI:
                     # должен появиться на шине снова. На macOS пере-энумерация
                     # (особенно через USB-хаб) может занять до десятков секунд
                     # или «залипнуть» — ждём РЕАЛЬНОГО возврата устройства.
-                    if self._wait_amlogic_usb(30):
+                    if self._wait_amlogic_usb(
+                            30, cancel_check=lambda: not self.is_flashing):
                         self.log("✓ Устройство снова на шине (U-Boot burn mode)")
                     else:
                         self.log("✗ Устройство не вернулось на USB после "
@@ -7995,7 +9585,8 @@ class FlasherGUI:
                     self.log(f"  ⚠ mmc dev 1 (попытка {mmc_try}/5): "
                              f"{emsg[:90]}")
                     self._release_aml_usb()
-                    if not self._wait_amlogic_usb(15):
+                    if not self._wait_amlogic_usb(
+                            15, cancel_check=lambda: not self.is_flashing):
                         break
                     time.sleep(1.5)
             if mmc_ok:
@@ -8468,6 +10059,11 @@ class AdbWindow(tk.Toplevel):
         self._term_proc = None
         self._termq = queue.Queue()
         self._closing = False
+        # Запускали ли ФОН-СЕРВЕР adb МЫ. adb devices стартует сервер, если его
+        # нет; если он уже работал (например, для Android Studio), гасить его
+        # при закрытии окна нельзя — иначе поломаем чужой инструмент.
+        self._adb_server_ours = False
+        self._adb_checked = False
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(150, self._initial_probe)
@@ -8572,6 +10168,31 @@ class AdbWindow(tk.Toplevel):
         except Exception:
             pass
 
+    def _note_server_state(self):
+        """Запомнить, поднят ли фон-сервер adb, ДО наших команд.
+
+        adb devices автоматически запускает сервер. Если он уже был запущен
+        (другие инструменты), закрывать его нельзя; если запустили мы — обязаны
+        погасить при закрытии окна (иначе остаётся висеть процесс adb).
+        """
+        if self._adb_checked or not self.adb_path:
+            return
+        self._adb_checked = True
+        try:
+            cf = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            r = subprocess.run([self.adb_path, "devices"], capture_output=True,
+                               timeout=15, creationflags=cf)
+            out = ((r.stdout or b"") + (r.stderr or b"")).decode("utf-8", "replace")
+            # Признак СВЕЖЕГО запуска — сообщение демона о старте:
+            # * daemon not running; starting now at tcp:5037
+            # При уже работающем сервере этой строки нет.
+            self._adb_server_ours = ("daemon not running" in out
+                                     or "starting now" in out)
+            if self._adb_server_ours:
+                self.log("adb-сервер запущен этим окном — погасим при закрытии")
+        except Exception:
+            pass
+
     def _initial_probe(self):
         if not self.adb_path:
             self.status_var.set("ADB: не найден")
@@ -8580,6 +10201,7 @@ class AdbWindow(tk.Toplevel):
                      "или кнопка «⬇ platform-tools»")
             return
         self.status_var.set("ADB: " + os.path.basename(self.adb_path))
+        self._note_server_state()
         self.refresh_devices()
 
     # ── интерфейс ─────────────────────────────────────────────────────────
@@ -9971,24 +11593,29 @@ class AdbWindow(tk.Toplevel):
     def _term_key_seq(self, ev):
         """Последовательность для клавиши терминала (или None).
 
-        ВАЖНО: клавиша с надписью «delete» (аналог Backspace в Windows)
-        должна стирать символ слева. Раньше на keysym "Delete" уходило
-        ESC[3~ — курсор уходил вперёд, текст не стирался.
+        ПОЧЕМУ БЕЗ keycode. Раньше здесь сравнивался ev.keycode с «магическими»
+        числами 51 (⌫) и 117 (fn+⌫). Это ненадёжно сразу по двум причинам:
+        keycode зависит от РАСКЛАДКИ и версии Tk (в Tk 9 на macOS он берётся из
+        системной раскладки — при русской раскладке приходят совсем другие
+        значения). Из-за этого клавиша ⌫ могла попасть в ветку forward-delete
+        (ESC[3~) и символ не стирался, а курсор «уезжал».
+
+        Теперь решение принимается по keysym — он не зависит от раскладки:
+          • BackSpace / Delete / KP_Delete / Clear → забой 0x7f (стирает слева);
+          • Shift+Delete (и fn на внешней клавиатуре) → ESC[3~ (стирает справа).
         """
-        kc = getattr(ev, "keycode", None)
-        ks = ev.keysym
-        if kc == self._YT_KEYCODE_FORWARD_DELETE:
-            return "\x1b[3~"                 # fn+⌫ — действительно forward
-        if kc == self._YT_KEYCODE_BACKSPACE:
-            return "\x7f"
-        # ВАЖНО: shell на устройстве — это Linux (независимо от хоста),
-        # поэтому Enter = CR, забой = DEL (0x7f) и на macOS, и на Windows.
-        if ks == "BackSpace":
-            return "\x7f"
-        if ks == "Delete":
-            # на клавиатурах/раскладках, где ⌫ отдаётся как Delete —
-            # это забой; forward delete доступен через fn/Shift+Delete
-            if bool(getattr(ev, "state", 0) & 0x1):     # Shift
+        ks = ev.keysym or ""
+        # Диагностика: видно, что именно пришло от системы. Помогает, когда
+        # раскладка/версия Tk даёт неожиданные keysym (а не молча «не работает»).
+        try:
+            hint = "⌫" if ks in ("BackSpace", "Delete", "KP_Delete",
+                                 "Clear") else ks
+            self.term_status.set(f"клавиша: {hint} "
+                                 f"(keysym={ks}, keycode={getattr(ev, 'keycode', '?')})")
+        except Exception:
+            pass
+        if ks in ("BackSpace", "Delete", "KP_Delete", "Clear"):
+            if bool(getattr(ev, "state", 0) & 0x1):     # Shift → forward delete
                 return "\x1b[3~"
             return "\x7f"
         if ks in ("F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9",
@@ -10486,6 +12113,19 @@ class AdbWindow(tk.Toplevel):
                 stop()
             except Exception:
                 pass
+        # Погасить фон-сервер adb, если он был поднят НАМИ (иначе после
+        # закрытия окна оставался висеть процесс adb). Чужой сервер не трогаем.
+        try:
+            if self._adb_server_ours and self.adb_path:
+                cf = (subprocess.CREATE_NO_WINDOW
+                      if sys.platform == "win32" else 0)
+                subprocess.run([self.adb_path, "kill-server"],
+                               capture_output=True, timeout=15,
+                               creationflags=cf)
+                self.log("adb-сервер остановлен")
+                self._adb_server_ours = False
+        except Exception:
+            pass
         try:
             if getattr(self, "_poll_id", None):
                 self.after_cancel(self._poll_id)
