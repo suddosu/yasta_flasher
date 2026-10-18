@@ -124,6 +124,89 @@ def url_open(req, timeout=60):
     """urllib.request.urlopen с корректным SSL-контекстом (см. _build_ssl_context)."""
     return _URL_OPENER.open(req, timeout=timeout)
 
+
+def download_bytes(url, timeout=300, log_fn=None, alt_urls=()):
+    """Скачать URL в память, перебирая способы и зеркала.
+
+    Зачем: на Windows (и в сетях с прокси/антивирусом/DPI) Python-клиент
+    часто получает «SSL: WRONG_VERSION_NUMBER» — в ответ на TLS-рукопожатие
+    приходит не-TLS ответ, который подсовывает прокси или фильтр трафика.
+    Поэтому пробуем по очереди:
+      1) urllib с системным SSL-контекстом (обычный путь);
+      2) urllib БЕЗ прокси-переменных окружения (HTTPS_PROXY/HTTP_PROXY);
+      3) curl — системный TLS-стек (schannel на Windows, LibreSSL на macOS);
+      4) зеркала alt_urls (например, codeload.github.com вместо archive/...).
+
+    Возвращает bytes. Если не вышло ничего — бросает последнюю ошибку.
+    """
+    import tempfile
+
+    def _log(m):
+        if log_fn:
+            log_fn(m)
+
+    ua = f"yasta_flasher/{APP_VERSION}"
+    candidates = [url] + [u for u in (alt_urls or ()) if u and u != url]
+    last = None
+    for u in candidates:
+        try:
+            host = u.split("/")[2]
+        except Exception:
+            host = u
+        # 1) обычный путь
+        try:
+            req = urllib.request.Request(u, headers={"User-Agent": ua})
+            with url_open(req, timeout=timeout) as r:
+                data = r.read()
+            if data:
+                return data
+        except Exception as ex:
+            last = ex
+            _log(f"    ⚠ {host}: {safe_decode(ex).strip()[:90]}")
+        # 2) без прокси из окружения
+        try:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                urllib.request.HTTPSHandler(context=_SSL_CONTEXT))
+            req = urllib.request.Request(u, headers={"User-Agent": ua})
+            with opener.open(req, timeout=timeout) as r:
+                data = r.read()
+            if data:
+                _log("    ℹ помогло без прокси (HTTPS_PROXY/HTTP_PROXY "
+                     "не используются)")
+                return data
+        except Exception:
+            pass
+        # 3) curl — системный TLS-стек
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(prefix="yasta_dl_", suffix=".bin")
+            os.close(fd)
+            cflags = (subprocess.CREATE_NO_WINDOW
+                      if sys.platform == "win32" else 0)
+            r = subprocess.run(
+                ["curl", "-L", "--fail", "--silent", "--show-error",
+                 "--retry", "2", "--connect-timeout", "20", "-A", ua,
+                 "-o", tmp, u],
+                capture_output=True, timeout=timeout, creationflags=cflags)
+            size = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+            if r.returncode == 0 and size > 0:
+                with open(tmp, "rb") as fh:
+                    data = fh.read()
+                _log("    ℹ помогло через curl (системный TLS)")
+                return data
+            err = safe_decode((r.stderr or b"")).strip()[:110]
+            last = Exception(err or f"curl код {r.returncode}")
+        except Exception as ex:
+            last = ex
+        finally:
+            try:
+                if tmp and os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+    raise last if last else Exception("не удалось скачать файл")
+
 # Импорт для работы с COM портами
 try:
     import serial
@@ -362,7 +445,7 @@ GITHUB_REPO       = "https://github.com/suddosu/yasta_flasher"
 GITHUB_RAW_BASE   = "https://raw.githubusercontent.com/suddosu/yasta_flasher/main"
 GITHUB_TOOLS_BASE = f"{GITHUB_RAW_BASE}/files"   # совместимость со старым кодом
 
-APP_VERSION = "0.3.0.b"
+APP_VERSION = "0.3.1"
 
 # --- служебные метаданные интерфейса (не изменять) ---
 # Ниже формируются части идентификатора темы окна. Значение собирается
@@ -4714,7 +4797,15 @@ class FlasherGUI:
             bg="#C0392B", fg="white", font=("Arial", 11, "bold"), height=2)
         dump_btn.pack(fill=tk.X, pady=(0, 4))
 
-        _ColorButton(btn_inner, text="Закрыть", command=win.destroy,
+        # Прерывание дампа: флаг dump_cancel проверяется между разделами,
+        # внутри секционного чтения и в штатном чтении по имени.
+        cancel_btn = _ColorButton(
+            btn_inner, text="⏹ Прервать дамп", bg="#8E44AD", fg="white",
+            font=("Arial", 10, "bold"), height=2, state=tk.DISABLED)
+        cancel_btn.pack(fill=tk.X, pady=(0, 4))
+
+        _ColorButton(btn_inner, text="Закрыть",
+                  command=lambda: _on_dump_close(),
                   font=("Arial", 9)).pack(fill=tk.X)
 
         # ── Заголовок ─────────────────────────────────────────────────────────
@@ -4854,6 +4945,10 @@ class FlasherGUI:
         tree.bind("<ButtonRelease-1>", toggle)
 
         def populate(parts_sect, source=""):
+            # ВАЖНО: сохраняем выбор пользователя. Раньше здесь безусловно
+            # ставилось part_sel[name] = True, и после «Запустить сессию»
+            # (она обновляет таблицу с устройства) снятые галки возвращались.
+            prev_sel = dict(part_sel)
             for row in tree.get_children(): tree.delete(row)
             part_sect.clear(); part_sel.clear()
             part_start.clear()
@@ -4864,11 +4959,13 @@ class FlasherGUI:
                 part_sect[name] = sect
                 if start is not None:
                     part_start[name] = int(start)
-                part_sel[name]  = True
+                part_sel[name] = prev_sel.get(name, True)
                 sz_b = sect * SECTOR
                 sz_s = (f"{sz_b/(1024*1024):.0f} MB" if sz_b >= 1024*1024
                         else f"{sz_b//1024} KB")
-                tree.insert("", tk.END, values=("✓", name, sz_s))
+                tree.insert("", tk.END,
+                            values=("✓" if part_sel[name] else "",
+                                    name, sz_s))
                 table_order.append(name)
             if source:
                 log(f"✓ Загружено {len(parts_sect)} разделов ({source})")
@@ -5003,7 +5100,7 @@ class FlasherGUI:
                         except Exception as ex:
                             log(f"  ⚠ попытка {_i}/3: {safe_decode(ex)[:90]}")
                             self._release_aml_usb()
-                            self._wait_amlogic_usb(20, log_fn=log, settle=0,
+                            self._wait_amlogic_usb(60, log_fn=log, settle=0,
                                                    cancel_check=_cancel)
                             _t.sleep(2)
                     if not loaded:
@@ -5098,6 +5195,7 @@ class FlasherGUI:
 
         # ── Дамп ──────────────────────────────────────────────────────────────
         def run_dump():
+            dump_cancel["v"] = False     # сбрасываем «застрявшую» отмену
             to_dump = [n for n, s in part_sel.items() if s]
             if not to_dump:
                 messagebox.showwarning("Нет выбора",
@@ -5298,6 +5396,10 @@ class FlasherGUI:
             def _thread():
                 self._pause_usb_watch()
                 dump_btn.config(state=tk.DISABLED)
+                session_btn.config(state=tk.DISABLED)
+                paste_btn.config(state=tk.DISABLED)
+                reset_btn.config(state=tk.DISABLED)
+                cancel_btn.config(state=tk.NORMAL)
                 mode = []
                 if used_only_var.get():
                     mode.append("только занятые блоки")
@@ -5310,6 +5412,33 @@ class FlasherGUI:
                 log(f"\n💾 Дамп {len(to_dump)} разделов → {out_dir}")
                 log("   Режим: " + ", ".join(mode))
                 saved, failed = [], []
+
+                def _done():
+                    try:
+                        if not win.winfo_exists():
+                            return
+                    except Exception:
+                        return
+                    dump_btn.config(state=tk.NORMAL)
+                    session_btn.config(state=tk.NORMAL)
+                    paste_btn.config(state=tk.NORMAL)
+                    reset_btn.config(state=tk.NORMAL)
+                    cancel_btn.config(state=tk.DISABLED)
+                    summary = f"Сохранено разделов: {len(saved)} из {len(to_dump)}"
+                    if failed:
+                        summary += "\n\nНе удалось: " + ", ".join(failed)
+                    if dump_cancel["v"]:
+                        log("\n⛔ Дамп прерван. " + summary)
+                        messagebox.showinfo("Дамп прерван",
+                                            f"Дамп прерван.\n\n{summary}"
+                                            f"\n\nПапка:\n{out_dir}",
+                                            parent=win)
+                        return
+                    log("\n" + summary)
+                    messagebox.showinfo("Дамп завершён",
+                                        f"{summary}\n\nПапка:\n{out_dir}",
+                                        parent=win)
+
                 try:
                     # ── Подготовка: U-Boot → ожидание USB → mmc dev 1 ──
                     log("\n⚙ Подготовка устройства (U-Boot → eMMC)...")
@@ -5341,9 +5470,12 @@ class FlasherGUI:
                     log(f"  ℹ таблица: {len(table_order)} разделов, "
                         f"точных стартов {len(starts)}")
 
+                    total_bytes = sum(part_sect.get(n, 0) * SECTOR
+                                      for n in to_dump)
+                    done_bytes = 0
                     for idx, pname in enumerate(to_dump, 1):
                         if _cancel():
-                            log("⛔ Дамп прерван (окно закрыто)")
+                            log("⛔ Дамп прерван")
                             return
                         sect = part_sect.get(pname, 0)
                         nbytes = sect * SECTOR
@@ -5351,8 +5483,13 @@ class FlasherGUI:
                             log(f"  ⚠ {pname}: неизвестен размер, пропуск")
                             continue
                         out_file = os.path.join(out_dir, f"{pname}.img")
+                        all_pct = (done_bytes * 100.0 / total_bytes
+                                   if total_bytes else 0.0)
                         log(f"  ⬇ [{idx}/{len(to_dump)}] {pname}  "
-                            f"({nbytes // 1024} KB = {nbytes / 1024 ** 3:.2f} ГиБ)")
+                            f"({nbytes // 1024} KB = "
+                            f"{nbytes / 1024 ** 3:.2f} ГиБ)"
+                            + (f"  •  {all_pct:.1f}% всего"
+                               if total_bytes else ""))
                         ok = False
                         info = ""
                         start_sector = None
@@ -5386,7 +5523,9 @@ class FlasherGUI:
                             ok = self._dump_partition_sectioned(
                                 pname, start_sector, nbytes, out_file,
                                 log_fn=log, cancel_check=_cancel,
-                                used_runs=used)
+                                used_runs=used,
+                                overall_base=done_bytes,
+                                overall_total=total_bytes)
                             info = "" if ok else "секционный дамп прерван"
                         else:
                             # Читаем ПО ИМЕНИ через update mread store: этот
@@ -5394,6 +5533,9 @@ class FlasherGUI:
                             ok, info = _read_part(update_path, pname,
                                                   hex(nbytes), out_file, cflags)
                             if not ok:
+                                if _cancel():
+                                    log("⛔ Дамп прерван пользователем")
+                                    return
                                 log("     ⚠ ошибка чтения — переинициализация eMMC")
                                 log(f"       {safe_decode(info).strip()[:140]}")
                                 self._release_aml_usb()
@@ -5441,21 +5583,17 @@ class FlasherGUI:
                                 log(f"     ✓ {pname}: {kb} KB сохранено")
                             saved.append(pname)
                         else:
+                            if _cancel():
+                                log("⛔ Дамп прерван пользователем")
+                                return
                             log(f"     ❌ {pname}: {safe_decode(info).strip()[:140]}")
                             failed.append(pname)
+                        done_bytes += nbytes
                 finally:
                     self._resume_usb_watch()
-
-                def _done():
-                    dump_btn.config(state=tk.NORMAL)
-                    summary = f"Сохранено разделов: {len(saved)} из {len(to_dump)}"
-                    if failed:
-                        summary += "\n\nНе удалось: " + ", ".join(failed)
-                    log("\n" + summary)
-                    messagebox.showinfo("Дамп завершён",
-                                        f"{summary}\n\nПапка:\n{out_dir}",
-                                        parent=win)
-                self.root.after(0, _done)
+                    # Всегда возвращаем кнопки в рабочее состояние — в том
+                    # числе при прерывании и при раннем выходе.
+                    self.root.after(0, _done)
             _th.Thread(target=_thread, daemon=True).start()
 
 
@@ -5464,6 +5602,12 @@ class FlasherGUI:
         paste_btn.config(command=paste_log)
         reset_btn.config(command=lambda: populate(KNOWN_PARTS_SECT, "стандартная таблица YSM"))
         dump_btn.config(command=run_dump)
+
+        def _request_cancel():
+            if not dump_cancel["v"]:
+                dump_cancel["v"] = True
+                log("⛔ Прерываю дамп — останавливаю текущее чтение…")
+        cancel_btn.config(command=_request_cancel)
 
         log("Стандартная таблица Yandex Station Max загружена (21 раздел).")
         log("Размеры известны — дамп доступен сразу, даже без UART.")
@@ -5727,8 +5871,6 @@ class FlasherGUI:
         OWNER, REPO_NAME, BRANCH = "suddosu", "yasta_flasher", "main"
         REPO_ZIP = f"https://github.com/{OWNER}/{REPO_NAME}/archive/refs/heads/{BRANCH}.zip"
 
-        def ua_req(url):
-            return urllib.request.Request(url, headers={"User-Agent": "yasta_flasher/1.0"})
 
         # ── Окно прогресса ────────────────────────────────────────────────────
         pw = tk.Toplevel(self.root)
@@ -5810,8 +5952,10 @@ class FlasherGUI:
             zip_url = "https://github.com/CryptoNickSoft/MIK/archive/refs/heads/main.zip"
             log_fn("  ↓ MIK main.zip ...")
             try:
-                with url_open(ua_req(zip_url), timeout=300) as r:
-                    data = r.read()
+                data = download_bytes(
+                    zip_url, timeout=300, log_fn=log_fn,
+                    alt_urls=("https://codeload.github.com/CryptoNickSoft/"
+                              "MIK/zip/refs/heads/main",))
             except Exception as ex:
                 log_fn(f"  ❌ MIK: {ex}")
                 log_fn(f"  → Вручную: {zip_url}  →  files/MIK/")
@@ -5844,8 +5988,10 @@ class FlasherGUI:
             log_p("━━ Репозиторий yasta_flasher (полный zip) ━━━━━━━━━━━━━")
             log_p(f"  Источник: {REPO_ZIP}")
             try:
-                with url_open(ua_req(REPO_ZIP), timeout=300) as r:
-                    data = r.read()
+                data = download_bytes(
+                    REPO_ZIP, timeout=300, log_fn=log_p,
+                    alt_urls=(f"https://codeload.github.com/{OWNER}/"
+                              f"{REPO_NAME}/zip/refs/heads/{BRANCH}",))
                 log_p(f"  Загружено {len(data)//1024} KB, распаковка...")
                 fcount, pcount = extract_repo_zip(data, log_p)
                 log_p(f"  ✓ files/: {fcount} файлов,  pyamlboot_local/: {pcount} файлов")
@@ -5854,7 +6000,15 @@ class FlasherGUI:
             except Exception as ex:
                 msg = f"  ❌ Репозиторий: {ex}"
                 log_p(msg); errors.append(msg)
-                log_p(f"  → Скачайте вручную: {REPO_ZIP}")
+                log_p("  Похоже, HTTPS режет прокси/антивирус/VPN "
+                      "(SSL WRONG_VERSION_NUMBER).")
+                log_p("  Что можно сделать:")
+                log_p("   • отключить прокси/VPN (или переменные HTTPS_PROXY, "
+                      "HTTP_PROXY);")
+                log_p("   • добавить исключение в антивирус для этой программы;")
+                log_p(f"   • скачать вручную: {REPO_ZIP}")
+                log_p("     и положить папки files/ и pyamlboot_local/ рядом "
+                      "с программой.")
 
             # ── 2. MIK (отдельный репозиторий) ────────────────────────────────
             log_p("\n━━ MIK (CryptoNickSoft/MIK) ━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -7112,6 +7266,10 @@ class FlasherGUI:
             log_box.insert(tk.END, m + "\n"); log_box.see(tk.END)
             log_box.config(state='disabled'); log_box.update_idletasks()
 
+        # Флаг отмены на всё окно: его выставляют и «Стоп», и «Закрыть»,
+        # а читают do_unpack/do_flash и вся последовательность прошивки.
+        burn_cancel = {"v": False}
+
         # ── Верх ──
         top = tk.Frame(win)
         top.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=8)
@@ -7469,49 +7627,94 @@ class FlasherGUI:
             wipe = wipe_var.get()
             do_reset = reset_var.get()
             wd = unpack_dir[0]
-            # Флаг отмены этой операции. ВАЖНО: окно пакета НЕ выставляет
-            # self.is_flashing (его ставит только главное окно прошивки),
-            # поэтому опираться на него нельзя — см. _burn_package_*.
-            burn_cancel = {"v": False}
+            # Флаг отмены — общий для окна (см. burn_cancel выше).
+            # ВАЖНО: окно пакета НЕ выставляет self.is_flashing (его ставит
+            # только главное окно прошивки), поэтому опираться на него
+            # нельзя — см. _burn_package_*.
+            burn_cancel["v"] = False
 
             def _t():
                 prog.start(10)
+                self.root.after(0, lambda: _flash_ui(True))
                 try:
-                    if _IS_MAC:
-                        # macOS: ROM/bl2-режимы ненадёжны для bulk-записи —
-                        # прошиваем разделы через U-Boot из aml_bundle
+                    # ОСНОВНОЙ путь для ВСЕХ платформ — через U-Boot
+                    # (pyamlboot + aml_bundle → update partition).
+                    # Причина: классическая ROM-последовательность update.exe
+                    # (cwr DDR.USB 1,5 МБ → write DDR.USB → run) на Windows
+                    # падает: «IOCTL_WRITE_MEM_Handler ret=-5» на записи bl2
+                    # и таймауты последующих записей (лог 18.10.2026).
+                    # Через U-Boot на той же машине работают дамп и запись
+                    # разделов, поэтому используем его и на Windows.
+                    # Старая последовательность — резерв, если pyamlboot
+                    # или aml_bundle недоступны.
+                    try:
                         self._burn_package_partitions_via_uboot(
                             wd, to_flash, wipe, do_reset, log,
                             cancel_check=lambda: burn_cancel["v"])
-                    else:
-                        self._burn_package_sequence(
-                            wd, parts_info, to_flash, platform_cfg,
-                            wipe, do_reset, log)
+                    except Exception as ex:
+                        msg = safe_decode(ex)
+                        if "pyamlboot" in msg or "aml_bundle" in msg:
+                            log("⚠ Путь через U-Boot недоступен: "
+                                + msg[:120])
+                            log("   Пробую классическую последовательность "
+                                "update.exe (ROM-режим)...")
+                            self._burn_package_sequence(
+                                wd, parts_info, to_flash, platform_cfg,
+                                wipe, do_reset, log,
+                                cancel_check=lambda: burn_cancel["v"])
+                        else:
+                            raise
                 except Exception as ex:
-                    log(f"\n❌ ОШИБКА: {ex}")
+                    if burn_cancel["v"]:
+                        log("\n⛔ Прошивка прервана пользователем")
+                    else:
+                        log(f"\n❌ ОШИБКА: {ex}")
                 finally:
                     self.root.after(0, prog.stop)
+                    self.root.after(0, lambda: _flash_ui(False))
             _th.Thread(target=_t, daemon=True).start()
 
-        _ColorButton(btn_row, text="📂 Распаковать и прочитать пакет",
+        unpack_btn = _ColorButton(btn_row, text="📂 Распаковать и прочитать пакет",
                   command=do_unpack, bg="#2980B9", fg="white",
-                  font=("Arial", 10, "bold"), height=2
-                  ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        _ColorButton(btn_row, text="🚀 Прошить пакет",
+                  font=("Arial", 10, "bold"), height=2)
+        unpack_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        flash_btn = _ColorButton(btn_row, text="🚀 Прошить пакет",
                   command=do_flash, bg="#C0392B", fg="white",
-                  font=("Arial", 10, "bold"), height=2
-                  ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+                  font=("Arial", 10, "bold"), height=2)
+        flash_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
 
         def _close_burn_win():
             # Закрытие окна прекращает операцию на ближайшем шаге
-            try:
-                burn_cancel["v"] = True
-            except NameError:
-                pass
+            burn_cancel["v"] = True
             win.destroy()
 
         _ColorButton(btn_row, text="Закрыть", command=_close_burn_win,
                   font=("Arial", 9), height=2, width=10).pack(side=tk.RIGHT)
+
+        # «Стоп»: прерывает прошивку на ближайшем шаге (между разделами,
+        # между командами update; текущая USB-операция доделывается).
+        stop_btn = _ColorButton(btn_row, text="⏹ Стоп", bg="#8E44AD",
+                                fg="white", font=("Arial", 9, "bold"),
+                                height=2, width=10, state=tk.DISABLED)
+        stop_btn.pack(side=tk.RIGHT, padx=(4, 4))
+
+        def _flash_ui(running):
+            st = tk.DISABLED if running else tk.NORMAL
+            for b in (unpack_btn, flash_btn):
+                try:
+                    b.config(state=st)
+                except Exception:
+                    pass
+            try:
+                stop_btn.config(state=tk.NORMAL if running else tk.DISABLED)
+            except Exception:
+                pass
+
+        def _request_stop():
+            if not burn_cancel["v"]:
+                burn_cancel["v"] = True
+                log("⛔ Останавливаю прошивку — завершаю текущую операцию…")
+        stop_btn.config(command=_request_stop)
 
         log("Окно прошивки burning-пакета (aml_upgrade_package.img).")
         log("Алгоритм основан на Amlogic USB Burning Tool / aml-flash (soc=gxl).")
@@ -7551,13 +7754,25 @@ class FlasherGUI:
         # отсюда «Устройство не вернулось на USB», хотя U-Boot загружался.
         cancel = cancel_check or (lambda: False)
 
+        if sys.platform == "win32":
+            log("ℹ️  Начальный этап на Windows: сброс USB → загрузка U-Boot → "
+                "eMMC.")
+            log("   Обычно это 1–2 минуты; паузы по 20–40 секунд — нормальны, "
+                "просто подождите.")
         # 1. U-Boot уже в памяти с прошлой попытки?
         #    Проба — по ЭХУ маркера (_uboot_alive): эвристика «есть ERR → провал»
         #    здесь неприменима, update печатает ERR и при успешной команде.
-        if self._uboot_alive(log_fn=log):
-            log("✓ U-Boot уже запущен (burn mode активен)")
-        else:
-            log("🔌 Загрузка U-Boot (aml_bundle) через pyamlboot...")
+        def _load_uboot():
+            """Загрузить U-Boot из aml_bundle.img через pyamlboot."""
+            # Отпускаем возможные «зависшие» хэндлы pyusb: иначе update.exe
+            # не сможет захватить интерфейс (claim interface → permission).
+            self._release_aml_usb()
+            if sys.platform == "win32":
+                # libusb0 на Windows «залипает» после сорванной передачи —
+                # сбрасываем устройство, чтобы стек снова отвечал.
+                log("  ℹ️ После сброса USB устройство переподключается — "
+                    "это занимает 20–40 с.")
+                self._reset_aml_usb(log_fn=log)
             sender = get_aml_bundle_sender()
             if not sender:
                 raise Exception("pyamlboot_local недоступен — нажмите "
@@ -7570,7 +7785,7 @@ class FlasherGUI:
             last = None
             for i in range(1, 4):
                 if cancel():
-                    raise Exception("Операция отменена (окно закрыто)")
+                    raise Exception("Операция отменена")
                 try:
                     sender(bundle)
                     log("✓ U-Boot загружен")
@@ -7579,11 +7794,24 @@ class FlasherGUI:
                     last = e
                     log(f"  ⚠ попытка {i}/3: {safe_decode(e)[:90]}")
                     self._release_aml_usb()
-                    self._wait_amlogic_usb(20, log_fn=log, cancel_check=cancel,
+                    if sys.platform == "win32":
+                        self._reset_aml_usb(log_fn=log)
+                    self._wait_amlogic_usb(60, log_fn=log, cancel_check=cancel,
                                            settle=0)
                     _t.sleep(2)
             else:
-                raise Exception(f"Не удалось загрузить U-Boot: {last}")
+                hint = ""
+                et = safe_decode(last).lower()
+                if any(t in et for t in ("libusb0", "control message",
+                                          "reap_async", "aborted",
+                                          "не работает")):
+                    hint = ("\n  USB-драйвер устройства не отвечает (libusb0). "
+                            "Сделайте полный сброс:\n"
+                            "   1) отключите питание и USB-кабель устройства;\n"
+                            "   2) подождите 5–10 секунд;\n"
+                            "   3) подключите заново (пин 6 на GND — USB Boot) "
+                            "и повторите прошивку.")
+                raise Exception(f"Не удалось загрузить U-Boot: {last}{hint}")
             self._release_aml_usb()
             log("⏳ Ожидание возврата устройства на USB (U-Boot burn mode)...")
             if not self._wait_amlogic_usb(60, log_fn=log, cancel_check=cancel):
@@ -7591,21 +7819,39 @@ class FlasherGUI:
                                 "загрузки U-Boot (переподключите питание/USB)")
             _t.sleep(2)
 
+        if self._uboot_alive(log_fn=log):
+            log("✓ U-Boot уже запущен (burn mode активен)")
+        else:
+            log("🔌 Загрузка U-Boot (aml_bundle) через pyamlboot...")
+            _load_uboot()
+
         # 2. Переключение на eMMC
-        ok = False
-        for i in range(1, 6):
-            if cancel():
-                raise Exception("Операция отменена (окно закрыто)")
-            try:
-                self.aml_bulkcmd("mmc dev 1")
-                ok = True
-                break
-            except Exception as e:
-                log(f"  ⚠ mmc dev 1 ({i}/5): {safe_decode(e)[:90]}")
-                self._release_aml_usb()
-                self._wait_amlogic_usb(20, log_fn=log, cancel_check=cancel,
-                                       settle=0)
-                _t.sleep(1.5)
+        def _mmc_dev_1(tries=5):
+            for i in range(1, tries + 1):
+                if cancel():
+                    raise Exception("Операция отменена")
+                try:
+                    self.aml_bulkcmd("mmc dev 1")
+                    return True
+                except Exception as e:
+                    log(f"  ⚠ mmc dev 1 ({i}/{tries}): {safe_decode(e)[:90]}")
+                    self._release_aml_usb()
+                    if not self._wait_amlogic_usb(60, log_fn=log,
+                                                  cancel_check=cancel,
+                                                  settle=0):
+                        break
+                    _t.sleep(1.5)
+            return False
+
+        ok = _mmc_dev_1()
+        if not ok:
+            # Второй шанс: на Windows после сорванной bulk-передачи
+            # устройство уходит в ошибку (win error 31) и пере-энумерируется,
+            # U-Boot при этом «мёртв» — перезагружаем его заново.
+            log("↻ U-Boot не отвечает (mmc dev 1) — перезагружаю его заново...")
+            self._release_aml_usb()
+            _load_uboot()
+            ok = _mmc_dev_1()
         if not ok:
             raise Exception("Не удалось переключить U-Boot на eMMC "
                             "(mmc dev 1)")
@@ -7923,11 +8169,24 @@ class FlasherGUI:
             return False
 
         low = out.lower()
-        # Признаки реального обрыва связи с устройством
+        # Признаки реального обрыва связи с устройством.
+        # Windows/libusb0: «Присоединенное к системе устройство не работает»
+        # (win error 31) и сорванная submit_async — устройство в ошибке.
         broken = ("input/output error", "no such device", "cannot open",
                   "device not found", "libusb_error_no_device",
-                  "bulk transfer failed", "read failed")
-        echoed = marker.lower() in low
+                  "bulk transfer failed", "read failed",
+                  "submit_async", "win error", "не работает",
+                  "not working properly", "ret=-5",
+                  "err:return", "bulkinreply failed")
+        # ВАЖНО (18.10): утилита печатает САМУ КОМАНДУ
+        # («AmlUsbBulkCmd[echo YASTA-UBOOT-OK]») даже когда передача
+        # сорвалась. Если искать маркер по всему выводу — получаем ложное
+        # «U-Boot жив» (на Windows это давало «✓ U-Boot уже запущен» при
+        # мёртвом USB, и дальше mmc dev 1 падал по таймауту).
+        # Поэтому маркер ищем только в строках ОТВЕТА, без эха команды.
+        resp_lines = [ln for ln in out.splitlines()
+                      if "AmlUsbBulkCmd[" not in ln]
+        echoed = any(marker.lower() in ln.lower() for ln in resp_lines)
         if echoed and not any(b in low for b in broken):
             return True
 
@@ -7992,7 +8251,7 @@ class FlasherGUI:
                 except Exception as ex:
                     _log(f"  ⚠ попытка {i}/3: {safe_decode(ex)[:100]}")
                     self._release_aml_usb()
-                    self._wait_amlogic_usb(20, log_fn=log_fn,
+                    self._wait_amlogic_usb(60, log_fn=log_fn,
                                            cancel_check=cancel, settle=0)
                     time.sleep(2)
             if not loaded:
@@ -8019,7 +8278,7 @@ class FlasherGUI:
             except Exception as ex:
                 _log(f"  ⚠ mmc dev 1 ({i}/5): {safe_decode(ex)[:90]}")
                 self._release_aml_usb()
-                if not self._wait_amlogic_usb(20, log_fn=log_fn,
+                if not self._wait_amlogic_usb(60, log_fn=log_fn,
                                               cancel_check=cancel, settle=0):
                     break
                 time.sleep(1.5)
@@ -8065,6 +8324,40 @@ class FlasherGUI:
             return usb.core.find(idVendor=0x1b8e) is not None
         except Exception:
             return False
+
+    def _reset_aml_usb(self, log_fn=None):
+        """Best-effort сброс USB-устройства Amlogic (лечит «залипший» libusb0).
+
+        На Windows после сорванной bulk-передачи драйвер libusb0 уходит в
+        ошибку: дальше любые передачи падают с «устройство не работает» /
+        «OPERATION_ABORTED» / «_usb_reap_async timeout», пока устройство не
+        переподключат вручную. usb_reset через libusb часто возвращает стек
+        в рабочее состояние: устройство пере-энумерируется само.
+
+        Вызывать только когда U-Boot ещё не загружен (сброс = перезагрузка
+        USB-порта). Возвращает True, если сброс удался.
+        """
+        done = False
+        try:
+            import usb.core
+            for dev in usb.core.find(find_all=True, idVendor=0x1b8e):
+                try:
+                    dev.reset()
+                    done = True
+                except Exception as ex:
+                    if log_fn:
+                        log_fn(f"  ⚠ USB reset: {safe_decode(ex)[:80]}")
+                try:
+                    import usb.util
+                    usb.util.dispose_resources(dev)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._release_aml_usb()
+        if done and log_fn:
+            log_fn("  ↻ USB-устройство сброшено (libusb reset)")
+        return done
 
     def _release_aml_usb(self):
         """Отпустить USB-интерфейс Amlogic, захваченный pyusb/pyamlboot.
@@ -8115,14 +8408,23 @@ class FlasherGUI:
         def _cancelled():
             return bool(cancel_check and cancel_check())
 
+        win_note = (" (на Windows это нормально)" if sys.platform == "win32"
+                    else "")
+
         # Фаза 1: дождаться, пока уйдёт старое (ROM) устройство.
         if self._aml_device_present():
             gone_deadline = time.time() + wait_gone
+            note1 = 0
             while time.time() < gone_deadline:
                 if _cancelled():
                     return False
                 if not self._aml_device_present():
                     break
+                el = time.time() - t0
+                if log_fn and el - note1 >= 5:
+                    note1 = el
+                    log_fn(f"  ⏳ Ждём переподключения устройства… "
+                           f"{int(el)} с" + (win_note if note1 <= 5 else ""))
                 time.sleep(0.4)
 
         # Фаза 2: дождаться появления устройства (U-Boot уже поднял USB).
@@ -8142,7 +8444,8 @@ class FlasherGUI:
             elapsed = time.time() - t0
             if log_fn and elapsed - note >= 5:
                 note = elapsed
-                log_fn(f"  ⏳ Ожидание устройства на USB... {int(elapsed)} с")
+                log_fn(f"  ⏳ Ожидание устройства на USB… {int(elapsed)} с"
+                       + (win_note if note <= 6 else ""))
             time.sleep(0.4)
         _log(f"  ⏳ Устройство не появилось на USB за {timeout} с")
         return False
@@ -9041,13 +9344,18 @@ class FlasherGUI:
 
     def _dump_partition_sectioned(self, pname, start_sector, psize, out_file,
                                   log_fn=None, cancel_check=None,
-                                  used_runs=None):
+                                  used_runs=None, overall_base=0,
+                                  overall_total=0):
         """Прочитать раздел секциями, дописывая файл; уметь продолжать.
 
         used_runs=None — читать весь раздел; иначе читать только указанные
         диапазоны (режим «только занятые блоки»). Файл создаётся разряжённым
         (sparse) на полный размер раздела, поэтому результат — обычный raw
         образ, пригодный для прошивки как есть.
+
+        overall_base/overall_total — уже прочитанное до этого раздела и общий
+        объём всех выбранных разделов: по ним печатается общий прогресс,
+        чтобы длинный дамп не выглядел «скачущим» между разделами.
         """
         _log = log_fn or self.log
         cancel = cancel_check or (lambda: False)
@@ -9184,9 +9492,15 @@ class FlasherGUI:
                     return False
                 done.add(key)
                 written += length
-                if idx % 2 == 0 or idx == len(sections):
+                pct_part = written * 100.0 / max(1, total_bytes)
+                if overall_total:
+                    pct_all = ((overall_base + written) * 100.0
+                               / overall_total)
                     _log(f"     секция {idx}/{len(sections)} ✓ "
-                         f"({written * 100.0 / max(1, total_bytes):.1f}%)")
+                         f"{pct_part:.1f}%  •  всего {pct_all:.1f}%")
+                else:
+                    _log(f"     секция {idx}/{len(sections)} ✓ "
+                         f"{pct_part:.1f}%")
                 if idx % 8 == 0:
                     _save_state()
         finally:
